@@ -78,7 +78,7 @@ make build
 
 检测到明确的 401/凭据失效后，页面可以创建恢复任务：AUTH 重新登录取得新 Refresh Token，写回原 Sub2 账号，实际检测通过后再开启调度。失败或结果不确定时保持停用并保留任务状态；该链路已发布，真实 401 账号验收需单独执行。
 
-AUTH 默认只监听 `127.0.0.1`。如果通过反向代理或 `-bind` 暴露到其他网络，必须在网关层为 `/api/history` 和 `/api/sub2/import*` 增加管理认证；CORS 不是访问控制，不能把管理 API Key 放进网页代码。
+AUTH 默认只监听 `127.0.0.1`。如果通过反向代理或 `-bind` 暴露到其他网络，必须在网关层为 `/api/history`、`/api/sub2/import*` 和 `/api/account-recovery*` 增加管理认证；CORS 不是访问控制，不能把管理 API Key 放进网页代码。
 
 ### sys1 网页版
 

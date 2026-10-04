@@ -42,6 +42,7 @@
 - 默认 1 个并发，服务端硬上限可配置为 1–10 个；单账号总超时默认 3 分钟。
 - SSE 实时进度、单个失败重试和批量重试。
 - 认证成功的历史账号可从页面导入 Sub2 未分组；任务状态持久化并通过来源标记回查确认。
+- 账号检测发现明确 401/凭据失效后，可创建恢复任务：重新登录取得新 Refresh Token，调用 Sub2 既有凭据写回接口，检测成功后重新开启调度；失败或不确定时保持停用。真实 401 恢复链路尚未验收。
 - HTTP 代理输入、代理测试和错误分类。
 - AUTH 本地凭据的手动模型检测；只读AT、无RT刷新、无Sub2状态调用；明确区分本地过期、401、额度、权限与网络错误。
 
@@ -75,16 +76,19 @@ cd /Users/tokk/Desktop/KKAI_AUTH
 
 ## 本轮精确验证命令与结果
 
-本次 Tab UI 发布的以下命令均通过：
+本次 AUTH 恢复发布的以下命令均通过：
 
 ```bash
-env GOPROXY=off GOSUMDB=off GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/kkai-auth-release-20261004T104640Z-tab-ui/openai-login-web ./cmd/server
-env GOPROXY=off GOSUMDB=off go test ./cmd/server -run '^(TestConcurrentLoginLimitAndRelease|TestLoginRequestGuards|TestSameOriginRequests|TestHistoryListAndDeleteEndpoints|TestHistoryDeleteRejectsActiveWork|TestRunWithHistoryAccountRejectsDeletedIdentity|TestAccountCheckAPIValidationIdempotency|TestAccountCheckHistorySafeDTO)$' -count=1 -timeout=60s
+GOPROXY=off GOSUMDB=off GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/openai-login-20261004T164742Z-sub2-recovery ./cmd/server
+go test ./cmd/server ./internal/store -count=1
+go vet ./cmd/server ./internal/store
+node cmd/server/account-checks.test.cjs
+node --check cmd/server/account-checks.js
 ```
 
-前端语法、fixture 和模拟 API 浏览器验证沿用 [TAB_UI_REDESIGN.md](TAB_UI_REDESIGN.md) 本轮已通过记录，没有重复运行全仓测试。线上 3 个静态资源 SHA 与本地一致，二进制 SHA-256 为 `59b2c3960dcc9410f95c096e8dc3bdd7f19f190a11219b615deb544817567719`。Node `v24.19.0`、Playwright `1.62.1` 原样保留，Chrome `154.0.8037.97`。
+Sub2 代码没有参与本次构建或部署；其本地工作区和线上版本保持原状。线上 AUTH 二进制 SHA-256 为 `2aabc5ad3c767f015ee55b9452ee39620be49c8b8eec2be0575936e4cd62eba4`，Node、Playwright driver 和 Chrome 运行环境沿用原 release。
 
-发布时间为 10:54:05 UTC；10:55:37 UTC 延后复查确认唯一服务进程运行新 release，panic/fatal/数据库锁/启动失败聚合均为 0。备份 `/var/lib/openai-login/backups/accounts-before-20261004T104640Z-tab-ui.db` 权限为 `0600`，`integrity_check=ok`；旧版二进制 SHA、Node 和 driver 已保留核对，回滚就绪，临时上传文件已清理。用户自行执行本次功能与真实 OAuth 验收；未执行认证后公网业务、真实账号登录、模型检测、生产删除或 Sub2 导入验收。
+发布时间为 2026-10-04 16:53:09 UTC；2026-10-04 21:19:14 UTC 延后复查确认唯一服务进程运行新 release，`active/running`、`NRestarts=0`、健康检查正常。备份 `/var/lib/openai-login/backups/accounts-before-20261004T164742Z-sub2-recovery.db` 权限为 `0600`，`integrity_check=ok`；旧版二进制、Node 与 driver 已核对保留，回滚就绪，远端和本地本次构建临时文件已清理。恢复功能已发布，未执行真实 401 账号的完整恢复验收。
 
 ## 历史列表发布验证命令与结果（此前记录）
 
