@@ -1,0 +1,12 @@
+# OpenAI 账号文件
+# 格式：email----password----totp_secret
+#
+# 示例：
+# user@example.com----MyPassword123----ABCD1234EFGH5678IJKL
+#
+# 注意：
+# 1. 三个字段用 ---- (4个短横线) 分隔
+# 2. TOTP 密钥必须是 Base32 格式（大写字母 + 数字2-7）
+# 3. 每行一个账号
+# 4. # 开头的行是注释
+

@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenAI 批量登录</title>
+    <style>
+        :root {
+            --bg-deepest: #05070C;
+            --bg-deep: #0A0D12;
+            --bg-mid: #0F131C;
+            --bg-elevated: #161D2B;
+            --bg-highest: #1E2636;
+            --accent: #38BDF8;
+            --accent-dim: #1E3A5F;
+            --text-primary: #E8EEF5;
+            --text-secondary: #9BA8BC;
+            --text-dim: #6B7A92;
+            --success: #6EE7B7;
+            --warning: #E9A568;
+            --error: #F87171;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg-deepest);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: clamp(1rem, 3vw, 2rem);
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: clamp(2rem, 5vw, 3rem);
+        }
+
+        h1 {
+            font-size: clamp(1.75rem, 4vw, 2.5rem);
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: clamp(0.875rem, 2vw, 1rem);
+        }
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 1.2fr;
+            gap: clamp(1rem, 3vw, 2rem);
+            margin-bottom: 2rem;
+        }
+
+        @media (max-width: 1024px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .card {
+            background: var(--bg-deep);
+            border-radius: 16px;
+            padding: clamp(1.25rem, 3vw, 2rem);
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 1.5rem;
+        }
+
+        .card-title {
+            font-size: clamp(1.125rem, 2.5vw, 1.25rem);
+            font-weight: 600;
+        }
+
+        .badge {
+            background: var(--accent-dim);
+            color: var(--accent);
+            padding: 0.25rem 0.75rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .input-group {
+            margin-bottom: 1.5rem;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+        }
+
+        textarea {
+            width: 100%;
+            background: var(--bg-mid);
+            border: 1px solid var(--bg-elevated);
+            border-radius: 12px;
+            padding: 1rem;
+            color: var(--text-primary);
+            font-family: 'SF Mono', 'Monaco', 'Cascadia Code', monospace;
+            font-size: 0.875rem;
+            line-height: 1.6;
+            resize: vertical;
+            min-height: 280px;
+            transition: all 0.2s;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+            background: var(--bg-elevated);
+        }
+
+        textarea::placeholder {
+            color: var(--text-dim);
+        }
+
+        .hint {
+            margin-top: 0.5rem;
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            line-height: 1.5;
+        }
+
+        .controls {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        select, input[type="number"], input[type="text"], input[type="url"] {
+            width: 100%;
+            background: var(--bg-mid);
+            border: 1px solid var(--bg-elevated);
+            border-radius: 12px;
+            padding: 0.75rem 1rem;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            transition: all 0.2s;
+        }
+
+        select:focus, input[type="number"]:focus, input[type="text"]:focus, input[type="url"]:focus {
+            outline: none;
+            border-color: var(--accent);
+            background: var(--bg-elevated);
+        }
+
+        .btn {
+            width: 100%;
+            padding: 1rem;
+            border: none;
+            border-radius: 999px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: var(--bg-deepest);
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: #5CD4FF;
+            transform: translateY(-1px);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-secondary {
+            background: var(--bg-elevated);
+            color: var(--text-primary);
+            border: 1px solid var(--bg-highest);
+            padding: 0.5rem 1rem;
+            border-radius: 999px;
+            font-size: 0.875rem;
+            width: auto;
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: var(--bg-highest);
+        }
+
+        .status-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+
+        .status-item {
+            background: var(--bg-mid);
+            border-radius: 12px;
+            padding: 1rem;
+            display: grid;
+            grid-template-columns: auto 1fr auto auto;
+            align-items: center;
+            gap: 1rem;
+            transition: all 0.2s;
+        }
+
+        .status-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+        }
+
+        .status-icon.pending { background: var(--bg-elevated); color: var(--text-dim); }
+        .status-icon.processing { background: var(--accent-dim); color: var(--accent); animation: pulse 2s infinite; }
+        .status-icon.success { background: rgba(110, 231, 183, 0.15); color: var(--success); }
+        .status-icon.error { background: rgba(248, 113, 113, 0.15); color: var(--error); }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .status-info {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+            min-width: 0;
+        }
+
+        .status-email {
+            font-size: 0.875rem;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .status-message {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .status-time {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            white-space: nowrap;
+        }
+
+        .status-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .btn-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            border: none;
+            background: var(--bg-elevated);
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+
+        .btn-icon:hover {
+            background: var(--bg-highest);
+            color: var(--accent);
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .stat-item {
+            background: var(--bg-mid);
+            border-radius: 12px;
+            padding: 1rem;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 0.25rem;
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 3rem 1rem;
+            color: var(--text-dim);
+        }
+
+        .empty-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-mid);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--bg-elevated);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--bg-highest);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 OpenAI 批量登录</h1>
+            <p class="subtitle">自动获取多个账号的 Access Token</p>
+        </header>
+
+        <div class="main-grid">
+            <!-- 左侧：输入区 -->
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">批量输入</h2>
+                    <span class="badge" id="accountCount">0 个账号</span>
+                </div>
+
+                <div class="input-group">
+                    <label>账号列表</label>
+                    <textarea
+                        id="accountsInput"
+                        placeholder="每行一个账号，格式：email----password----totp_secret
+
+示例：
+user@example.com----MyPassword123----ABCD1234EFGH5678
+user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
+                    <p class="hint">
+                        💡 格式：email----password----totp_secret（用4个短横线分隔）<br>
+                        💡 支持多行输入，每行一个账号
+                    </p>
+                </div>
+
+                <div class="input-group">
+                    <label for="proxyInput">HTTP 代理（可选）</label>
+                    <input
+                        id="proxyInput"
+                        type="text"
+                        inputmode="url"
+                        autocomplete="off"
+                        spellcheck="false"
+                        placeholder="http://用户名:密码@主机:端口">
+                    <p class="hint">
+                        例如：<code>http://user:password@proxy.example.com:8080</code>。仅支持 HTTP 代理；留空则使用启动命令中的代理。
+                    </p>
+                </div>
+
+                <div class="controls">
+                    <div class="control-group">
+                        <label>处理模式</label>
+                        <select id="modeSelect">
+                            <option value="sequential">顺序处理（推荐）</option>
+                            <option value="parallel">并发处理（快速）</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
+                        <label>并发数量</label>
+                        <input type="number" id="concurrency" value="2" min="1" max="10" disabled>
+                    </div>
+                </div>
+
+                <button class="btn btn-primary" id="startBtn">
+                    <span>▶️</span>
+                    <span>开始处理</span>
+                </button>
+            </div>
+
+            <!-- 右侧：状态区 -->
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">处理状态</h2>
+                    <button class="btn-secondary" id="exportBtn" disabled>
+                        导出结果
+                    </button>
+                </div>
+
+                <div class="stats">
+                    <div class="stat-item">
+                        <div class="stat-value" id="totalCount">0</div>
+                        <div class="stat-label">总数</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="successCount" style="color: var(--success)">0</div>
+                        <div class="stat-label">成功</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="failedCount" style="color: var(--error)">0</div>
+                        <div class="stat-label">失败</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="pendingCount">0</div>
+                        <div class="stat-label">待处理</div>
+                    </div>
+                </div>
+
+                <div class="status-grid" id="statusGrid">
+                    <div class="empty-state">
+                        <div class="empty-icon">📝</div>
+                        <p>在左侧输入账号信息后开始处理</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const accountsInput = document.getElementById('accountsInput');
+        const proxyInput = document.getElementById('proxyInput');
+        const accountCount = document.getElementById('accountCount');
+        const modeSelect = document.getElementById('modeSelect');
+        const concurrencyInput = document.getElementById('concurrency');
+        const startBtn = document.getElementById('startBtn');
+        const exportBtn = document.getElementById('exportBtn');
+        const statusGrid = document.getElementById('statusGrid');
+        const totalCount = document.getElementById('totalCount');
+        const successCount = document.getElementById('successCount');
+        const failedCount = document.getElementById('failedCount');
+        const pendingCount = document.getElementById('pendingCount');
+
+        let accounts = [];
+        let results = [];
+        let processing = false;
+
+        // 更新账号计数
+        accountsInput.addEventListener('input', () => {
+            const lines = accountsInput.value.trim().split('\n').filter(line => {
+                const trimmed = line.trim();
+                return trimmed && !trimmed.startsWith('#');
+            });
+            accountCount.textContent = `${lines.length} 个账号`;
+        });
+
+        // 并发控制显示
+        modeSelect.addEventListener('change', () => {
+            concurrencyInput.disabled = modeSelect.value === 'sequential';
+        });
+
+        // 开始处理
+        startBtn.addEventListener('click', async () => {
+            const input = accountsInput.value.trim();
+            if (!input) {
+                alert('请输入账号信息');
+                return;
+            }
+
+            // 解析账号
+            accounts = input.split('\n')
+                .filter(line => {
+                    const trimmed = line.trim();
+                    return trimmed && !trimmed.startsWith('#');
+                })
+                .map((line, index) => {
+                    const parts = line.split('----');
+                    if (parts.length !== 3) {
+                        return null;
+                    }
+                    return {
+                        id: index,
+                        email: parts[0].trim(),
+                        password: parts[1].trim(),
+                        totp_secret: parts[2].trim(),
+                        status: 'pending',
+                        message: '等待处理',
+                        result: null
+                    };
+                })
+                .filter(acc => acc !== null);
+
+            if (accounts.length === 0) {
+                alert('没有有效的账号信息，请检查格式');
+                return;
+            }
+
+            // 初始化状态
+            results = [];
+            processing = true;
+            startBtn.disabled = true;
+            exportBtn.disabled = true;
+            renderStatus();
+            updateStats();
+
+            // 处理
+            const mode = modeSelect.value;
+            if (mode === 'sequential') {
+                await processSequential();
+            } else {
+                await processParallel();
+            }
+
+            // 完成
+            processing = false;
+            startBtn.disabled = false;
+            exportBtn.disabled = results.length === 0;
+        });
+
+        // 顺序处理
+        async function processSequential() {
+            for (const account of accounts) {
+                await processAccount(account);
+            }
+        }
+
+        // 并发处理
+        async function processParallel() {
+            const concurrency = Math.min(10, Math.max(1, parseInt(concurrencyInput.value) || 2));
+            const queue = [...accounts];
+            const workers = [];
+
+            for (let i = 0; i < concurrency; i++) {
+                workers.push(async () => {
+                    while (queue.length > 0) {
+                        const account = queue.shift();
+                        if (account) {
+                            await processAccount(account);
+                        }
+                    }
+                });
+            }
+
+            await Promise.all(workers.map(w => w()));
+        }
+
+        // 处理单个账号
+        async function processAccount(account) {
+            account.status = 'processing';
+            account.message = '正在登录...';
+            account.startTime = Date.now();
+            renderStatus();
+            updateStats();
+
+            try {
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        email: account.email,
+                        password: account.password,
+                        totp_secret: account.totp_secret,
+                        proxy: proxyInput.value.trim()
+                    })
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    account.status = 'success';
+                    account.message = '登录成功';
+                    account.result = data.data;
+                    results.push({
+                        email: account.email,
+                        ...data.data
+                    });
+                } else {
+                    throw new Error(data.message || '登录失败');
+                }
+            } catch (error) {
+                account.status = 'error';
+                account.message = error.message;
+            }
+
+            account.endTime = Date.now();
+            account.duration = ((account.endTime - account.startTime) / 1000).toFixed(1) + 's';
+            renderStatus();
+            updateStats();
+        }
+
+        // 渲染状态列表
+        function renderStatus() {
+            if (accounts.length === 0) {
+                statusGrid.innerHTML = '<div class="empty-state"><div class="empty-icon">📝</div><p>在左侧输入账号信息后开始处理</p></div>';
+                return;
+            }
+
+            statusGrid.innerHTML = accounts.map(account => {
+                const icons = {
+                    pending: '⏳',
+                    processing: '⚡',
+                    success: '✅',
+                    error: '❌'
+                };
+
+                return `
+                    <div class="status-item">
+                        <div class="status-icon ${account.status}">
+                            ${icons[account.status]}
+                        </div>
+                        <div class="status-info">
+                            <div class="status-email">${account.email}</div>
+                            <div class="status-message">${account.message}</div>
+                        </div>
+                        <div class="status-time">${account.duration || '-'}</div>
+                        <div class="status-actions">
+                            ${account.result ? `
+                                <button class="btn-icon" onclick="copyToken(${account.id})" title="复制 Refresh Token">
+                                    📋
+                                </button>
+                            ` : ''}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // 更新统计
+        function updateStats() {
+            totalCount.textContent = accounts.length;
+            successCount.textContent = accounts.filter(a => a.status === 'success').length;
+            failedCount.textContent = accounts.filter(a => a.status === 'error').length;
+            pendingCount.textContent = accounts.filter(a => a.status === 'pending' || a.status === 'processing').length;
+        }
+
+        // 复制 Token
+        window.copyToken = function(id) {
+            const account = accounts.find(a => a.id === id);
+            if (account && account.result) {
+                navigator.clipboard.writeText(account.result.RefreshToken);
+                alert('Refresh Token 已复制到剪贴板');
+            }
+        };
+
+        // 导出结果
+        exportBtn.addEventListener('click', () => {
+            if (results.length === 0) {
+                alert('没有成功的结果可以导出');
+                return;
+            }
+
+            const output = {
+                type: 'sub2api-data',
+                version: 1,
+                exported_at: new Date().toISOString(),
+                proxies: [],
+                accounts: results.map(r => ({
+                    name: `${Date.now()}----${r.Email}`,
+                    platform: 'openai',
+                    type: 'oauth',
+                    credentials: {
+                        access_token: r.AccessToken,
+                        refresh_token: r.RefreshToken,
+                        chatgpt_account_id: r.ChatGPTAccountID,
+                        organization_id: r.OrganizationID,
+                        expires_at: r.ExpiresAt,
+                        expires_in: r.ExpiresIn,
+                        plan_type: r.PlanType
+                    },
+                    extra: {
+                        email: r.Email,
+                        recovery: {
+                            email: r.Email
+                        }
+                    }
+                }))
+            };
+
+            const blob = new Blob([JSON.stringify(output, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `sub2api-accounts-${Date.now()}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,1310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KKAI 账号系统</title>
+    <style>
+        :root {
+            --bg-deepest: #05070C;
+            --bg-deep: #0A0D12;
+            --bg-mid: #0F131C;
+            --bg-elevated: #161D2B;
+            --bg-highest: #1E2636;
+            --accent: #3B6DFF;
+            --accent-glow: rgba(59, 109, 255, 0.3);
+            --accent-dim: #1A2847;
+            --text-primary: #E8EEF5;
+            --text-secondary: #9BA8BC;
+            --text-dim: #6B7A92;
+            --success: #6EE7B7;
+            --warning: #E9A568;
+            --error: #F87171;
+            --border: rgba(255, 255, 255, 0.06);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(-20px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        @keyframes shimmer {
+            0% { background-position: -1000px 0; }
+            100% { background-position: 1000px 0; }
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg-deepest);
+            color: var(--text-primary);
+            height: 100dvh;
+            overflow: hidden;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: clamp(2rem, 5vw, 3rem);
+            animation: slideIn 0.6s ease-out;
+        }
+
+        .logo {
+            display: inline-flex;
+            align-items: center;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .logo-icon {
+            width: 48px;
+            height: 48px;
+            background: linear-gradient(135deg, var(--accent) 0%, #5B8DFF 100%);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            box-shadow: 0 8px 32px var(--accent-glow);
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        h1 {
+            font-size: clamp(1.75rem, 4vw, 2.5rem);
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, var(--text-primary) 0%, var(--text-secondary) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: clamp(0.875rem, 2vw, 1rem);
+            letter-spacing: 0.02em;
+        }
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+            gap: clamp(1rem, 3vw, 2rem);
+            margin-bottom: 2rem;
+        }
+
+        @media (max-width: 1024px) {
+            .main-grid {
+                grid-template-columns: minmax(0, 1fr);
+            }
+        }
+
+        .card {
+            min-width: 0;
+            background: var(--bg-deep);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: clamp(1.25rem, 3vw, 2rem);
+            animation: fadeIn 0.6s ease-out backwards;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .card:nth-child(1) { animation-delay: 0.1s; }
+        .card:nth-child(2) { animation-delay: 0.2s; }
+
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 48px rgba(0, 0, 0, 0.3);
+        }
+
+        .card-header {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 1.5rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .card-title {
+            font-size: clamp(1.125rem, 2.5vw, 1.25rem);
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .card-title::before {
+            content: '';
+            width: 4px;
+            height: 1.25rem;
+            background: linear-gradient(180deg, var(--accent) 0%, transparent 100%);
+            border-radius: 999px;
+        }
+
+        .badge {
+            background: var(--accent-dim);
+            color: var(--accent);
+            padding: 0.375rem 0.875rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            letter-spacing: 0.03em;
+            border: 1px solid rgba(59, 109, 255, 0.2);
+            transition: all 0.3s ease;
+        }
+
+        .badge:hover {
+            background: rgba(59, 109, 255, 0.2);
+            border-color: var(--accent);
+        }
+
+        .input-group {
+            margin-bottom: 1.5rem;
+        }
+
+        label {
+            display: block;
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+            letter-spacing: 0.01em;
+        }
+
+        textarea, input[type="text"], input[type="number"], input[type="search"], select {
+            width: 100%;
+            background: var(--bg-mid);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text-primary);
+            font-size: 0.9375rem;
+            padding: 0.875rem 1rem;
+            font-family: 'SF Mono', 'Monaco', 'Cascadia Code', monospace;
+            transition: all 0.3s ease;
+        }
+
+        textarea {
+            min-height: 180px;
+            resize: vertical;
+            line-height: 1.6;
+        }
+
+        textarea:focus, input:focus, select:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+            background: var(--bg-elevated);
+        }
+
+        textarea::placeholder, input::placeholder {
+            color: var(--text-dim);
+        }
+
+        .hint {
+            font-size: 0.8125rem;
+            color: var(--text-dim);
+            margin-top: 0.5rem;
+            line-height: 1.5;
+            overflow-wrap: anywhere;
+        }
+
+        .hint code {
+            background: var(--bg-elevated);
+            padding: 0.125rem 0.375rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            color: var(--accent);
+            font-family: 'SF Mono', monospace;
+        }
+
+        .preflight-panel {
+            margin-top: 0.75rem;
+            padding: 0.7rem 0.85rem;
+            border: 1px solid rgba(110, 231, 183, 0.25);
+            border-radius: 8px;
+            background: rgba(110, 231, 183, 0.05);
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            line-height: 1.5;
+        }
+
+        .preflight-panel.preflight-warning {
+            border-color: rgba(233, 165, 104, 0.35);
+            background: rgba(233, 165, 104, 0.06);
+        }
+
+        .preflight-summary strong {
+            color: var(--text-primary);
+        }
+
+        .preflight-panel ul {
+            margin: 0.35rem 0 0;
+            padding-left: 1.1rem;
+            color: var(--warning);
+        }
+
+        .preflight-ok {
+            color: var(--success);
+        }
+
+        .input-label-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+
+        .controls {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .control-group label {
+            margin-bottom: 0.5rem;
+        }
+
+        select {
+            cursor: pointer;
+            padding-right: 2.5rem;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg width='12' height='8' viewBox='0 0 12 8' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1.5L6 6.5L11 1.5' stroke='%239BA8BC' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 1rem center;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 1rem 1.5rem;
+            border: none;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
+            transform: translateX(-100%);
+            transition: transform 0.6s;
+        }
+
+        .btn:hover::before {
+            transform: translateX(100%);
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent) 0%, #5B8DFF 100%);
+            color: white;
+            box-shadow: 0 4px 24px var(--accent-glow);
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px var(--accent-glow);
+        }
+
+        .btn-primary:active:not(:disabled) {
+            transform: translateY(0);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-secondary {
+            background: var(--bg-elevated);
+            color: var(--text-secondary);
+            border: 1px solid var(--border);
+            padding: 0.5rem 1rem;
+            font-size: 0.875rem;
+            border-radius: 8px;
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: var(--bg-highest);
+            color: var(--accent);
+            border-color: var(--accent);
+        }
+
+        .btn-secondary:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .processing .btn-primary {
+            background: var(--bg-elevated);
+            color: var(--text-secondary);
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        .status-grid {
+            max-height: 600px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .status-item {
+            background: var(--bg-mid);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1rem;
+            display: grid;
+            grid-template-columns: 40px minmax(0, 1fr) auto auto;
+            gap: 1rem;
+            align-items: center;
+            transition: all 0.3s ease;
+        }
+
+        .status-item:hover {
+            background: var(--bg-elevated);
+            border-color: rgba(255, 255, 255, 0.1);
+            transform: translateX(4px);
+        }
+
+        .status-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.25rem;
+            transition: all 0.3s ease;
+        }
+
+        .status-icon.pending {
+            background: rgba(155, 168, 188, 0.1);
+            border: 1px solid rgba(155, 168, 188, 0.2);
+        }
+
+        .status-icon.processing {
+            background: rgba(59, 109, 255, 0.1);
+            border: 1px solid rgba(59, 109, 255, 0.3);
+        }
+
+        .status-icon.success {
+            background: rgba(110, 231, 183, 0.1);
+            border: 1px solid rgba(110, 231, 183, 0.3);
+        }
+
+        .status-icon.error {
+            background: rgba(248, 113, 113, 0.1);
+            border: 1px solid rgba(248, 113, 113, 0.3);
+        }
+
+        .status-info {
+            min-width: 0;
+        }
+
+        .status-email {
+            overflow-wrap: anywhere;
+            font-weight: 500;
+            margin-bottom: 0.25rem;
+            color: var(--text-primary);
+            font-family: 'SF Mono', monospace;
+            font-size: 0.875rem;
+        }
+
+        .status-message {
+            font-size: 0.8125rem;
+            color: var(--text-dim);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .status-progress {
+            margin-top: 0.5rem;
+        }
+
+        .status-progress-track {
+            height: 5px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: var(--bg-elevated);
+        }
+
+        .status-progress-bar {
+            width: 0;
+            height: 100%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, var(--accent), #6f96ff);
+            transition: width 0.45s ease;
+        }
+
+        .status-progress-label {
+            margin-top: 0.25rem;
+            color: var(--text-dim);
+            font-size: 0.6875rem;
+        }
+
+        .status-time {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            font-family: 'SF Mono', monospace;
+            white-space: nowrap;
+        }
+
+        .status-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .history-card {
+            animation-delay: 0.3s;
+        }
+
+        .check-panel { scroll-margin-top: 1rem; }
+        .check-controls { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .check-progress { margin: 1rem 0; padding: 1rem; border: 1px solid var(--border); border-radius: 10px; }
+        .check-progress progress { display: block; width: 100%; height: 0.6rem; accent-color: var(--accent); margin: 0.7rem 0; }
+        .check-progress p { color: var(--text-secondary); font-size: 0.8125rem; line-height: 1.6; }
+        .check-notice { min-height: 1.4rem; color: var(--warning); font-size: 0.8125rem; margin: 0.7rem 0; }
+        .check-details { margin: auto; color: var(--text-primary); }
+        .check-details::backdrop { background: rgba(0, 0, 0, 0.68); }
+        .check-details dl { display: grid; grid-template-columns: auto 1fr; gap: 0.4rem 1rem; font-size: 0.8125rem; }
+        .check-details dt { color: var(--text-dim); }
+        .check-details dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+
+        .history-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
+
+        .history-refresh-status {
+            color: var(--text-dim);
+            font-size: 0.8125rem;
+        }
+
+        .history-grid {
+            max-height: 520px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .history-filter-toolbar {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .history-filter-toolbar label {
+            margin-bottom: 0;
+        }
+
+        .history-filter-toolbar select {
+            display: block;
+            width: 100%;
+            margin-top: 0.35rem;
+            padding: 0.6rem 0.75rem;
+            border-radius: 8px;
+        }
+
+        .history-list-toolbar,
+        .history-pagination {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+            margin-top: 0.9rem;
+        }
+
+        .history-list-toolbar {
+            justify-content: space-between;
+            padding: 0.75rem 0;
+            margin-top: 0;
+        }
+
+        .history-selection-controls,
+        .history-batch-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.65rem;
+            flex-wrap: wrap;
+        }
+
+        .action-bar .btn-danger {
+            color: var(--error);
+            border-color: rgba(248, 113, 113, 0.35);
+        }
+
+        .history-item.history-selected {
+            border-color: var(--accent);
+        }
+
+        .history-select-all,
+        .history-pagination label {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.45rem;
+            color: var(--text-secondary);
+            font-size: 0.8125rem;
+            margin-bottom: 0;
+        }
+
+        .history-select-all input,
+        .history-select input {
+            width: 1rem;
+            height: 1rem;
+            accent-color: var(--accent);
+        }
+
+        .history-selection-status,
+        .history-batch-status,
+        .history-pagination {
+            color: var(--text-dim);
+            font-size: 0.8125rem;
+        }
+
+        .history-batch-status {
+            color: var(--accent);
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            max-height: 8rem;
+            overflow-y: auto;
+            margin: 0 0 0.75rem;
+        }
+
+        .history-pagination {
+            justify-content: flex-end;
+        }
+
+        .history-pagination select {
+            width: auto;
+            min-width: 4.25rem;
+            padding: 0.35rem 0.5rem;
+            color: var(--text-primary);
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+        }
+
+        .history-item {
+            background: var(--bg-mid);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1rem;
+            display: grid;
+            grid-template-columns: auto minmax(0, 1fr) auto;
+            gap: 0.75rem 1rem;
+            align-items: center;
+            transition: all 0.3s ease;
+        }
+
+        .history-item:hover {
+            background: var(--bg-elevated);
+            border-color: rgba(255, 255, 255, 0.1);
+        }
+
+        .history-item.history-deleted {
+            border-color: rgba(248, 113, 113, 0.35);
+        }
+
+        .history-select {
+            align-self: start;
+            padding-top: 0.15rem;
+        }
+
+        .history-main {
+            min-width: 0;
+        }
+
+        .history-email {
+            color: var(--text-primary);
+            font-family: 'SF Mono', monospace;
+            font-size: 0.9rem;
+            font-weight: 600;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .history-meta {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            margin-top: 0.45rem;
+            color: var(--text-dim);
+            font-size: 0.75rem;
+        }
+
+        .history-status {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 0.2rem 0.55rem;
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            background: var(--bg-elevated);
+        }
+
+        .history-status.success { color: var(--success); border-color: rgba(110, 231, 183, 0.35); }
+        .history-status.error, .history-status.deleted, .history-status.deactivated,
+        .history-status.deleted_or_deactivated { color: var(--error); border-color: rgba(248, 113, 113, 0.35); }
+        .history-status.running { color: var(--accent); border-color: rgba(59, 109, 255, 0.35); }
+
+        .history-expiry {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 0.2rem 0.55rem;
+            border: 1px solid var(--border);
+            background: var(--bg-elevated);
+        }
+
+        .history-expiry.valid { color: var(--success); border-color: rgba(110, 231, 183, 0.3); }
+        .history-expiry.soon { color: var(--warning); border-color: rgba(233, 165, 104, 0.35); }
+        .history-expiry.expired { color: var(--error); border-color: rgba(248, 113, 113, 0.35); }
+
+        .history-error {
+            color: var(--warning);
+            font-size: 0.8125rem;
+            line-height: 1.4;
+            margin-top: 0.5rem;
+            overflow-wrap: anywhere;
+        }
+
+        .history-actions {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .history-actions .btn-secondary {
+            white-space: nowrap;
+        }
+
+        .history-detail-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 20;
+            display: grid;
+            place-items: center;
+            padding: 1rem;
+        }
+
+        .history-detail-overlay[hidden] {
+            display: none;
+        }
+
+        .history-detail-backdrop {
+            position: absolute;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.68);
+            backdrop-filter: blur(3px);
+        }
+
+        .history-detail-panel {
+            position: relative;
+            width: min(760px, 100%);
+            max-height: min(760px, 90vh);
+            overflow: auto;
+            padding: 1.25rem;
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            background: var(--bg-deep);
+            box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+        }
+
+        .action-confirm-dialog {
+            margin: auto;
+            width: min(520px, calc(100% - 2rem));
+            max-height: calc(100dvh - 2rem);
+            color: var(--text-primary);
+        }
+
+        .action-confirm-dialog::backdrop { background: rgba(0, 0, 0, 0.68); backdrop-filter: blur(3px); }
+        .action-confirm-dialog h3 { font-size: 1.125rem; overflow-wrap: anywhere; }
+        .action-confirm-message { margin: 1rem 0 1.5rem; color: var(--text-secondary); line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+        .action-confirm-buttons { display: flex; justify-content: flex-end; gap: 0.75rem; flex-wrap: wrap; }
+        .action-confirm-buttons button { min-height: 44px; flex: 1 1 8rem; }
+        .action-confirm-buttons button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+        .action-confirm-buttons .btn-danger { color: var(--error); border-color: var(--error); }
+        .action-confirm-buttons .btn-danger:hover { color: var(--error); border-color: var(--error); background: rgba(248, 113, 113, 0.1); }
+
+        .history-detail-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .history-detail-header h3 {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 1rem;
+        }
+
+        .history-detail-summary {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.65rem;
+            margin-bottom: 1rem;
+        }
+
+        .history-detail-stat {
+            padding: 0.7rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg-mid);
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+        }
+
+        .history-attempt {
+            padding: 0.8rem 0;
+            border-top: 1px solid var(--border);
+        }
+
+        .history-attempt-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 0.75rem;
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+        }
+
+        .history-attempt-message {
+            margin-top: 0.35rem;
+            color: var(--text-dim);
+            font-size: 0.8125rem;
+            overflow-wrap: anywhere;
+        }
+
+        @media (max-width: 640px) {
+            .controls { grid-template-columns: minmax(0, 1fr); }
+            .status-item { grid-template-columns: 40px minmax(0, 1fr); }
+            .status-time, .status-actions { grid-column: 2; }
+            .status-actions { flex-wrap: wrap; }
+            .history-filter-toolbar { grid-template-columns: 1fr; }
+            .history-item { grid-template-columns: auto 1fr; }
+            .history-main { grid-column: 2; }
+            .history-select { grid-row: 1 / span 2; }
+            .history-actions { grid-column: 1 / -1; }
+            .history-actions { justify-content: flex-start; }
+            .history-pagination { justify-content: flex-start; }
+            .history-detail-summary { grid-template-columns: 1fr; }
+        }
+
+        .btn-icon {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border: 1px solid var(--border);
+            background: var(--bg-elevated);
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+            font-size: 1rem;
+        }
+
+        .btn-icon:hover {
+            background: var(--bg-highest);
+            color: var(--accent);
+            border-color: var(--accent);
+            transform: scale(1.1);
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .stat-item {
+            background: var(--bg-mid);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.25rem 1rem;
+            text-align: center;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .stat-item::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, var(--accent) 0%, transparent 100%);
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .stat-item:hover::before {
+            opacity: 1;
+        }
+
+        .stat-item:hover {
+            background: var(--bg-elevated);
+            transform: translateY(-2px);
+        }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 0.375rem;
+            font-family: 'SF Mono', monospace;
+            letter-spacing: -0.02em;
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 4rem 1rem;
+            color: var(--text-dim);
+        }
+
+        .empty-icon {
+            font-size: 4rem;
+            margin-bottom: 1rem;
+            opacity: 0.4;
+        }
+
+        ::-webkit-scrollbar {
+            width: 10px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-mid);
+            border-radius: 5px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--bg-elevated);
+            border-radius: 5px;
+            border: 2px solid var(--bg-mid);
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--bg-highest);
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        /* ===== TAB ARCHITECTURE ===== */
+        .tab-shell { display: flex; flex-direction: column; height: 100dvh; min-width: 0; }
+
+        .tab-nav {
+            display: flex; align-items: stretch; flex-wrap: wrap;
+            background: var(--bg-deep); border-bottom: 1px solid var(--border);
+            flex-shrink: 0; padding: 0 clamp(0.5rem, 3vw, 2rem); min-height: 52px;
+        }
+        .tab-buttons { display: flex; margin-left: auto; min-width: 0; max-width: 100%; overflow-x: auto; }
+
+        .tab-btn {
+            background: none; border: none; border-bottom: 3px solid transparent;
+            color: var(--text-secondary); cursor: pointer;
+            font-size: 0.875rem; font-weight: 500;
+            padding: 0 1.1rem; display: flex; align-items: center; gap: 0.45rem;
+            margin-bottom: -1px; transition: color 150ms, border-color 150ms;
+            white-space: nowrap; flex-shrink: 0; min-height: 52px;
+        }
+        .tab-btn:hover { color: var(--text-primary); }
+        .tab-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+        .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+        .tab-badge {
+            background: var(--bg-highest); border-radius: 10px;
+            color: var(--text-dim); font-size: 0.72rem; font-variant-numeric: tabular-nums;
+            min-width: 1.3rem; padding: 0.1rem 0.45rem; text-align: center;
+        }
+        .tab-badge:empty { display: none; }
+        .tab-badge--warn { background: rgba(233,165,104,0.15); color: var(--warning); }
+
+        .tab-panel { display: none; flex: 1; min-height: 0; min-width: 0; overflow-y: auto; padding: clamp(1rem, 2.5vw, 1.75rem) clamp(1rem, 3vw, 2rem); }
+        .tab-panel.active { display: block; }
+        .tab-panel[hidden] { display: none; }
+
+        .tab-login-grid, .tab-history-inner, .tab-check-inner { max-width: 1400px; margin: 0 auto; }
+
+        .tab-brand {
+            display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 0.25rem; min-width: 0;
+        }
+        .tab-brand .logo-icon { width: 28px; height: 28px; font-size: 1rem; flex-shrink: 0; margin: 0; animation: none; }
+        .tab-brand h1 { font-size: 1rem; font-weight: 700; margin: 0; overflow-wrap: anywhere;
+            background: linear-gradient(135deg, var(--text-primary) 0%, var(--text-secondary) 100%);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+
+        @media (max-width: 640px) {
+            .tab-brand { width: 100%; }
+            .tab-buttons { width: 100%; margin-left: 0; }
+            .tab-btn { flex: 1 0 auto; min-height: 44px; justify-content: center; padding: 0 0.5rem; }
+        }
+
+        /* body CSS override for tab layout */
+        body { padding: 0; overflow: hidden; }
+
+        /* Remove fixed scroll constraints */
+        .history-grid { max-height: none !important; overflow-y: visible !important; }
+        .status-grid { max-height: none !important; overflow-y: visible !important; }
+
+        /* ===== ACTION BAR ===== */
+        .action-bar {
+            flex-shrink: 0; max-height: 40dvh; overflow-y: auto;
+            background: var(--bg-elevated); border-top: 1px solid var(--border);
+            padding: 0.6rem clamp(1rem, 3vw, 2rem);
+            padding-bottom: max(0.6rem, env(safe-area-inset-bottom));
+            display: flex; align-items: center; gap: 0.65rem; flex-wrap: wrap;
+            box-shadow: 0 -4px 24px rgba(0,0,0,0.45);
+        }
+        .action-bar[hidden] { display: none; }
+        .action-bar .action-bar-label { color: var(--text-secondary); font-size: 0.8rem; flex: 1; min-width: 6rem; }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+        }
+    </style>
+</head>
+<body>
+    <div class="tab-shell">
+        <nav class="tab-nav" aria-label="功能模块">
+            <div class="tab-brand">
+                <div class="logo-icon">🤖</div>
+                <h1>KKAI 账号系统</h1>
+            </div>
+            <div class="tab-buttons" role="tablist" aria-label="功能模块">
+                <button id="tab-login" class="tab-btn active" type="button" role="tab" aria-selected="true" aria-controls="panel-login" tabindex="0" data-tab="login">批量登录</button>
+                <button id="tab-history" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="panel-history" tabindex="-1" data-tab="history">账号历史<span class="tab-badge" id="tabBadgeHistory"></span></button>
+                <button id="tab-checks" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="panel-checks" tabindex="-1" data-tab="checks">账号检测<span class="tab-badge tab-badge--warn" id="tabBadgeChecks"></span></button>
+            </div>
+        </nav>
+
+        <!-- ── 批量登录 ── -->
+        <div id="panel-login" class="tab-panel active" data-tab="login" role="tabpanel" aria-labelledby="tab-login" tabindex="0">
+            <div class="tab-login-grid">
+        <div class="main-grid">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">批量输入</h2>
+                    <span class="badge" id="accountCount">0 个账号</span>
+                </div>
+
+                <div class="input-group">
+                    <label>账号列表</label>
+                    <textarea
+                        id="accountsInput"
+                        placeholder="每行一个账号，支持3或4个短横线分隔
+
+示例：
+user@example.com---MyPassword123---ABCD1234EFGH5678
+user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
+                    <p class="hint">
+                        💡 格式：<code>email---password---totp_secret</code>（支持3或4个短横线分隔）<br>
+                        💡 支持多行输入，每行一个账号
+                    </p>
+                    <div class="preflight-panel" id="accountPreflight" role="status" aria-live="polite"></div>
+                </div>
+
+                <div class="input-group">
+                    <div class="input-label-row">
+                        <label for="proxyInput">HTTP 代理</label>
+                        <button class="btn-secondary" id="proxyCheckBtn" type="button">测试代理</button>
+                    </div>
+                    <input
+                        id="proxyInput"
+                        type="text"
+                        inputmode="url"
+                        autocomplete="off"
+                        spellcheck="false"
+                        placeholder="http://用户名:密码@主机:端口">
+                    <p class="hint">
+                        例如：<code>http://user:pass@proxy.example.com:8080</code>。留空使用启动命令中的代理。
+                    </p>
+                    <p class="hint" id="proxyCheckStatus" role="status" aria-live="polite"></p>
+                </div>
+
+                <div class="controls">
+                    <div class="control-group">
+                        <label>处理模式</label>
+                        <select id="modeSelect">
+                            <option value="parallel" selected>并发处理（默认 1）</option>
+                            <option value="sequential">顺序处理（逐个）</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
+                        <label>并发数量</label>
+                        <input type="number" id="concurrency" value="1" min="1" max="10">
+                    </div>
+                </div>
+
+                <p class="hint">默认逐个处理账号以降低上游验证压力；确认单账号稳定后，可手动提高并发数量。</p>
+
+                <button class="btn btn-primary" id="startBtn">
+                    <span>▶️</span>
+                    <span>开始处理</span>
+                </button>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">处理状态</h2>
+                    <button class="btn-secondary" id="retryFailedBtn" disabled>
+                        重试全部失败
+                    </button>
+                    <button class="btn-secondary" id="exportBtn" disabled>
+                        导出结果
+                    </button>
+                </div>
+
+                <div class="stats">
+                    <div class="stat-item">
+                        <div class="stat-value" id="totalCount">0</div>
+                        <div class="stat-label">总数</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="successCount" style="color: var(--success)">0</div>
+                        <div class="stat-label">成功</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="failedCount" style="color: var(--error)">0</div>
+                        <div class="stat-label">失败</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="pendingCount">0</div>
+                        <div class="stat-label">待处理</div>
+                    </div>
+                </div>
+
+                <div class="status-grid" id="statusGrid">
+                    <div class="empty-state">
+                        <div class="empty-icon">📝</div>
+                        <p>在左侧输入账号信息后开始处理</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+            </div>
+        </div>
+
+        <!-- ── 账号历史 ── -->
+        <div id="panel-history" class="tab-panel" data-tab="history" role="tabpanel" aria-labelledby="tab-history" tabindex="0" hidden>
+            <div class="tab-history-inner">
+                <div class="card history-card">
+            <div class="card-header">
+                <h2 class="card-title">账号历史</h2>
+                <div class="history-toolbar">
+                    <span class="history-refresh-status" id="historyRefreshStatus" role="status" aria-live="polite"></span>
+                    <button class="btn-secondary" id="refreshHistoryBtn" type="button">刷新历史</button>
+                </div>
+            </div>
+            <p class="hint" style="margin-top: -0.75rem; margin-bottom: 1rem;">
+                这里只显示账号状态和错误摘要，不会显示密码或 TOTP；重新登录成功后可复制 Refresh Token。已确认被官方删除的账号会提示清理记录。
+            </p>
+            <div class="input-group">
+                <label for="historySearchInput">搜索账号</label>
+                <input type="search" id="historySearchInput" placeholder="输入邮箱或邮箱片段" autocomplete="off" spellcheck="false" aria-controls="historyGrid" disabled>
+            </div>
+            <div class="history-filter-toolbar">
+                <label for="historyStatusFilter">状态
+                    <select id="historyStatusFilter">
+                        <option value="all" selected>全部</option>
+                        <option value="available">可用</option>
+                        <option value="failed">登录失败</option>
+                        <option value="deactivated">停用或删除</option>
+                        <option value="processing">处理中</option>
+                        <option value="expired">访问令牌已过期</option>
+                        <option value="other">中断或未知</option>
+                    </select>
+                </label>
+                <label for="historySort">排序
+                    <select id="historySort">
+                        <option value="updated_desc" selected>最近更新</option>
+                        <option value="last_success_desc">最近成功</option>
+                        <option value="expires_asc">访问令牌到期最早</option>
+                        <option value="attempt_desc">尝试次数最多</option>
+                        <option value="email_asc">邮箱 A-Z</option>
+                    </select>
+                </label>
+            </div>
+            <div class="history-list-toolbar" aria-label="账号选择与批量操作">
+                <div class="history-selection-controls">
+                    <label class="history-select-all">
+                        <input type="checkbox" id="historySelectAll" aria-label="全选当前页账号" disabled>
+                        <span>全选当前页</span>
+                    </label>
+                </div>
+            </div>
+            <p class="history-batch-status" id="historyBatchStatus" role="status" aria-live="polite" hidden></p>
+            <div class="history-grid" id="historyGrid">
+                <div class="empty-state"><div class="empty-icon">🗂️</div><p>正在加载账号历史…</p></div>
+            </div>
+            <div class="history-pagination" aria-label="账号历史分页">
+                <span id="historyPageInfo">暂无账号</span>
+                <label>每页
+                    <select id="historyPageSize" aria-label="每页显示数量">
+                        <option value="20" selected>20</option>
+                        <option value="50">50</option>
+                        <option value="100">100</option>
+                    </select>
+                </label>
+                <button class="btn-secondary" id="historyPrevPageBtn" type="button" disabled>上一页</button>
+                <button class="btn-secondary" id="historyNextPageBtn" type="button" disabled>下一页</button>
+            </div>
+                </div>
+            </div>
+            <div class="history-detail-overlay" id="historyDetail" hidden>
+                <div class="history-detail-backdrop" data-history-detail-close></div>
+                <section class="history-detail-panel" role="dialog" aria-modal="true" aria-labelledby="historyDetailTitle" tabindex="-1">
+                    <div class="history-detail-header">
+                        <h3 id="historyDetailTitle">账号详情</h3>
+                        <button class="btn-icon" id="historyDetailClose" type="button" aria-label="关闭详情">×</button>
+                    </div>
+                    <div id="historyDetailBody"><div class="empty-state"><p>正在加载详情…</p></div></div>
+                </section>
+            </div>
+        </div>
+
+        <!-- ── 账号检测 ── -->
+        <div id="panel-checks" class="tab-panel" data-tab="checks" role="tabpanel" aria-labelledby="tab-checks" tabindex="0" hidden>
+            <div class="tab-check-inner">
+                <section class="card check-panel" id="accountChecksPanel" aria-labelledby="checkTitle">
+            <div class="card-header">
+                <h2 class="card-title" id="checkTitle">账号检测</h2>
+                <button class="btn-secondary" id="checkRefresh" type="button">刷新检测账号</button>
+            </div>
+            <p class="hint">检测 AUTH 记录已导入 Sub2 的账号，使用 AUTH 当前保存的访问令牌。一次小模型请求可能产生用量；结果不代表 Sub2 当前凭据状态。明确收到 401 或凭据失效时，可在账号行点击“恢复账号”，重新登录并写回原 Sub2 账号。</p>
+            <div class="input-group">
+                <label for="checkSearch">搜索检测账号</label>
+                <input type="search" id="checkSearch" placeholder="输入邮箱或邮箱片段" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="history-filter-toolbar check-controls">
+                <label for="checkFilter">检测结果
+                    <select id="checkFilter">
+                        <option value="all">全部</option><option value="never">尚无完成检测</option><option value="ok">上次正常</option>
+                        <option value="401">收到 HTTP 401</option><option value="stream_auth">流内鉴权失败</option><option value="credential">凭据待更新</option>
+                        <option value="limit">限流或额度不足</option><option value="permission">权限或模型不可用</option><option value="network">网络或代理错误</option>
+                        <option value="other">其他异常</option><option value="stale">结果已过时</option>
+                    </select>
+                </label>
+                <label for="checkRoute">检测出口
+                    <select id="checkRoute"><option value="default">服务器默认代理</option><option value="direct">sys1 IPv4 直连</option></select>
+                </label>
+                <label for="checkConcurrency">检测并发
+                    <select id="checkConcurrency"><option value="1">1</option><option value="2" selected>2</option></select>
+                </label>
+            </div>
+            <p class="hint" id="checkModel">模型：正在读取服务配置…</p>
+            <div class="history-list-toolbar">
+                <label class="history-select-all"><input type="checkbox" id="checkSelectAll" disabled><span>全选当前页可检测账号</span></label>
+                <span class="history-selection-status" id="checkSelection">已选 0 个</span>
+                <button class="btn-secondary" id="checkClear" type="button" disabled>清空选择</button>
+                <button class="btn-secondary" id="checkStart" type="button" disabled>开始检测</button>
+            </div>
+            <p class="check-notice" id="checkNotice" role="status" aria-live="polite"></p>
+            <div class="check-progress" id="checkProgress" hidden>
+                <div class="history-toolbar"><strong id="checkBatchTitle"></strong><button class="btn-secondary" id="checkStop" type="button">停止检测</button><button class="btn-secondary" id="checkRetry" type="button" hidden>选择未完成项重试</button></div>
+                <progress id="checkProgressBar" max="100" value="0" aria-label="检测批次结束比例"></progress>
+                <p id="checkBatchCounts" role="status" aria-live="polite"></p>
+                <p id="checkBatchRoute"></p>
+            </div>
+            <div class="history-toolbar"><span class="history-refresh-status" id="checkListStatus">正在读取账号…</span><button class="btn-secondary" id="checkApplyFilter" type="button" hidden>更新筛选结果</button></div>
+            <div class="history-grid" id="checkGrid" style="margin-top: 0.75rem"></div>
+            <div class="history-pagination" aria-label="检测账号分页">
+                <span id="checkPageInfo"></span><label for="checkPageSize">每页<select id="checkPageSize"><option value="20">20</option><option value="50">50</option><option value="100">100</option></select></label>
+                <button class="btn-secondary" id="checkPrev" type="button">上一页</button><button class="btn-secondary" id="checkNext" type="button">下一页</button>
+            </div>
+            <dialog class="history-detail-panel check-details" id="checkDetails" aria-labelledby="checkDetailsTitle">
+                <div class="history-detail-header"><h3 id="checkDetailsTitle">检测详情</h3><button class="btn-icon" id="checkDetailsClose" type="button" aria-label="关闭检测详情">×</button></div>
+                <p class="hint">检测使用 AUTH 当前保存的凭据。401 不等于账号永久失效；访问令牌过期不代表 Refresh Token 失效。需要更新凭据时，请在账号历史中重新登录。</p>
+                <p class="check-notice" id="checkDetailsStatus" role="status"></p><div id="checkDetailsBody"></div>
+            </dialog>
+                </section>
+            </div>
+        </div>
+
+        <!-- History selection actions occupy their own row below the scrolling panel. -->
+        <div class="action-bar" id="historyActionBar" role="group" aria-label="历史账号批量操作" hidden>
+            <span class="action-bar-label" id="historySelectionStatus" role="status" aria-live="polite">已选 0 个</span>
+            <button class="btn-secondary" id="historyClearSelectionBtn" type="button" disabled>清空选择</button>
+            <button class="btn-secondary" id="historyBatchReloginBtn" type="button" title="复活所选的失败、中断或停用账号" disabled>批量复活</button>
+            <button class="btn-secondary" id="historyBatchImportBtn" type="button" title="将所选可导入账号加入 Sub2 未分组" disabled>导入 Sub2</button>
+            <button class="btn-secondary btn-danger" id="historyBatchDeleteBtn" type="button" disabled>批量删除</button>
+        </div>
+    </div>
+
+    <dialog class="history-detail-panel action-confirm-dialog" id="actionConfirmDialog" role="dialog" aria-modal="true" aria-labelledby="actionConfirmTitle" aria-describedby="actionConfirmMessage" tabindex="-1">
+        <h3 id="actionConfirmTitle">确认操作</h3>
+        <p class="action-confirm-message" id="actionConfirmMessage"></p>
+        <div class="action-confirm-buttons">
+            <button class="btn-secondary" id="actionConfirmCancel" type="button" autofocus>取消</button>
+            <button class="btn-secondary" id="actionConfirmAccept" type="button">继续</button>
+        </div>
+    </dialog>
+
+    <script src="/api/client.js"></script>
+    <script src="/api/account-checks.js"></script>
+</body>
+</html>

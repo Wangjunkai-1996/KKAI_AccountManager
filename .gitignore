@@ -1,0 +1,39 @@
+.sub2api.env
+.sub2api-key.*
+
+# Local configuration and credentials
+.env
+.env.*
+*.env
+!.env.example
+!.env.template
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Account data and exported credentials
+/data/
+/work/
+accounts*.txt
+sub2api-accounts*.json
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Build artifacts
+/bin/
+/build/
+/dist/
+/release/
+/openai-login
+/openai-login-web
+
+# Local browser output, logs, and OS files
+/.playwright-mcp/
+*.log
+.DS_Store
+*~
