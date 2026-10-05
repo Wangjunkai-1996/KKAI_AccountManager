@@ -435,6 +435,7 @@
             await readBatch(id);
             notice(payload.reused ? '已恢复原检测任务，没有重复发送请求。' : '检测已开始。刷新或关闭页面不会终止后台任务。');
             if (!activeID) await refreshAccounts({ reapply: true, invalidate: true });
+            return true;
         } catch (error) {
             if (error.definitive) savePending(null);
             if (error.payload?.code === 'batch_active' && error.payload.active_batch_id) {
@@ -442,16 +443,21 @@
                 try { await readBatch(activeID); } catch (_) { /* Poll resumes safely. */ }
             }
             notice(pendingRequest ? '提交结果尚未确认。点击“重试提交”会使用同一任务编号，不会重复创建。' : error.message || '检测提交失败');
+            return false;
         } finally { submitting = false; render(); schedulePoll(); }
     }
     async function startSingle(id) {
+        return startMany([String(id)]);
+    }
+    async function startMany(ids) {
         window.AuthTabs?.select('checks');
         await refreshAll();
-        if (pendingRequest) { notice('另有一次提交结果未确认，请先点击“重试提交”恢复原任务，再检测这个账号。'); return; }
-        if (activeID) return start([]);
-        const cooldown = remaining(summaries.get(String(id)));
-        if (cooldown) { notice(`该凭据刚刚检测过，请 ${cooldown} 秒后重试；上次检测结果已保留。`); return; }
-        return start([String(id)]);
+        if (pendingRequest) { notice('另有一次提交结果未确认，请先点击“重试提交”恢复原任务，再检测这个账号。'); return false; }
+        if (activeID) { notice('已有检测批次正在执行，当前页面显示其进度。'); return false; }
+        const unique = [...new Set((ids || []).map(String))];
+        const cooldown = unique.find(id => remaining(summaries.get(id)));
+        if (cooldown) { notice(`部分凭据刚刚检测过，请稍后重试；上次检测结果已保留。`); return false; }
+        return start(unique);
     }
     async function stop() {
         if (!activeID || stopping) return;
@@ -576,7 +582,7 @@
         if (event.detail.name === 'checks') void refreshAll();
         else if (ui.Details.open) ui.Details.close();
     });
-    window.AccountChecks = { startSingle, recoverAccount: startRecovery };
+    window.AccountChecks = { startSingle, startMany, recoverAccount: startRecovery };
     if (pendingRequest) notice('有一次提交结果未确认；重试提交会沿用原任务编号。');
     void refreshAll();
 })();

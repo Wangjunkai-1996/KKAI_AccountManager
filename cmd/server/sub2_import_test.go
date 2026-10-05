@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -91,6 +92,9 @@ func TestSub2ImportPostsAndReconcilesUnGroupedAccount(t *testing.T) {
 	if err != nil || got.State != "imported" || got.Sub2AccountID != 42 || importedName == "" {
 		t.Fatalf("import task = %+v err=%v", got, err)
 	}
+	if !regexp.MustCompile(`^AUTH_[0-9]{8}_sub2@example\.com$`).MatchString(importedName) {
+		t.Fatalf("unexpected display name %q", importedName)
+	}
 }
 
 func TestListSub2AccountStatusesReadsDetailAndDistinguishesMissing(t *testing.T) {
@@ -136,6 +140,34 @@ func TestListSub2AccountStatusesMarksTransportFailuresUnknown(t *testing.T) {
 	got := statuses[accountID]
 	if got.Exists || !got.Unknown || !got.Stale || got.Error == "" {
 		t.Fatalf("transport status = %+v", got)
+	}
+}
+
+func TestListSub2AccountStatusesPropagatesRuntimeCooldowns(t *testing.T) {
+	history, accountID := testOAuthStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		future := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339Nano)
+		past := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)
+		_, _ = w.Write([]byte(`{"code":0,"data":{"id":42,"status":"active","schedulable":true,"error_message":"","rate_limited_at":"` + past + `","rate_limit_reset_at":"` + future + `","overload_until":null,"temp_unschedulable_until":null,"temp_unschedulable_reason":"","expires_at":null}}`))
+	}))
+	defer server.Close()
+	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
+	status := service.listSub2AccountStatuses(context.Background(), []store.Sub2Import{{DestinationKey: "test", AccountID: accountID, Sub2AccountID: 42, State: "imported"}})[accountID]
+	if status.RateLimitedAt == nil || status.RateLimitResetAt == nil || status.EffectiveSchedulable == nil || *status.EffectiveSchedulable {
+		t.Fatalf("future rate limit was not propagated/effective schedulability disabled: %+v", status)
+	}
+}
+
+func TestRemoteStatusTimeAndEffectiveSchedulableExpiry(t *testing.T) {
+	if parsed, ok := remoteStatusTime("2026-01-02T03:04:05.123Z"); !ok || parsed.Year() != 2026 {
+		t.Fatalf("RFC3339 parse failed: %v %v", parsed, ok)
+	}
+	if parsed, ok := remoteStatusTime(float64(time.Now().UnixMilli())); !ok || parsed.IsZero() {
+		t.Fatalf("millisecond parse failed: %v %v", parsed, ok)
+	}
+	if _, ok := remoteStatusTime("not-a-time"); ok {
+		t.Fatal("malformed optional timestamp treated as valid")
 	}
 }
 

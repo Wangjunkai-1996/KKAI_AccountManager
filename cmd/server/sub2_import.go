@@ -156,8 +156,11 @@ func (s *sub2ImportService) buildPayloadWithOperation(accountID int64, operation
 	if err != nil {
 		return nil, "", "", err
 	}
-	marker := "AUTH-" + operationID
-	name := marker + " | " + email
+	// Keep the display name human-readable; the operation marker remains in
+	// `extra.kkai_auth_import` and is used for reconciliation/idempotency.
+	// The service runs in UTC on sys1, so format in the product's local zone.
+	localZone := time.FixedZone("Asia/Shanghai", 8*60*60)
+	name := "AUTH_" + time.Now().In(localZone).Format("01021504") + "_" + email
 	if len([]rune(name)) > 100 {
 		name = string([]rune(name)[:100])
 	}
@@ -300,17 +303,24 @@ type sub2ListResponse struct {
 // current remote account state. A failed lookup is marked stale/unknown so a
 // transient management API failure cannot be mistaken for a deleted account.
 type sub2AccountStatus struct {
-	Exists            bool      `json:"exists"`
-	Imported          bool      `json:"imported"`
-	Sub2AccountID     int64     `json:"sub2_account_id,omitempty"`
-	Status            string    `json:"status,omitempty"`
-	Schedulable       *bool     `json:"schedulable,omitempty"`
-	ErrorMessage      string    `json:"error_message,omitempty"`
-	CheckedAt         time.Time `json:"checked_at"`
-	Stale             bool      `json:"stale,omitempty"`
-	Error             string    `json:"error,omitempty"`
-	Unknown           bool      `json:"unknown,omitempty"`
-	AssociationStatus string    `json:"association_status,omitempty"`
+	Exists                  bool      `json:"exists"`
+	Imported                bool      `json:"imported"`
+	Sub2AccountID           int64     `json:"sub2_account_id,omitempty"`
+	Status                  string    `json:"status,omitempty"`
+	Schedulable             *bool     `json:"schedulable,omitempty"`
+	EffectiveSchedulable    *bool     `json:"effective_schedulable,omitempty"`
+	ErrorMessage            string    `json:"error_message,omitempty"`
+	RateLimitedAt           any       `json:"rate_limited_at,omitempty"`
+	RateLimitResetAt        any       `json:"rate_limit_reset_at,omitempty"`
+	OverloadUntil           any       `json:"overload_until,omitempty"`
+	TempUnschedulableUntil  any       `json:"temp_unschedulable_until,omitempty"`
+	TempUnschedulableReason string    `json:"temp_unschedulable_reason,omitempty"`
+	ExpiresAt               any       `json:"expires_at,omitempty"`
+	CheckedAt               time.Time `json:"checked_at"`
+	Stale                   bool      `json:"stale,omitempty"`
+	Error                   string    `json:"error,omitempty"`
+	Unknown                 bool      `json:"unknown,omitempty"`
+	AssociationStatus       string    `json:"association_status,omitempty"`
 }
 
 var (
@@ -605,10 +615,62 @@ func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, che
 	status.Exists = true
 	status.Status, _ = detail["status"].(string)
 	status.ErrorMessage, _ = detail["error_message"].(string)
+	status.RateLimitedAt = detail["rate_limited_at"]
+	status.RateLimitResetAt = detail["rate_limit_reset_at"]
+	status.OverloadUntil = detail["overload_until"]
+	status.TempUnschedulableUntil = detail["temp_unschedulable_until"]
+	status.TempUnschedulableReason, _ = detail["temp_unschedulable_reason"].(string)
+	status.ExpiresAt = detail["expires_at"]
 	if value, ok := detail["schedulable"].(bool); ok {
 		status.Schedulable = &value
+		effective := value
+		if strings.EqualFold(strings.TrimSpace(status.Status), "active") {
+			now := time.Now()
+			for _, key := range []string{"rate_limit_reset_at", "overload_until", "temp_unschedulable_until"} {
+				if t, ok := remoteStatusTime(detail[key]); ok && t.After(now) {
+					effective = false
+				}
+			}
+			if t, ok := remoteStatusTime(detail["expires_at"]); ok && !t.After(now) {
+				effective = false
+			}
+		} else if !strings.EqualFold(strings.TrimSpace(status.Status), "active") {
+			effective = false
+		}
+		status.EffectiveSchedulable = &effective
 	}
 	return status
+}
+
+// remoteStatusTime accepts the RFC3339 timestamps emitted by Sub2 and keeps a
+// small numeric fallback for older installations that serialized Unix seconds
+// or milliseconds. Unknown values are ignored so a malformed optional field
+// cannot turn a healthy account into a false pause.
+func remoteStatusTime(value any) (time.Time, bool) {
+	switch v := value.(type) {
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return time.Time{}, false
+		}
+		for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+			if parsed, err := time.Parse(layout, v); err == nil {
+				return parsed, true
+			}
+		}
+	case float64:
+		if v > 1e12 {
+			return time.UnixMilli(int64(v)), true
+		}
+		if v > 0 {
+			return time.Unix(int64(v), 0), true
+		}
+	case json.Number:
+		parsed, err := v.Float64()
+		if err == nil {
+			return remoteStatusTime(parsed)
+		}
+	}
+	return time.Time{}, false
 }
 
 func (s *sub2ImportService) apiJSON(ctx context.Context, method, path string, query url.Values, out any) error {
@@ -673,7 +735,10 @@ func (s *sub2ImportService) reconcile(ctx context.Context, id int64) error {
 	query.Set("type", "oauth")
 	query.Set("lite", "1")
 	query.Set("group", "ungrouped")
-	query.Set("search", task.OperationID)
+	// The display name is intentionally human-readable and no longer embeds
+	// the opaque operation ID. Search by the account email, then verify the
+	// signed local marker below.
+	query.Set("search", task.AccountEmail)
 	query.Set("page_size", "1000")
 	for page := 1; page <= 20; page++ {
 		query.Set("page", strconv.Itoa(page))
@@ -690,7 +755,7 @@ func (s *sub2ImportService) reconcile(ctx context.Context, id int64) error {
 	}
 	candidates := make([]map[string]any, 0, len(list.Items))
 	for _, item := range list.Items {
-		if strings.Contains(fmt.Sprint(item["name"]), task.OperationID) && matchesImportMarker(item, task) {
+		if matchesImportMarker(item, task) {
 			candidates = append(candidates, item)
 		}
 	}

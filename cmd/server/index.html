@@ -709,6 +709,7 @@
         .history-status.success, .history-status.sub2-ok { color: var(--success); border-color: rgba(110, 231, 183, 0.35); }
         .history-status.sub2-error { color: var(--error); border-color: rgba(248, 113, 113, 0.35); }
         .history-status.sub2-unknown { color: var(--warning); border-color: rgba(233, 165, 104, 0.35); }
+        .history-status.sub2-warning { color: var(--warning); border-color: rgba(233, 165, 104, 0.55); }
         .history-status.error, .history-status.deleted, .history-status.deactivated,
         .history-status.deleted_or_deactivated { color: var(--error); border-color: rgba(248, 113, 113, 0.35); }
         .history-status.running { color: var(--accent); border-color: rgba(59, 109, 255, 0.35); }
@@ -1171,6 +1172,7 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                         <div class="stat-label">待处理</div>
                     </div>
                 </div>
+                <p class="history-batch-status" id="batchImportStatus" role="status" aria-live="polite" hidden></p>
 
                 <div class="status-grid" id="statusGrid">
                     <div class="empty-state">
@@ -1203,7 +1205,7 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                 这里只显示账号状态和错误摘要，不会显示密码或 TOTP；重新登录成功后可复制 Refresh Token。已确认被官方删除的账号会提示清理记录。
             </p>
             <p class="hint" id="autoRecoveryDetail" role="status" aria-live="polite">正在读取自动恢复设置…</p>
-            <p class="hint">检测会发起少量模型请求。仅对仍在 Sub2 中的异常账号确认凭据是否失效；正常、人工暂停、已禁用或已删除的账号不会自动恢复。</p>
+            <p class="hint">检测会发起少量模型请求。历史行的 Sub2 状态来自详情接口：原始“可调度”是人工开关，限流、过载、临时暂停和凭据过期会另外标记为“暂不可调度”。AUTH 401 与 Sub2 凭据状态分别显示；仅对仍在 Sub2 中的异常账号确认凭据是否失效，正常、人工暂停、已禁用或已删除的账号不会自动恢复。</p>
             <div class="input-group">
                 <label for="historySearchInput">搜索账号</label>
                 <input type="search" id="historySearchInput" placeholder="输入邮箱或邮箱片段" autocomplete="off" spellcheck="false" aria-controls="historyGrid" disabled>
@@ -1236,6 +1238,8 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                         <input type="checkbox" id="historySelectAll" aria-label="全选当前页账号" disabled>
                         <span>全选当前页</span>
                     </label>
+                    <button class="btn-secondary" id="historyCheckNowBtn" type="button" disabled>立即检测</button>
+                    <span class="history-setting-status" id="historyCheckNowStatus" role="status" aria-live="polite"></span>
                 </div>
             </div>
             <p class="history-batch-status" id="historyBatchStatus" role="status" aria-live="polite" hidden></p>

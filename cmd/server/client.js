@@ -100,6 +100,9 @@ const historyBatchStatus = document.getElementById('historyBatchStatus');
 const historyClearSelectionBtn = document.getElementById('historyClearSelectionBtn');
 const historyBatchDeleteBtn = document.getElementById('historyBatchDeleteBtn');
 const historyBatchImportBtn = document.getElementById('historyBatchImportBtn');
+const historyCheckNowBtn = document.getElementById('historyCheckNowBtn');
+const historyCheckNowStatus = document.getElementById('historyCheckNowStatus');
+const batchImportStatus = document.getElementById('batchImportStatus');
 const historyPageInfo = document.getElementById('historyPageInfo');
 const historyPageSizeSelect = document.getElementById('historyPageSize');
 const historyPrevPageBtn = document.getElementById('historyPrevPageBtn');
@@ -169,6 +172,7 @@ let historyPageSize = 20;
 let historyBatchRunning = false;
 let historyBatchStats = null;
 let historyBatchSummary = '';
+let batchImportProgress = null;
 let historyLoadError = '';
 let historySub2Configured = true;
 let historyImportsAvailable = true;
@@ -349,6 +353,7 @@ historyClearSelectionBtn.addEventListener('click', () => {
 });
 historyBatchDeleteBtn.addEventListener('click', () => deleteHistoryAccounts([...historySelectedIDs]));
 historyBatchImportBtn.addEventListener('click', () => batchImportHistory());
+historyCheckNowBtn?.addEventListener('click', () => checkHistoryNow());
 historyPageSizeSelect.addEventListener('change', () => {
     historyPageSize = Math.max(1, Number(historyPageSizeSelect.value) || 20);
     historyPage = 1;
@@ -657,13 +662,26 @@ function normalizeSub2Status(value) {
         sub2AccountID: String(source.sub2_account_id ?? source.sub2AccountId ?? source.id ?? ''),
         status: String(source.status || 'unknown').toLowerCase(),
         schedulable: typeof source.schedulable === 'boolean' ? source.schedulable : null,
+        effectiveSchedulable: typeof source.effective_schedulable === 'boolean' ? source.effective_schedulable : null,
         errorMessage: String(source.error_message || source.errorMessage || ''),
+        rateLimitedAt: source.rate_limited_at || source.rateLimitedAt || '',
+        rateLimitResetAt: source.rate_limit_reset_at || source.rateLimitResetAt || '',
+        overloadUntil: source.overload_until || source.overloadUntil || '',
+        tempUnschedulableUntil: source.temp_unschedulable_until || source.tempUnschedulableUntil || '',
+        tempUnschedulableReason: String(source.temp_unschedulable_reason || source.tempUnschedulableReason || ''),
+        expiresAt: source.expires_at ?? source.expiresAt ?? '',
         associationStatus: String(source.association_status || ''),
         checkedAt: source.checked_at || source.checkedAt || '',
         stale: Boolean(source.stale),
         unknown: Boolean(source.unknown),
         error: String(source.error || '')
     };
+}
+
+function localAuthFailure(account) {
+    const result = historyChecks.get(account.id)?.last_result;
+    return Boolean(result && result.freshness !== 'stale' &&
+        (Number(result.http_status) === 401 || ['unauthorized', 'credential_revoked', 'access_token_expired', 'token_expired', 'auth_failed', 'authentication_failed'].includes(result.outcome)));
 }
 
 function normalizeHistoryAccount(row, sub2Status = null) {
@@ -696,6 +714,23 @@ function sub2StatusName(status) {
     }[status] || status || '未知');
 }
 
+function sub2RuntimePause(state) {
+    const now = Date.now();
+    const future = value => {
+        const timestamp = historyTimeValue(value);
+        return timestamp > now ? timestamp : 0;
+    };
+    const temporary = future(state.tempUnschedulableUntil);
+    if (temporary) return { kind: 'temporary', label: `临时暂停至 ${formatHistoryTime(temporary)}`, reason: state.tempUnschedulableReason };
+    const rateLimit = future(state.rateLimitResetAt);
+    if (rateLimit) return { kind: 'rate_limit', label: `限流至 ${formatHistoryTime(rateLimit)}`, reason: 'Sub2 返回 429 限流窗口' };
+    const overload = future(state.overloadUntil);
+    if (overload) return { kind: 'overload', label: `过载至 ${formatHistoryTime(overload)}`, reason: 'Sub2 暂时过载' };
+    const expiry = historyTimeValue(state.expiresAt);
+    if (expiry && expiry <= now) return { kind: 'expired', label: 'Sub2 凭据已过期', reason: 'Sub2 账号凭据有效期已到' };
+    return null;
+}
+
 function renderSub2Status(account) {
     const state = account.sub2Status || normalizeSub2Status(null);
     if (!historySub2Configured) return '<span class="history-status sub2-unknown">Sub2 未配置</span>';
@@ -707,13 +742,18 @@ function renderSub2Status(account) {
     if (!state.imported && !state.sub2AccountID) return '<span class="history-status sub2-unknown">Sub2 未找到关联</span>';
     if (!state.exists) return '<span class="history-status sub2-error">Sub2 已删除</span>';
     const status = state.status;
-    const className = status === 'active' || status === 'available' || status === 'enabled' ? 'sub2-ok'
+    const conflict = localAuthFailure(account) && ['active', 'available', 'enabled'].includes(status);
+    const runtimePause = sub2RuntimePause(state);
+    const effective = state.effectiveSchedulable ?? state.schedulable;
+    const className = conflict || runtimePause || effective === false ? 'sub2-warning' : status === 'active' || status === 'available' || status === 'enabled' ? 'sub2-ok'
         : status === 'unknown' || status === 'stale' ? 'sub2-unknown' : 'sub2-error';
-    const schedule = state.schedulable === true ? '可调度' : state.schedulable === false ? '暂停调度' : '';
+    const schedule = effective === true ? '可调度' : effective === false ? '暂不可调度' : '';
     const checked = state.checkedAt ? ` · 同步 ${formatHistoryTime(state.checkedAt)}` : '';
-    const reason = state.errorMessage || state.error;
+    const reason = state.errorMessage || runtimePause?.reason || state.error;
     const title = reason ? ` title="${escapeHTML(reason)}"` : '';
-    return `<span class="history-status ${className}"${title}>Sub2 ${escapeHTML(sub2StatusName(status))}${schedule ? ` · ${schedule}` : ''}${checked}</span>`;
+    const label = runtimePause ? runtimePause.label : conflict ? '正常 · 本地凭据失效待处理' : escapeHTML(sub2StatusName(status));
+    const suffix = conflict && runtimePause ? ' · 本地凭据失效待处理' : '';
+    return `<span class="history-status ${className}"${title}>Sub2 ${label}${suffix}${schedule ? ` · ${schedule}` : ''}${checked}</span>`;
 }
 
 function historyStatusName(status) {
@@ -754,10 +794,11 @@ function historyRecoveryAction(account) {
     else if (state.stale || state.unknown) reason = 'Sub2 状态未知，请刷新后重试';
     else if (!state.exists) reason = '该账号已从 Sub2 删除';
     else if (['inactive', 'disabled', 'deleted'].includes(state.status)) reason = 'Sub2 账号已禁用或删除，请先在 Sub2 中确认';
+    else if (sub2RuntimePause(state) && !resumable) reason = sub2RuntimePause(state).label;
     else if (!resumable && ['active', 'available', 'enabled'].includes(state.status) && state.schedulable === false) reason = '账号已人工暂停，保持暂停状态';
     else if (account.status === 'deleted') reason = '该账号已删除';
     else if (account.status === 'running') reason = '账号正在登录';
-    if (!reason && !resumable && state.status !== 'error') reason = ['active', 'available', 'enabled'].includes(state.status)
+    if (!reason && !resumable && !localAuthFailure(account) && state.status !== 'error') reason = ['active', 'available', 'enabled'].includes(state.status)
         ? 'Sub2 正常，无需恢复' : '当前 Sub2 状态不支持自动恢复，请先核对';
     const active = historyRecoveryRequests.has(account.id) || checking || historyRecoveryActive(task);
     return {
@@ -932,6 +973,9 @@ function updateHistoryControls(visibleAccounts, pageAccounts) {
     const hiddenCount = selected.length - selectedOnPage;
     const reloginCount = selected.filter(canBatchRelogin).length;
     const importCount = selected.filter(canImportToSub2).length;
+    const checkCandidates = selected.length
+        ? selected.filter(account => historyChecks.get(account.id)?.eligible && account.sub2Status.present && account.sub2Status.exists).length
+        : visibleAccounts.filter(account => historyChecks.get(account.id)?.eligible && account.sub2Status.present && account.sub2Status.exists).length;
     const locked = historyActionsLocked();
     historySelectAll.checked = !historyLoadError && pageAccounts.length > 0 && selectedOnPage === pageAccounts.length;
     historySelectAll.indeterminate = !historyLoadError && selectedOnPage > 0 && selectedOnPage < pageAccounts.length;
@@ -945,6 +989,12 @@ function updateHistoryControls(visibleAccounts, pageAccounts) {
         ? '导入状态读取失败，请刷新后重试' : '将所选可导入账号加入 Sub2 未分组';
     historyBatchDeleteBtn.disabled = locked || selected.length === 0;
     historyBatchDeleteBtn.textContent = `批量删除${selected.length ? ` (${selected.length})` : ''}`;
+    if (historyCheckNowBtn) {
+        historyCheckNowBtn.disabled = locked || checkCandidates === 0;
+        historyCheckNowBtn.textContent = selected.length ? `立即检测 (${checkCandidates})` : `立即检测全部 (${checkCandidates})`;
+        historyCheckNowBtn.title = selected.length ? '检测当前选中且已关联 Sub2 的账号' : '按当前筛选条件检测已关联 Sub2 的账号';
+    }
+    if (historyCheckNowStatus && !checkCandidates) historyCheckNowStatus.textContent = selected.length ? '选中账号没有可检测项' : '当前筛选没有可检测项';
     historySelectionStatus.textContent = `已选 ${selected.length} 个${hiddenCount ? ` · ${hiddenCount} 个不在当前页` : ''}`;
     historyPageInfo.textContent = visibleAccounts.length
         ? `第 ${historyPage} / ${pageCount} 页 · ${visibleAccounts.length} 个账号`
@@ -1059,6 +1109,28 @@ function renderHistory() {
                 </div>
             </article>`;
     }).join('');
+}
+
+async function checkHistoryNow() {
+    if (historyActionsLocked() || !window.AccountChecks?.startMany) return;
+    const visible = getFilteredHistoryAccounts();
+    const source = historySelectedIDs.size
+        ? historyAccounts.filter(account => historySelectedIDs.has(account.id))
+        : visible;
+    const ids = source.filter(account => historyChecks.get(account.id)?.eligible && account.sub2Status.present && account.sub2Status.exists).map(account => account.id);
+    if (!ids.length) return;
+    if (historyCheckNowStatus) historyCheckNowStatus.textContent = `正在提交 ${ids.length} 个账号的检测…`;
+    historyCheckNowBtn.disabled = true;
+    try {
+        const submitted = await window.AccountChecks.startMany(ids);
+        if (historyCheckNowStatus) historyCheckNowStatus.textContent = submitted
+            ? `已提交 ${ids.length} 个，进度请查看检测任务页或账号行`
+            : '检测未提交，请查看检测任务页提示';
+    } catch (error) {
+        if (historyCheckNowStatus) historyCheckNowStatus.textContent = error.message || '检测提交失败';
+    } finally {
+        renderHistory();
+    }
 }
 
 async function deleteHistory(id) {
@@ -1341,7 +1413,7 @@ async function batchReloginHistory() {
     }
 }
 
-async function importHistoryAccounts(ids) {
+async function importHistoryAccounts(ids, { waitForCompletion = false } = {}) {
     if (historyActionsLocked()) return;
     const uniqueIDs = [...new Set(ids.map(String))].filter(id => {
         const account = historyAccounts.find(item => item.id === id);
@@ -1353,6 +1425,11 @@ async function importHistoryAccounts(ids) {
     renderHistory();
     let accepted = 0;
     let submitted = 0;
+    const acceptedIDsForWait = [];
+    if (waitForCompletion) {
+        batchImportProgress = { total: uniqueIDs.length, done: 0, success: 0, failed: 0, pending: uniqueIDs.length, running: true };
+        renderBatchImportStatus();
+    }
     try {
         // The existing import endpoint accepts at most 100 IDs per request.
         for (let offset = 0; offset < uniqueIDs.length; offset += 100) {
@@ -1367,19 +1444,28 @@ async function importHistoryAccounts(ids) {
             if (!response.ok) throw new Error(payload.message || `导入失败（HTTP ${response.status}）`);
             const acceptedIDs = new Set((Array.isArray(payload.imports) ? payload.imports : []).map(item => String(item.account_id)));
             batchIDs.forEach(id => {
-                if (acceptedIDs.has(id)) { historySelectedIDs.delete(id); accepted += 1; }
+                if (acceptedIDs.has(id)) { historySelectedIDs.delete(id); accepted += 1; acceptedIDsForWait.push(id); }
             });
             submitted += batchIDs.length;
             historyBatchSummary = `正在提交导入：${submitted} / ${uniqueIDs.length}，已受理 ${accepted} 个`;
             renderHistory();
         }
-        historyBatchSummary = `已加入 Sub2 导入队列 ${accepted} 个${uniqueIDs.length > accepted ? `；${uniqueIDs.length - accepted} 个未受理，已保留选中` : ''}。其他选中账号未操作。`;
+        if (accepted && waitForCompletion) {
+            const outcome = await waitForImportCompletion(acceptedIDsForWait);
+            historyBatchSummary = outcome.pending ? `已受理 ${accepted} 个；${outcome.message}`
+                : `Sub2 导入完成：成功 ${outcome.success} 个${outcome.failed ? `，失败 ${outcome.failed} 个` : ''}。`;
+        } else {
+            historyBatchSummary = accepted
+                ? `已加入 Sub2 导入队列 ${accepted} 个${uniqueIDs.length > accepted ? `；${uniqueIDs.length - accepted} 个未受理，已保留选中` : ''}。`
+                : `没有账号被 Sub2 受理；${uniqueIDs.length} 个未受理，已保留选中。`;
+        }
     } catch (error) {
         historyBatchSummary = `已受理 ${accepted} 个；其余选中账号已保留。${error.message || '提交导入失败，请刷新后核对'}`;
     } finally {
         await loadHistory();
         historyBatchRunning = false;
         renderHistory();
+        renderBatchImportStatus();
     }
 }
 
@@ -1398,6 +1484,8 @@ async function importLoginResultsToSub2() {
     if (processing || historyBatchRunning || results.length === 0) return;
     importSub2Btn.disabled = true;
     historyBatchRunning = true;
+    batchImportProgress = null;
+    renderBatchImportStatus();
     historyBatchSummary = '正在准备批量登录结果导入…';
     renderHistory();
     try {
@@ -1435,10 +1523,12 @@ async function importLoginResultsToSub2() {
         if (!await confirmAction({ title: '导入 Sub2', message, confirmLabel: '确认导入' })) return;
         historyBatchRunning = false;
         renderHistory();
-        await importHistoryAccounts(ids);
+        await importHistoryAccounts(ids, { waitForCompletion: true });
     } finally {
         historyBatchRunning = false;
         importSub2Btn.disabled = processing || results.length === 0;
+        renderStatus();
+        renderBatchImportStatus();
         renderHistory();
     }
 }
@@ -1775,6 +1865,44 @@ function renderStatus() {
     }
 
     accounts.forEach(account => updateStatusRow(account, statusRows.get(String(account.id))));
+}
+
+function renderBatchImportStatus() {
+    if (!batchImportStatus) return;
+    if (!batchImportProgress) {
+        batchImportStatus.hidden = true;
+        batchImportStatus.textContent = '';
+        return;
+    }
+    const p = batchImportProgress;
+    const terminal = p.failed === 0 && p.pending === 0;
+    const prefix = p.running ? '正在同步到 Sub2' : terminal ? 'Sub2 导入完成' : p.failed ? 'Sub2 导入部分失败' : 'Sub2 导入仍在处理';
+    batchImportStatus.textContent = `${prefix}：${p.done} / ${p.total}，成功 ${p.success}，${p.failed ? `失败 ${p.failed}` : '失败 0'}${p.pending ? `，处理中 ${p.pending}` : ''}${p.message ? ` · ${p.message}` : ''}`;
+    batchImportStatus.hidden = false;
+}
+
+async function waitForImportCompletion(ids, timeoutMs = 90000) {
+    const wanted = new Set(ids.map(String));
+    const started = Date.now();
+    let last = null;
+    while (Date.now() - started < timeoutMs) {
+        await loadHistory();
+        const states = [...wanted].map(id => String(historyImports.get(id)?.state || 'unknown').toLowerCase());
+        const terminal = states.filter(state => ['imported', 'completed', 'failed', 'error', 'rejected'].includes(state));
+        const success = terminal.filter(state => ['imported', 'completed'].includes(state)).length;
+        const failed = terminal.filter(state => ['failed', 'error', 'rejected'].includes(state)).length;
+        const pending = states.length - terminal.length;
+        last = { total: states.length, done: terminal.length, success, failed, pending, running: pending > 0 };
+        batchImportProgress = last;
+        renderBatchImportStatus();
+        if (!pending) return last;
+        await new Promise(resolve => setTimeout(resolve, 2500));
+    }
+    const result = last || { total: ids.length, done: 0, success: 0, failed: 0, pending: ids.length, running: false };
+    result.message = '部分任务仍在队列中，请稍后刷新历史';
+    batchImportProgress = result;
+    renderBatchImportStatus();
+    return result;
 }
 
 function updateStatusRow(account, state) {
