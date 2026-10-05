@@ -158,6 +158,25 @@ func (s *accountCheckService) process(work *store.AccountCheckWork) {
 		s.finish(work.Check.ID, accountID, store.AccountCheckResult{Canceled: true})
 		return
 	}
+	if accountRecoveryService != nil && !accountRecoveryService.autoRecovery.Load() {
+		automatic, err := s.store.AutomaticRecoveryCheck(ctx, batch.ID)
+		if err != nil {
+			s.pause()
+			return
+		}
+		if automatic {
+			if _, err := s.store.CancelAccountCheckBatch(ctx, batch.ID); err != nil {
+				s.pause()
+				return
+			}
+			s.finish(work.Check.ID, accountID, store.AccountCheckResult{Canceled: true})
+			return
+		}
+	}
+	if work.PrecheckResult != nil {
+		s.finish(work.Check.ID, accountID, *work.PrecheckResult)
+		return
+	}
 	if probe.AccessTokenExpired(work.AccessToken, time.Now()) {
 		s.finish(work.Check.ID, accountID, store.AccountCheckResult{Outcome: "access_token_expired", ErrorCode: "access_token_expired", Message: "本地访问令牌已过期，请重新登录后检测", FailureStage: "precheck"})
 		return
@@ -212,8 +231,24 @@ func (s *accountCheckService) finish(id, accountID int64, result store.AccountCh
 	if batch.State == "stopping" {
 		s.cancelBatch(batch.ID)
 	}
-	if !result.Canceled && batch.State != "stopping" && batch.State != "stopped" && accountID > 0 && accountRecoveryService != nil && accountRecoveryService.autoRecovery.Load() && recoveryCheckCandidate(result) {
-		accountRecoveryService.enqueueAutomatic(accountID)
+	if !result.Canceled && batch.State != "stopping" && batch.State != "stopped" && accountID > 0 && accountRecoveryService != nil && recoveryCheckCandidate(result) {
+		explicit, err := s.store.ExplicitRecoveryCheck(ctx, batch.ID)
+		if err == nil && explicit {
+			// This single-account intent survives a page close or an unrelated
+			// change to the automatic switch. The shared enqueue path revalidates
+			// identity, state and credentials before any recovery mutation.
+			recoveryCtx, recoveryCancel := context.WithTimeout(accountRecoveryService.ctx, 10*time.Second)
+			if accountRecoveryService.remoteRecoverySuspect(recoveryCtx, accountID) {
+				if _, _, err := accountRecoveryService.enqueue(recoveryCtx, accountID); err != nil {
+					accountRecoveryService.recordRecoveryEnqueueFailure(accountID)
+				}
+			} else {
+				accountRecoveryService.recordRecoveryEnqueueFailure(accountID)
+			}
+			recoveryCancel()
+		} else if err == nil {
+			accountRecoveryService.enqueueAutomatic(accountID)
+		}
 	}
 	s.notify()
 }
@@ -294,6 +329,10 @@ func (s *accountCheckService) handleCollection(w http.ResponseWriter, r *http.Re
 	}
 	var req accountCheckRequest
 	if !decodeCheckJSON(w, r, &req) {
+		return
+	}
+	if strings.HasPrefix(strings.ToLower(req.RequestKey), "recovery-") {
+		checkAPIError(w, 400, "reserved_request_key", "请求标识不能使用 recovery- 前缀")
 		return
 	}
 	input := store.AccountCheckInput{RequestKey: req.RequestKey, AccountIDs: req.AccountIDs, Concurrency: req.Concurrency, ProxyMode: req.ProxyMode}

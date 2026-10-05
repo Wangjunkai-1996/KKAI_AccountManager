@@ -90,11 +90,12 @@ type AccountCheck struct {
 
 // Work credentials are deliberately excluded from JSON and never persisted in checks.
 type AccountCheckWork struct {
-	Batch            AccountCheckBatch `json:"batch"`
-	Check            AccountCheck      `json:"check"`
-	AccessToken      string            `json:"-"`
-	ChatGPTAccountID string            `json:"-"`
-	Proxy            string            `json:"-"`
+	Batch            AccountCheckBatch   `json:"batch"`
+	Check            AccountCheck        `json:"check"`
+	AccessToken      string              `json:"-"`
+	ChatGPTAccountID string              `json:"-"`
+	Proxy            string              `json:"-"`
+	PrecheckResult   *AccountCheckResult `json:"-"`
 }
 type AccountCheckResult struct {
 	RequestAttempted  *bool
@@ -214,7 +215,7 @@ func scanCheck(row scanner) (AccountCheck, error) {
 	c.Freshness = "stale"
 	if !account.Valid {
 		c.Freshness = "account_removed"
-	} else if version.Valid && version.Int64 > 0 && version.Int64 == current {
+	} else if version.Valid && version.Int64 == current && (version.Int64 > 0 || c.Outcome == "credential_missing") {
 		c.Freshness = "current"
 	}
 	return c, nil
@@ -413,7 +414,7 @@ func (s *Store) claimAccountCheck(ctx context.Context) (*AccountCheckWork, bool,
 			skip = "no_longer_imported"
 		} else if status == "running" {
 			skip = "login_in_progress"
-		} else if version > 0 {
+		} else {
 			var prior int64
 			err = tx.QueryRowContext(ctx, `SELECT id FROM account_checks WHERE account_id=? AND state='finished' AND credential_attempt_id=? AND finished_at>? ORDER BY id DESC LIMIT 1`, accountID.Int64, version, time.Now().Add(-30*time.Second).UnixMilli()).Scan(&prior)
 			if err == nil {
@@ -471,10 +472,9 @@ func (s *Store) claimAccountCheck(ctx context.Context) (*AccountCheckWork, bool,
 			result.ErrorCode = "credential_version_missing"
 			result.Message = "缺少可靠凭据版本，请重新登录"
 		}
-		if _, err = s.FinishAccountCheck(ctx, id, result); err != nil {
-			return nil, false, err
-		}
-		return nil, true, nil
+		// The worker owns all terminal results, including local prechecks, so
+		// recovery hooks observe missing credentials just like an upstream 401.
+		return &AccountCheckWork{Batch: batch, Check: item, PrecheckResult: &result}, false, nil
 	}
 	return &AccountCheckWork{Batch: batch, Check: item, AccessToken: access, ChatGPTAccountID: chatGPTID, Proxy: proxy}, false, nil
 }

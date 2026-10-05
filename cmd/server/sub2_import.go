@@ -300,16 +300,200 @@ type sub2ListResponse struct {
 // current remote account state. A failed lookup is marked stale/unknown so a
 // transient management API failure cannot be mistaken for a deleted account.
 type sub2AccountStatus struct {
-	Exists        bool      `json:"exists"`
-	Imported      bool      `json:"imported"`
-	Sub2AccountID int64     `json:"sub2_account_id,omitempty"`
-	Status        string    `json:"status,omitempty"`
-	Schedulable   *bool     `json:"schedulable,omitempty"`
-	ErrorMessage  string    `json:"error_message,omitempty"`
-	CheckedAt     time.Time `json:"checked_at"`
-	Stale         bool      `json:"stale,omitempty"`
-	Error         string    `json:"error,omitempty"`
-	Unknown       bool      `json:"unknown,omitempty"`
+	Exists            bool      `json:"exists"`
+	Imported          bool      `json:"imported"`
+	Sub2AccountID     int64     `json:"sub2_account_id,omitempty"`
+	Status            string    `json:"status,omitempty"`
+	Schedulable       *bool     `json:"schedulable,omitempty"`
+	ErrorMessage      string    `json:"error_message,omitempty"`
+	CheckedAt         time.Time `json:"checked_at"`
+	Stale             bool      `json:"stale,omitempty"`
+	Error             string    `json:"error,omitempty"`
+	Unknown           bool      `json:"unknown,omitempty"`
+	AssociationStatus string    `json:"association_status,omitempty"`
+}
+
+var (
+	errSub2AmbiguousMatch   = errors.New("Sub2 存在多个同邮箱、同账号身份的记录，无法自动关联")
+	errSub2IdentityConflict = errors.New("Sub2 同邮箱账号身份不一致，无法自动关联")
+)
+
+// syncAccountStatuses shares the same persisted associations between history,
+// automatic checks and recovery. An association only reads Sub2; it never
+// creates an account or changes remote metadata.
+func (s *sub2ImportService) syncAccountStatuses(ctx context.Context) ([]store.Sub2Import, map[int64]sub2AccountStatus, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	accounts, err := s.store.ListAccounts(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	allImports, err := s.store.ListSub2ImportStatuses(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	bindings := make(map[int64]store.Sub2Import)
+	for _, task := range allImports {
+		if task.DestinationKey == s.destinationKey {
+			bindings[task.AccountID] = task
+		}
+	}
+	checkedAt := time.Now().UTC()
+	statuses := make(map[int64]sub2AccountStatus, len(accounts))
+	needsDiscovery := false
+	for _, account := range accounts {
+		task, bound := bindings[account.ID]
+		needsDiscovery = needsDiscovery || !bound
+		statuses[account.ID] = sub2AccountStatus{Imported: task.State == "imported", Sub2AccountID: task.Sub2AccountID,
+			CheckedAt: checkedAt, Unknown: true, Stale: true, Error: "Sub2 状态查询未完成"}
+	}
+	var candidates []map[string]any
+	var discoveryErr error
+	if needsDiscovery {
+		// Sub2's search is name-only. A complete list is needed to recognize
+		// custom account names and to prove a match is unique across pages.
+		candidates, discoveryErr = s.listOAuthAccounts(ctx)
+	}
+	jobs := make(chan store.Account)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i := 0; i < 8 && i < len(accounts); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for account := range jobs {
+				mu.Lock()
+				task, bound := bindings[account.ID]
+				mu.Unlock()
+				var snapshot sub2AccountStatus
+				if !bound {
+					linkErr := discoveryErr
+					if linkErr == nil {
+						task, linkErr = s.linkExistingAccount(ctx, account, candidates)
+					}
+					if linkErr != nil {
+						snapshot = sub2AccountStatus{CheckedAt: checkedAt, Unknown: true, Stale: true, Error: linkErr.Error()}
+						if errors.Is(linkErr, errSub2AmbiguousMatch) {
+							snapshot.AssociationStatus = "ambiguous"
+						} else if errors.Is(linkErr, errSub2IdentityConflict) {
+							snapshot.AssociationStatus = "conflict"
+						}
+					} else if task.ID == 0 {
+						snapshot = sub2AccountStatus{CheckedAt: checkedAt, Unknown: true, AssociationStatus: "unmatched", Error: "Sub2 未找到邮箱和账号身份一致的记录"}
+					} else {
+						bound = true
+						mu.Lock()
+						bindings[account.ID] = task
+						mu.Unlock()
+					}
+				}
+				if bound {
+					if task.Sub2AccountID > 0 {
+						snapshot = s.sub2AccountStatus(ctx, task.Sub2AccountID, checkedAt, account)
+					} else {
+						snapshot = sub2AccountStatus{CheckedAt: checkedAt, Unknown: true, Stale: true, Error: "Sub2 账号尚未完成核对"}
+					}
+					snapshot.Imported = task.State == "imported"
+					if snapshot.Imported {
+						snapshot.AssociationStatus = "imported"
+						if strings.HasPrefix(task.OperationID, "linked-") {
+							snapshot.AssociationStatus = "linked"
+						}
+					}
+				}
+				mu.Lock()
+				statuses[account.ID] = snapshot
+				mu.Unlock()
+			}
+		}()
+	}
+send:
+	for _, account := range accounts {
+		select {
+		case jobs <- account:
+		case <-ctx.Done():
+			break send
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	imports := make([]store.Sub2Import, 0, len(bindings))
+	for _, account := range accounts {
+		if task, ok := bindings[account.ID]; ok {
+			imports = append(imports, task)
+		}
+	}
+	return imports, statuses, nil
+}
+
+func (s *sub2ImportService) listOAuthAccounts(ctx context.Context) ([]map[string]any, error) {
+	query := url.Values{"platform": {"openai"}, "type": {"oauth"}, "lite": {"1"}, "page_size": {"100"}, "sort_by": {"id"}, "sort_order": {"asc"}}
+	items := make([]map[string]any, 0)
+	seen := make(map[int64]bool)
+	for page := 1; ; page++ {
+		query.Set("page", strconv.Itoa(page))
+		var current sub2ListResponse
+		if err := s.apiJSON(ctx, http.MethodGet, "/admin/accounts", query, &current); err != nil {
+			return nil, err
+		}
+		if current.Page != 0 && current.Page != page {
+			return nil, errors.New("Sub2 账号列表分页不一致")
+		}
+		for _, item := range current.Items {
+			id := int64(toFloat(item["id"]))
+			if id <= 0 || seen[id] {
+				return nil, errors.New("Sub2 账号列表不完整，请重新同步")
+			}
+			seen[id] = true
+			items = append(items, item)
+		}
+		if current.Pages > page || current.Total > len(items) {
+			if len(current.Items) == 0 {
+				return nil, errors.New("Sub2 账号列表分页不完整")
+			}
+			continue
+		}
+		return items, nil
+	}
+}
+
+func (s *sub2ImportService) linkExistingAccount(ctx context.Context, account store.Account, candidates []map[string]any) (store.Sub2Import, error) {
+	var match map[string]any
+	var conflictingIdentity bool
+	for _, candidate := range candidates {
+		credentials, _ := candidate["credentials"].(map[string]any)
+		email, _ := credentials["email"].(string)
+		if strings.TrimSpace(email) == "" || !strings.EqualFold(strings.TrimSpace(email), strings.TrimSpace(account.Email)) {
+			continue
+		}
+		if err := verifySub2AccountIdentity(candidate, int64(toFloat(candidate["id"])), account.ID, account); err != nil {
+			conflictingIdentity = true
+			continue
+		}
+		if match != nil {
+			return store.Sub2Import{}, errSub2AmbiguousMatch
+		}
+		match = candidate
+	}
+	if match == nil {
+		if conflictingIdentity {
+			return store.Sub2Import{}, errSub2IdentityConflict
+		}
+		return store.Sub2Import{}, nil
+	}
+	id := int64(toFloat(match["id"]))
+	var detail map[string]any
+	if err := s.apiJSON(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(id, 10), nil, &detail); err != nil {
+		return store.Sub2Import{}, err
+	}
+	if err := verifySub2AccountIdentity(detail, id, account.ID, account); err != nil {
+		return store.Sub2Import{}, errors.New("Sub2 账号身份在关联前发生变化")
+	}
+	operationID, err := newOperationID()
+	if err != nil {
+		return store.Sub2Import{}, err
+	}
+	return s.store.LinkSub2Account(ctx, s.destinationKey, account.ID, id, "linked-"+operationID)
 }
 
 // listSub2AccountStatuses fetches the details for imported accounts in
@@ -337,6 +521,8 @@ func (s *sub2ImportService) listSub2AccountStatuses(ctx context.Context, imports
 		// Include acknowledged tasks as well, so an import that is waiting for
 		// reconciliation remains visible in the history response.
 		status := sub2AccountStatus{Imported: task.State == "imported", Sub2AccountID: task.Sub2AccountID, CheckedAt: checkedAt}
+		status.Unknown, status.Stale, status.Error = true, true, "Sub2 状态查询未完成"
+		statuses[task.AccountID] = status
 		if task.Sub2AccountID <= 0 {
 			status.Unknown = true
 			status.Stale = true
@@ -388,7 +574,7 @@ send:
 	return statuses
 }
 
-func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, checkedAt time.Time) sub2AccountStatus {
+func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, checkedAt time.Time, accounts ...store.Account) sub2AccountStatus {
 	status := sub2AccountStatus{Sub2AccountID: id, CheckedAt: checkedAt}
 	var detail map[string]any
 	code, err := s.apiJSONStatus(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(id, 10), nil, &detail)
@@ -408,6 +594,13 @@ func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, che
 		status.Stale = true
 		status.Error = "Sub2 账号身份核对不一致"
 		return status
+	}
+	for _, account := range accounts {
+		if err := verifySub2AccountIdentity(detail, id, account.ID, account); err != nil {
+			status.Unknown, status.Stale = true, true
+			status.Error = "Sub2 账号身份与 AUTH 绑定不一致"
+			return status
+		}
 	}
 	status.Exists = true
 	status.Status, _ = detail["status"].(string)
@@ -615,6 +808,8 @@ func (s *sub2ImportService) handleImport(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *sub2ImportService) ensureTask(ctx context.Context, accountID int64) (store.Sub2Import, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	if existing, err := s.store.GetSub2Import(ctx, s.destinationKey, accountID); err == nil {
 		if existing.State == "failed" {
 			payload, _, _, buildErr := s.buildPayloadWithOperation(accountID, existing.OperationID)
@@ -627,6 +822,19 @@ func (s *sub2ImportService) ensureTask(ctx context.Context, accountID int64) (st
 			return s.store.GetSub2Import(ctx, s.destinationKey, accountID)
 		}
 		return existing, nil
+	} else if !errors.Is(err, store.ErrSub2ImportNotFound) {
+		return store.Sub2Import{}, err
+	}
+	account, err := s.store.GetAccountByID(ctx, accountID)
+	if err != nil {
+		return store.Sub2Import{}, err
+	}
+	candidates, err := s.listOAuthAccounts(ctx)
+	if err != nil {
+		return store.Sub2Import{}, err
+	}
+	if linked, err := s.linkExistingAccount(ctx, account, candidates); err != nil || linked.ID != 0 {
+		return linked, err
 	}
 	payload, operationID, idempotencyKey, err := s.buildPayload(accountID)
 	if err != nil {

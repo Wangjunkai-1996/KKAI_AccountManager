@@ -142,3 +142,25 @@ func TestRecoveryVerifyActualDTO(t *testing.T) {
 		})
 	}
 }
+
+func TestRecoveryVerifyExternalAssociation(t *testing.T) {
+	account := store.Account{Email: "recover@example.test", ChatGPTAccountID: "workspace"}
+	binding := store.Sub2Import{AccountID: 7, Sub2AccountID: 42, State: "imported", OperationID: "linked-verified"}
+	detail := recoveryVerifyDetailFixture()
+	delete(detail, "extra")
+	if err := verifySub2RecoveryDetail(detail, 42, 7, account, binding); err != nil {
+		t.Fatalf("verified external association rejected: %v", err)
+	}
+	if err := verifySub2RecoveryIdentity(detail, 42, 7, account); err == nil {
+		t.Fatal("missing local association accepted")
+	}
+	detail["extra"] = map[string]any{"kkai_auth_import": map[string]any{"source_account_id": float64(8)}}
+	if err := verifySub2RecoveryIdentity(detail, 42, 7, account, binding); err == nil {
+		t.Fatal("foreign import marker accepted")
+	}
+	delete(detail, "extra")
+	detail["credentials"].(map[string]any)["chatgpt_account_id"] = "different-workspace"
+	if err := verifySub2RecoveryIdentity(detail, 42, 7, account, binding); err == nil {
+		t.Fatal("wrong workspace accepted")
+	}
+}

@@ -734,6 +734,14 @@
             overflow-wrap: anywhere;
         }
 
+        .history-task-status {
+            color: var(--text-secondary);
+            font-size: 0.8125rem;
+            line-height: 1.5;
+            margin-top: 0.4rem;
+            overflow-wrap: anywhere;
+        }
+
         .history-actions {
             display: flex;
             align-items: center;
@@ -1183,7 +1191,7 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                 <h2 class="card-title">账号历史</h2>
                 <div class="history-toolbar">
                     <span class="history-refresh-status" id="historyRefreshStatus" role="status" aria-live="polite"></span>
-                    <label class="history-setting-toggle" title="AUTH 检测确认 401 或凭据失效，且账号仍在 Sub2 池中时，自动重新登录并恢复调度；人工暂停保持不变">
+                    <label class="history-setting-toggle" title="开启后立即巡检，每 60 秒检查 Sub2 异常账号；确认凭据失效后自动重新登录。设置会保存，关闭页面后仍继续。">
                         <input type="checkbox" id="autoRecoveryToggle">
                         <span>自动检测恢复</span>
                     </label>
@@ -1194,6 +1202,8 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
             <p class="hint" style="margin-top: -0.75rem; margin-bottom: 1rem;">
                 这里只显示账号状态和错误摘要，不会显示密码或 TOTP；重新登录成功后可复制 Refresh Token。已确认被官方删除的账号会提示清理记录。
             </p>
+            <p class="hint" id="autoRecoveryDetail" role="status" aria-live="polite">正在读取自动恢复设置…</p>
+            <p class="hint">检测会发起少量模型请求。仅对仍在 Sub2 中的异常账号确认凭据是否失效；正常、人工暂停、已禁用或已删除的账号不会自动恢复。</p>
             <div class="input-group">
                 <label for="historySearchInput">搜索账号</label>
                 <input type="search" id="historySearchInput" placeholder="输入邮箱或邮箱片段" autocomplete="off" spellcheck="false" aria-controls="historyGrid" disabled>
@@ -1202,7 +1212,7 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                 <label for="historyStatusFilter">状态
                     <select id="historyStatusFilter">
                         <option value="all" selected>全部</option>
-                        <option value="available">可用</option>
+                        <option value="available">最近登录成功</option>
                         <option value="failed">登录失败</option>
                         <option value="deactivated">停用或删除</option>
                         <option value="processing">处理中</option>

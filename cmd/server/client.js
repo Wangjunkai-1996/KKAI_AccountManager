@@ -83,6 +83,7 @@ const refreshHistoryBtn = document.getElementById('refreshHistoryBtn');
 const historyRefreshStatus = document.getElementById('historyRefreshStatus');
 const autoRecoveryToggle = document.getElementById('autoRecoveryToggle');
 const autoRecoveryStatus = document.getElementById('autoRecoveryStatus');
+const autoRecoveryDetail = document.getElementById('autoRecoveryDetail');
 const historySearchInput = document.getElementById('historySearchInput');
 const historyStatusFilter = document.getElementById('historyStatusFilter');
 const historySort = document.getElementById('historySort');
@@ -172,10 +173,16 @@ let historyLoadError = '';
 let historySub2Configured = true;
 let historyImportsAvailable = true;
 let historySub2Statuses = new Map();
+let historyChecks = new Map();
+let historyRecoveries = new Map();
+const historyRecoveryRequests = new Set();
+const historyRecoveryNotices = new Map();
 let recoverySettings = { autoRecoveryEnabled: false };
 let recoverySettingsLoading = false;
 let recoverySettingsSaving = false;
 let historyRefreshTimer = null;
+let historyRefreshAt = 0;
+let historyRefreshPolling = false;
 let historyDetailID = '';
 let historyDetailAbort = null;
 let historyDetailTrigger = null;
@@ -305,7 +312,7 @@ modeSelect.addEventListener('change', () => {
     concurrencyInput.disabled = modeSelect.value === 'sequential';
 });
 
-refreshHistoryBtn.addEventListener('click', () => loadHistory());
+refreshHistoryBtn.addEventListener('click', () => Promise.all([loadHistory(), loadRecoverySettings()]));
 autoRecoveryToggle?.addEventListener('change', () => updateRecoverySetting(Boolean(autoRecoveryToggle.checked)));
 function resetHistoryScroll() {
     document.getElementById('panel-history').scrollTop = 0;
@@ -382,6 +389,8 @@ historyGrid.addEventListener('click', event => {
         openHistoryDetails(id, button);
     } else if (button.dataset.historyAction === 'check') {
         window.AccountChecks?.startSingle(id);
+    } else if (button.dataset.historyAction === 'recover') {
+        checkAndRecoverHistory(id);
     }
 });
 historyGrid.addEventListener('change', event => {
@@ -479,6 +488,8 @@ async function loadHistory() {
         historyImportsAvailable = payload.imports_available !== false;
         historySub2Statuses = normalizeSub2Statuses(payload.sub2_statuses ?? payload.sub2Statuses
             ?? payload.data?.sub2_statuses ?? payload.data?.sub2Statuses);
+        historyChecks = new Map(Object.entries(payload.checks || {}));
+        historyRecoveries = new Map(Object.entries(payload.recoveries || {}));
         const candidate = Array.isArray(payload) ? payload
             : (Array.isArray(payload.accounts) ? payload.accounts
                 : (Array.isArray(payload.history) ? payload.history
@@ -504,7 +515,7 @@ async function loadHistory() {
             if (!availableIDs.has(id)) historyRefreshTokens.delete(id);
         });
         renderHistory();
-        document.dispatchEvent(new Event('auth-history-changed'));
+        document.dispatchEvent(new CustomEvent('auth-history-changed', { detail: { history: payload } }));
     } catch (error) {
         historyLoadError = error.message || '历史加载失败';
         historyRefreshStatus.textContent = historyLoadError;
@@ -512,20 +523,61 @@ async function loadHistory() {
         historyLoading = false;
         historySearchInput.disabled = processing || historyBatchRunning;
         refreshHistoryBtn.disabled = processing || historyBatchRunning;
+        historyRefreshAt = Date.now() + historyRefreshDelay();
         renderHistory();
     }
 }
 
 function scheduleHistoryRefresh() {
     if (historyRefreshTimer || typeof setInterval !== 'function') return;
-    historyRefreshTimer = setInterval(() => {
-        if (document.hidden || historyLoading || processing || historyBatchRunning) return;
-        loadHistory();
-    }, 5 * 60 * 1000);
+    historyRefreshAt = Date.now() + historyRefreshDelay();
+    historyRefreshTimer = setInterval(pollHistory, 5000);
+}
+
+function historyRefreshDelay() {
+    const checking = [...historyChecks.values()].some(item => ['queued', 'running'].includes(item.latest_task?.state));
+    const recovering = [...historyRecoveries.values()].some(item => historyRecoveryActive(item));
+    return checking || recovering || historyRecoveryRequests.size || recoverySettings.scanning ? 5000
+        : recoverySettings.autoRecoveryEnabled ? 60000 : 5 * 60000;
+}
+
+async function pollHistory() {
+    if (document.hidden || historyLoading || historyRefreshPolling || processing || historyBatchRunning || Date.now() < historyRefreshAt) return;
+    historyRefreshPolling = true;
+    try {
+        await loadRecoverySettings();
+        await loadHistory();
+    } finally {
+        historyRefreshPolling = false;
+    }
+}
+
+function applyRecoverySettings(payload) {
+    const settings = payload.settings || payload;
+    const enabled = settings.auto_recovery_enabled ?? settings.autoRecoveryEnabled;
+    if (typeof enabled !== 'boolean') throw new Error('恢复设置响应不完整，请刷新重试');
+    recoverySettings = { ...settings, autoRecoveryEnabled: enabled };
+    autoRecoveryToggle.checked = recoverySettings.autoRecoveryEnabled;
+    renderRecoverySettings();
+    historyRefreshAt = Math.min(historyRefreshAt || Infinity, Date.now() + historyRefreshDelay());
+}
+
+function renderRecoverySettings() {
+    if (autoRecoveryStatus) autoRecoveryStatus.textContent = recoverySettings.autoRecoveryEnabled
+        ? recoverySettings.scanning ? '正在巡检…' : '已开启 · 后台运行' : '已关闭';
+    if (!autoRecoveryDetail) return;
+    const parts = [recoverySettings.autoRecoveryEnabled
+        ? `每 ${Number(recoverySettings.interval_seconds) || 60} 秒巡检 Sub2 异常账号，确认 401 或凭据失效后重新登录、写回凭据并恢复调度。关闭页面后仍继续，开关已保存。`
+        : '开启后立即巡检，此后每 60 秒检查 Sub2 异常账号；也可点击账号旁的“检测并恢复”。'];
+    if (recoverySettings.last_scan_at) parts.push(`上次巡检：${formatHistoryTime(recoverySettings.last_scan_at)}`);
+    if (recoverySettings.autoRecoveryEnabled && recoverySettings.next_scan_at) parts.push(`下次巡检：${formatHistoryTime(recoverySettings.next_scan_at)}`);
+    if (recoverySettings.summary) parts.push(recoverySettings.summary);
+    if (recoverySettings.last_error) parts.push(`巡检提示：${recoverySettings.last_error}`);
+    autoRecoveryDetail.textContent = parts.join(' · ');
 }
 
 async function loadRecoverySettings() {
-    if (!autoRecoveryToggle || recoverySettingsLoading) return;
+    if (!autoRecoveryToggle || recoverySettingsLoading || recoverySettingsSaving) return;
     recoverySettingsLoading = true;
     autoRecoveryToggle.disabled = true;
     try {
@@ -534,11 +586,7 @@ async function loadRecoverySettings() {
         });
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(payload.message || `设置读取失败（HTTP ${response.status}）`);
-        const settings = payload.settings || payload;
-        const enabled = Boolean(settings.auto_recovery_enabled ?? settings.autoRecoveryEnabled);
-        recoverySettings.autoRecoveryEnabled = enabled;
-        autoRecoveryToggle.checked = enabled;
-        if (autoRecoveryStatus) autoRecoveryStatus.textContent = enabled ? '已开启' : '已关闭';
+        applyRecoverySettings(payload);
     } catch (error) {
         if (autoRecoveryStatus) autoRecoveryStatus.textContent = '设置读取失败';
     } finally {
@@ -562,10 +610,9 @@ async function updateRecoverySetting(enabled) {
         });
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(payload.message || `设置保存失败（HTTP ${response.status}）`);
-        const settings = payload.settings || payload;
-        recoverySettings.autoRecoveryEnabled = Boolean(settings.auto_recovery_enabled ?? settings.autoRecoveryEnabled ?? enabled);
-        autoRecoveryToggle.checked = recoverySettings.autoRecoveryEnabled;
-        if (autoRecoveryStatus) autoRecoveryStatus.textContent = recoverySettings.autoRecoveryEnabled ? '已开启' : '已关闭';
+        applyRecoverySettings(payload);
+        await loadHistory();
+        if (recoverySettings.autoRecoveryEnabled) historyRefreshAt = Date.now() + 5000;
     } catch (error) {
         recoverySettings.autoRecoveryEnabled = previous;
         autoRecoveryToggle.checked = previous;
@@ -611,6 +658,7 @@ function normalizeSub2Status(value) {
         status: String(source.status || 'unknown').toLowerCase(),
         schedulable: typeof source.schedulable === 'boolean' ? source.schedulable : null,
         errorMessage: String(source.error_message || source.errorMessage || ''),
+        associationStatus: String(source.association_status || ''),
         checkedAt: source.checked_at || source.checkedAt || '',
         stale: Boolean(source.stale),
         unknown: Boolean(source.unknown),
@@ -651,10 +699,12 @@ function sub2StatusName(status) {
 function renderSub2Status(account) {
     const state = account.sub2Status || normalizeSub2Status(null);
     if (!historySub2Configured) return '<span class="history-status sub2-unknown">Sub2 未配置</span>';
-    if (!state.present) return '<span class="history-status sub2-unknown">Sub2 未同步</span>';
+    if (!state.present) return '<span class="history-status sub2-unknown">Sub2 未找到关联</span>';
     if (!state.configured) return '<span class="history-status sub2-unknown">Sub2 未配置</span>';
-    if (!state.imported && !state.sub2AccountID) return '<span class="history-status sub2-unknown">Sub2 未导入</span>';
+    const association = { unmatched: '未找到关联', ambiguous: '多条匹配待确认', conflict: '身份不一致' }[state.associationStatus];
+    if (association) return `<span class="history-status sub2-unknown" title="${escapeHTML(state.error || '')}">Sub2 ${association}</span>`;
     if (state.stale || state.unknown) return `<span class="history-status sub2-unknown"${state.errorMessage || state.error ? ` title="${escapeHTML(state.errorMessage || state.error)}"` : ''}>Sub2 状态未知${state.checkedAt ? ` · 同步 ${formatHistoryTime(state.checkedAt)}` : ''}</span>`;
+    if (!state.imported && !state.sub2AccountID) return '<span class="history-status sub2-unknown">Sub2 未找到关联</span>';
     if (!state.exists) return '<span class="history-status sub2-error">Sub2 已删除</span>';
     const status = state.status;
     const className = status === 'active' || status === 'available' || status === 'enabled' ? 'sub2-ok'
@@ -669,7 +719,7 @@ function renderSub2Status(account) {
 function historyStatusName(status) {
     return {
         success: '最近登录成功',
-        active: '可用',
+        active: '最近登录成功',
         running: '登录中',
         pending: '等待处理',
         interrupted: '上次中断',
@@ -680,6 +730,98 @@ function historyStatusName(status) {
         deleted_or_deactivated: '账号已删除或停用',
         unknown: '暂无状态'
     }[status] || status || '暂无状态';
+}
+
+const historyRecoveryNames = {
+    queued: '等待恢复', validating: '正在核对账号', disabling_schedule: '正在暂停调度', logging_in: '正在重新登录',
+    login_succeeded: '重新登录成功', identity_verified: '身份已核对', refreshing_credentials: '正在更新凭据',
+    applying_credentials: '正在写回 Sub2', credentials_applied: '凭据已写回 Sub2', enabling_schedule: '正在恢复调度',
+    completed: '恢复完成', success: '恢复完成', failed: '恢复失败', unknown: '恢复结果待核对', canceled: '恢复已取消'
+};
+
+function historyRecoveryActive(task) {
+    return Boolean(task && Object.hasOwn(historyRecoveryNames, task.state) && !['completed', 'success', 'failed', 'unknown', 'canceled'].includes(task.state));
+}
+
+function historyRecoveryAction(account) {
+    const state = account.sub2Status;
+    const task = historyRecoveries.get(account.id);
+    const resumable = task?.resumable && ['failed', 'unknown'].includes(task.state);
+    const checking = ['queued', 'running'].includes(historyChecks.get(account.id)?.latest_task?.state);
+    const linked = state.present && (state.imported || Boolean(state.sub2AccountID));
+    let reason = '';
+    if (!historySub2Configured || !linked) reason = '尚未关联 Sub2 账号';
+    else if (state.stale || state.unknown) reason = 'Sub2 状态未知，请刷新后重试';
+    else if (!state.exists) reason = '该账号已从 Sub2 删除';
+    else if (['inactive', 'disabled', 'deleted'].includes(state.status)) reason = 'Sub2 账号已禁用或删除，请先在 Sub2 中确认';
+    else if (!resumable && ['active', 'available', 'enabled'].includes(state.status) && state.schedulable === false) reason = '账号已人工暂停，保持暂停状态';
+    else if (account.status === 'deleted') reason = '该账号已删除';
+    else if (account.status === 'running') reason = '账号正在登录';
+    if (!reason && !resumable && state.status !== 'error') reason = ['active', 'available', 'enabled'].includes(state.status)
+        ? 'Sub2 正常，无需恢复' : '当前 Sub2 状态不支持自动恢复，请先核对';
+    const active = historyRecoveryRequests.has(account.id) || checking || historyRecoveryActive(task);
+    return {
+        visible: linked || Boolean(task),
+        disabled: active || Boolean(reason),
+        label: historyRecoveryRequests.has(account.id) ? '提交中…' : checking ? '检测中…'
+            : historyRecoveryActive(task) ? '恢复中…' : resumable ? '继续恢复' : '检测并恢复',
+        reason: reason || (resumable ? '继续已保存的恢复任务，完成凭据写回与调度恢复' : '先检测当前凭据，确认失效后重新登录并恢复 Sub2 调度'),
+        resume: Boolean(resumable)
+    };
+}
+
+function renderHistoryRecovery(account) {
+    const summary = historyChecks.get(account.id);
+    const latest = summary?.latest_task;
+    const result = summary?.last_result;
+    const recovery = historyRecoveries.get(account.id);
+    const lines = [];
+    if (['queued', 'running'].includes(latest?.state)) lines.push(latest.state === 'queued' ? '检测已排队，等待确认凭据状态' : '正在检测当前凭据');
+    else if (latest && latest.state !== 'finished') {
+        const names = { skipped: '检测已跳过', canceled: '检测已取消', interrupted: '检测中断' };
+        const reasons = { account_removed: '账号已删除', no_longer_imported: '不再符合检测条件', login_in_progress: '账号正在登录', cooldown: '检测冷却中' };
+        const reason = latest.message || reasons[latest.skip_reason];
+        lines.push(`${names[latest.state] || '检测状态待确认'}${reason ? `：${reason}` : ''}`);
+    }
+    if (result && !['queued', 'running'].includes(latest?.state)) {
+        const names = { ok: result.freshness === 'stale' ? '上次凭据调用正常' : '当前凭据调用正常，无需重新登录', unauthorized: '凭据鉴权失败', credential_revoked: '凭据已失效',
+            access_token_expired: '访问令牌已过期', credential_missing: '缺少访问令牌', credential_incomplete: '凭据信息不完整',
+            account_disabled: '账号已停用', account_deleted: '账号已删除', rate_limited: '请求限流，暂不重新登录',
+            quota_exhausted: '额度不足，暂不重新登录', network_error: '网络异常，未确认凭据失效',
+            proxy_error: '代理异常，未确认凭据失效', timeout: '检测超时，未确认凭据失效' };
+        const resultText = names[result.outcome] || result.message || '检测结束，详见检测详情';
+        lines.push(`检测：${resultText}${result.http_status ? `（HTTP ${result.http_status}）` : ''}${result.freshness === 'stale' ? ' · 旧凭据结果' : ''}${result.finished_at ? ` · ${formatHistoryTime(result.finished_at)}` : ''}`);
+    }
+    if (recovery) lines.push(`${historyRecoveryNames[recovery.state] || '恢复状态待确认'}${recovery.last_error ? `：${recovery.last_error}` : ''}${recovery.updated_at ? ` · ${formatHistoryTime(recovery.updated_at)}` : ''}`);
+    if (historyRecoveryNotices.has(account.id)) lines.push(historyRecoveryNotices.get(account.id));
+    return lines.map(line => `<div class="history-task-status">${escapeHTML(line)}</div>`).join('');
+}
+
+async function checkAndRecoverHistory(id) {
+    const key = String(id), account = historyAccounts.find(item => item.id === key);
+    if (!account || historyActionsLocked()) return;
+    const action = historyRecoveryAction(account);
+    if (action.disabled) return;
+    historyRecoveryRequests.add(key);
+    historyRecoveryNotices.delete(key);
+    renderHistory();
+    try {
+        const response = await fetch(action.resume ? '/api/account-recovery' : '/api/account-recovery/check', {
+            method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ account_id: Number(key) }), signal: AbortSignal.timeout(30000)
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || payload.success === false) throw new Error(payload.message || `提交失败（HTTP ${response.status}）`);
+        await loadHistory();
+        historyRefreshAt = Date.now() + 5000;
+    } catch (error) {
+        historyRecoveryNotices.set(key, error.name === 'TimeoutError' || error instanceof TypeError
+            ? '提交结果暂未确认，请刷新核对检测与恢复进度。' : error.message || '检测恢复提交失败');
+        historyRefreshAt = Date.now() + 5000;
+    } finally {
+        historyRecoveryRequests.delete(key);
+        renderHistory();
+    }
 }
 
 function formatHistoryTime(value) {
@@ -859,7 +1001,8 @@ function renderHistory() {
         const busy = historyBusyID === account.id;
         const selected = historySelectedIDs.has(account.id);
         const importState = historyImportState(account);
-        const importStateText = historyImportStateName(importState);
+        const externallyLinked = account.sub2Status.associationStatus === 'linked' || String(historyImports.get(account.id)?.operation_id || '').startsWith('linked-');
+        const importStateText = externallyLinked && importState === 'imported' ? '已关联 Sub2' : historyImportStateName(importState);
         const importError = historyImports.get(String(account.id))?.last_error || '';
         const statusClass = escapeHTML(account.status.replace(/[^a-z_]/g, ''));
         const errorSummary = account.reloginMessage || account.lastError;
@@ -867,6 +1010,8 @@ function renderHistory() {
         const errorHTTPStatus = account.lastHTTPStatus > 0 ? ` · HTTP ${account.lastHTTPStatus}` : '';
         const expiry = historyExpiryState(account);
         const expiryBadge = expiry.label ? `<span class="history-expiry ${expiry.kind}" title="这里只表示 OAuth 访问令牌有效期，不代表账号或 Refresh Token 已失效">${escapeHTML(expiry.label)}</span>` : '';
+        const recoveryAction = historyRecoveryAction(account);
+        const recoveryButton = recoveryAction.visible ? `<button class="btn-secondary" type="button" data-history-action="recover" data-history-id="${escapeHTML(account.id)}" title="${escapeHTML(recoveryAction.reason)}" ${historyActionsLocked() || busy || recoveryAction.disabled ? 'disabled' : ''}>${recoveryAction.label}</button>` : '';
         const copyRefreshButton = account.refreshToken ? `
                     <button class="btn-secondary" type="button" data-history-action="copy-refresh-token" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy ? 'disabled' : ''}>
                         复制 Refresh Token
@@ -892,9 +1037,12 @@ function renderHistory() {
                     ${deactivated ? '<div class="history-error">⚠️ 登录返回停用或删除提示；记录仍保留，可尝试重新登录确认最新状态。</div>' : ''}
                     ${errorSummary ? `<div class="history-error">${escapeHTML(errorSummary)}${errorCode}${errorHTTPStatus}</div>` : ''}
                     ${importError ? `<div class="history-error">Sub2：${escapeHTML(importError)}</div>` : ''}
+                    ${account.sub2Status.errorMessage ? `<div class="history-error">Sub2：${escapeHTML(account.sub2Status.errorMessage)}</div>` : ''}
+                    ${renderHistoryRecovery(account)}
                 </div>
                 <div class="history-actions">
                     ${importState === 'imported' ? `<button class="btn-secondary" type="button" data-history-action="check" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy || account.status === 'running' ? 'disabled' : ''}>检测状态</button>` : ''}
+                    ${recoveryButton}
                     <button class="btn-secondary" type="button" data-history-action="details" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy ? 'disabled' : ''}>
                         详情
                     </button>

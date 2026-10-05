@@ -71,7 +71,9 @@ let sub2Statuses = {
     1: { configured: true, imported: true, exists: true, status: 'active', schedulable: true, checked_at: '2026-10-05T10:00:00Z' },
     2: { configured: true, imported: true, exists: true, status: 'disabled', schedulable: false, checked_at: '2026-10-05T10:01:00Z' }
 };
-let recoverySettings = { auto_recovery_enabled: false };
+let recoverySettings = { auto_recovery_enabled: false, interval_seconds: 60 };
+let checks = {}, recoveries = {}, recoveryCheckFailure = false, settingsFailure = false;
+const intervals = [];
 let imports = [], historyFailure = false, historyGate = null, deleteGate = null;
 let deletionFailures = new Map(), missingIDs = new Set(), acceptedImportIDs = null, importGate = null;
 let confirmations = [], confirmResult = true, requests = [];
@@ -80,19 +82,32 @@ const location = { hash: '' };
 const window = new Element();
 Object.assign(window, { alert: () => {},
     history: { state: null, pushState(_state, _title, hash) { location.hash = hash; } } });
-const context = vm.createContext({ document, window, location, console, Event, CustomEvent, AbortController, AbortSignal, setTimeout, clearTimeout, CSS: { escape: String },
+const context = vm.createContext({ document, window, location, console, Event, CustomEvent, AbortController, AbortSignal, setTimeout, clearTimeout,
+    setInterval: (callback, delay) => { intervals.push({ callback, delay }); return intervals.length; }, CSS: { escape: String },
     fetch: async (url, options = {}) => {
         requests.push({ url, options });
         if (url === '/health') return response({ max_concurrent: 10 });
         if (url === '/api/history') {
             if (historyGate) { const gate = historyGate; historyGate = null; await gate.promise; }
             if (historyFailure) return response({ message: 'fixture refresh unavailable' }, 503);
-            return response({ data: rows, imports, sub2_configured: true, imports_available: true, sub2_statuses: sub2Statuses });
+            return response({ data: rows, imports, sub2_configured: true, imports_available: true, sub2_statuses: sub2Statuses, checks, recoveries, checks_available: true });
         }
         if (url === '/api/account-recovery/settings' && !options.method) return response(recoverySettings);
         if (url === '/api/account-recovery/settings' && options.method === 'PUT') {
-            recoverySettings = { auto_recovery_enabled: Boolean(JSON.parse(options.body).auto_recovery_enabled) };
+            if (settingsFailure) return response({ message: '设置未保存' }, 503);
+            recoverySettings = { ...recoverySettings, auto_recovery_enabled: Boolean(JSON.parse(options.body).auto_recovery_enabled) };
             return response(recoverySettings);
+        }
+        if (url === '/api/account-recovery/check' && options.method === 'POST') {
+            if (recoveryCheckFailure) return response({ success: false, message: '请稍后重试，检测冷却中' }, 409);
+            const id = JSON.parse(options.body).account_id;
+            checks[id] = { latest_task: { id: 10, account_id: id, state: 'queued' } };
+            return response({ success: true, batch: { id: 'manual-recovery-check' } });
+        }
+        if (url === '/api/account-recovery' && options.method === 'POST') {
+            const id = JSON.parse(options.body).account_id;
+            recoveries[id] = { ...recoveries[id], state: 'queued', resumable: false };
+            return response({ success: true, task: recoveries[id] });
         }
         if (url.startsWith('/api/history/') && !options.method) {
             const id = Number(url.split('/').pop());
@@ -193,7 +208,99 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     await change('autoRecoveryToggle', true);
     assert.equal(recoverySettings.auto_recovery_enabled, true);
     assert.equal(el('autoRecoveryToggle').checked, true);
-    assert.equal(el('autoRecoveryStatus').textContent, '已开启');
+    assert.equal(el('autoRecoveryStatus').textContent, '已开启 · 后台运行');
+    assert.match(el('autoRecoveryDetail').textContent, /每 60 秒/);
+    assert.match(el('autoRecoveryDetail').textContent, /关闭页面后仍继续/);
+    assert.match(el('historyGrid').innerHTML, /最近登录成功/);
+    assert.equal(intervals.length, 1, 'history has one background polling loop');
+    assert.equal(intervals[0].delay, 5000);
+    assert.equal(run('historyRefreshDelay()'), 60000, 'enabled idle polling is once per minute');
+    assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '1')).disabled"), true, 'healthy account cannot be recovered');
+    assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '1')).reason"), 'Sub2 正常，无需恢复');
+    assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), true, 'disabled account cannot be recovered');
+    sub2Statuses[2] = { ...sub2Statuses[2], sub2_account_id: 200, status: 'error', error_message: '401 credential expired', association_status: 'linked' };
+    imports = [{ account_id: 2, sub2_account_id: 200, state: 'imported', operation_id: 'linked-200' }];
+    await click('refreshHistoryBtn');
+    assert.match(el('historyGrid').innerHTML, /已关联 Sub2/);
+    assert.match(el('historyGrid').innerHTML, /Sub2：401 credential expired/);
+    assert.match(el('historyGrid').innerHTML, /data-history-action="recover" data-history-id="2"[^>]*>检测并恢复/);
+    assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), false);
+    await run("checkAndRecoverHistory('2')");
+    assert.equal(requests.filter(item => item.url === '/api/account-recovery/check').length, 1);
+    assert.deepEqual(JSON.parse(requests.find(item => item.url === '/api/account-recovery/check').options.body), { account_id: 2 });
+    assert.match(el('historyGrid').innerHTML, /检测已排队/);
+    assert.doesNotMatch(el('historyGrid').innerHTML, /恢复完成/, 'queued checks must not claim successful recovery');
+    assert.equal(run('historyRefreshDelay()'), 5000, 'active tasks are refreshed promptly');
+    await run("checkAndRecoverHistory('2')");
+    assert.equal(requests.filter(item => item.url === '/api/account-recovery/check').length, 1, 'duplicate clicks during checking do not submit again');
+    checks[2] = { latest_task: { id: 10, state: 'finished' }, last_result: { id: 10, state: 'finished', outcome: 'unauthorized', http_status: 401 } };
+    recoveries[2] = { state: 'logging_in', updated_at: '2026-10-05T11:00:00Z' };
+    await click('refreshHistoryBtn');
+    assert.match(el('historyGrid').innerHTML, /HTTP 401/);
+    assert.match(el('historyGrid').innerHTML, /正在重新登录/);
+    assert.match(el('historyGrid').innerHTML, /disabled>恢复中…/);
+    recoveries[2] = { state: 'failed', last_error: '登录需要额外验证' };
+    await click('refreshHistoryBtn');
+    assert.match(el('historyGrid').innerHTML, /恢复失败：登录需要额外验证/);
+    recoveryCheckFailure = true;
+    await run("checkAndRecoverHistory('2')");
+    assert.match(el('historyGrid').innerHTML, /请稍后重试，检测冷却中/);
+    assert.doesNotMatch(el('historyGrid').innerHTML, /恢复完成/);
+    recoveryCheckFailure = false;
+    sub2Statuses[2].status = 'active'; sub2Statuses[2].schedulable = false;
+    await click('refreshHistoryBtn');
+    assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).reason"), '账号已人工暂停，保持暂停状态');
+    recoveries[2].resumable = true;
+    await click('refreshHistoryBtn');
+    assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), false, 'a checkpointed recovery can continue while scheduling is paused');
+    assert.match(el('historyGrid').innerHTML, />继续恢复/);
+    await run("checkAndRecoverHistory('2')");
+    assert.deepEqual(JSON.parse(requests.find(item => item.url === '/api/account-recovery' && item.options.method === 'POST').options.body), { account_id: 2 });
+    recoveries[2] = { state: 'failed' };
+    checks[2] = { latest_task: { state: 'skipped', skip_reason: 'cooldown' }, last_result: { outcome: 'ok', freshness: 'stale' } };
+    await click('refreshHistoryBtn');
+    assert.match(el('historyGrid').innerHTML, /检测已跳过：检测冷却中/);
+    assert.match(el('historyGrid').innerHTML, /上次凭据调用正常 · 旧凭据结果/);
+    assert.doesNotMatch(el('historyGrid').innerHTML, /当前凭据调用正常/);
+    sub2Statuses[2].exists = false;
+    await click('refreshHistoryBtn');
+    assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).reason"), '该账号已从 Sub2 删除');
+    for (const [association, label] of [['unmatched', '未找到关联'], ['ambiguous', '多条匹配待确认'], ['conflict', '身份不一致']]) {
+        sub2Statuses[2] = { imported: false, exists: false, unknown: true, association_status: association, error: '<reason>' };
+        await click('refreshHistoryBtn');
+        assert.match(el('historyGrid').innerHTML, new RegExp(`Sub2 ${label}`));
+        assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), true);
+    }
+    recoverySettings = { ...recoverySettings, scanning: true, last_scan_at: '2026-10-05T11:01:00Z', next_scan_at: '2026-10-05T11:02:00Z', last_error: '出口暂不可用', summary: 'Sub2 异常 2 个，提交检测 1 个，恢复 0 个，等待或冷却 1 个' };
+    await run('loadRecoverySettings()');
+    assert.equal(el('autoRecoveryStatus').textContent, '正在巡检…');
+    assert.match(el('autoRecoveryDetail').textContent, /上次巡检/);
+    assert.match(el('autoRecoveryDetail').textContent, /下次巡检/);
+    assert.match(el('autoRecoveryDetail').textContent, /出口暂不可用/);
+    assert.match(el('autoRecoveryDetail').textContent, /提交检测 1 个/);
+    settingsFailure = true;
+    await change('autoRecoveryToggle', false);
+    assert.equal(el('autoRecoveryToggle').checked, true, 'unsaved changes roll back to server state');
+    assert.equal(el('autoRecoveryStatus').textContent, '设置未保存');
+    settingsFailure = false;
+    recoverySettings = { auto_recovery_enabled: true, interval_seconds: 60 };
+    checks = {}; recoveries = {}; imports = [];
+    sub2Statuses[2] = { configured: true, imported: true, exists: true, status: 'disabled', schedulable: false };
+    run('historyRecoveryNotices.clear()');
+    await change('autoRecoveryToggle', false);
+    assert.equal(run('historyRefreshDelay()'), 300000, 'disabled idle polling returns to five minutes');
+    recoverySettings.last_error = '手动恢复未能入队';
+    await run('loadRecoverySettings()');
+    assert.match(el('autoRecoveryDetail').textContent, /手动恢复未能入队/, 'manual failure remains visible with automatic recovery off');
+    let releasePoll;
+    historyGate = { promise: new Promise(resolve => { releasePoll = resolve; }) };
+    run('historyRefreshAt = 0');
+    const beforePoll = requests.filter(item => item.url === '/api/history').length;
+    const firstPoll = run('pollHistory()');
+    await flush();
+    await run('pollHistory()');
+    assert.equal(requests.filter(item => item.url === '/api/history').length, beforePoll + 1, 'poll ticks never overlap');
+    releasePoll(); await firstPoll;
     await click('tab-login');
     assert.equal(el('historyActionBar').hidden, true, 'history actions must not appear in login');
     await click('tab-history');

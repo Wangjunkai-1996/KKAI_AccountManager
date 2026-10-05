@@ -44,6 +44,10 @@ type sub2RecoveryService struct {
 	wake         chan struct{}
 	paused       atomic.Bool
 	autoRecovery atomic.Bool
+	checker      *accountCheckService
+	monitorMu    sync.Mutex
+	monitorWake  chan struct{}
+	monitorState sub2MonitorState
 }
 
 type sub2RecoveryRequest struct {
@@ -78,8 +82,19 @@ func (e *sub2APIError) Error() string {
 
 func newSub2RecoveryService(history *store.Store, loginService *login.Service, importer *sub2ImportService) *sub2RecoveryService {
 	ctx, cancel := context.WithCancel(context.Background())
-	service := &sub2RecoveryService{store: history, sub2: importer, timeout: 6 * time.Minute, ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1)}
+	service := &sub2RecoveryService{store: history, sub2: importer, timeout: 6 * time.Minute, ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1), monitorWake: make(chan struct{}, 1)}
 	service.autoRecovery.Store(envBool("AUTH_AUTO_RECOVERY"))
+	if history != nil {
+		readCtx, readCancel := context.WithTimeout(ctx, 5*time.Second)
+		enabled, saved, err := history.AutoRecoveryEnabled(readCtx)
+		readCancel()
+		if err != nil {
+			service.autoRecovery.Store(false)
+			service.monitorState.LastError = "自动恢复设置读取失败，请重新保存开关"
+		} else if saved {
+			service.autoRecovery.Store(enabled)
+		}
+	}
 	if loginService != nil {
 		service.loginWithProxies = loginService.LoginWithProxiesContext
 	}
@@ -103,8 +118,9 @@ func (s *sub2RecoveryService) Start() {
 	if !s.configured() {
 		return
 	}
-	s.wg.Add(1)
+	s.wg.Add(2)
 	go s.worker()
+	go s.monitor()
 	s.notify()
 }
 
@@ -234,6 +250,10 @@ func (s *sub2RecoveryService) handleCollection(w http.ResponseWriter, r *http.Re
 
 func (s *sub2RecoveryService) handleAction(w http.ResponseWriter, r *http.Request) {
 	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/account-recovery/"), "/")
+	if path == "check" {
+		s.handleRecoveryCheck(w, r)
+		return
+	}
 	if path == "settings" {
 		if s == nil || s.store == nil {
 			recoveryAPIError(w, http.StatusServiceUnavailable, "recovery_unavailable", "恢复服务不可用")
@@ -241,7 +261,7 @@ func (s *sub2RecoveryService) handleAction(w http.ResponseWriter, r *http.Reques
 		}
 		switch r.Method {
 		case http.MethodGet:
-			respondJSON(w, map[string]any{"success": true, "enabled": s.autoRecovery.Load(), "auto_recovery_enabled": s.autoRecovery.Load()})
+			respondJSON(w, s.recoverySettings())
 		case http.MethodPut:
 			var req struct {
 				Enabled            *bool `json:"enabled"`
@@ -258,8 +278,12 @@ func (s *sub2RecoveryService) handleAction(w http.ResponseWriter, r *http.Reques
 				recoveryAPIError(w, http.StatusBadRequest, "invalid_request", "enabled 必须是布尔值")
 				return
 			}
-			s.autoRecovery.Store(*enabled)
-			respondJSON(w, map[string]any{"success": true, "enabled": *enabled, "auto_recovery_enabled": *enabled})
+			if err := s.saveRecoverySetting(r.Context(), *enabled); err != nil {
+				recoveryAPIError(w, http.StatusServiceUnavailable, "settings_save_failed", "自动恢复设置保存失败")
+				return
+			}
+			s.notifyMonitor()
+			respondJSON(w, s.recoverySettings())
 		default:
 			recoveryAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "请求方法不支持")
 		}
@@ -286,7 +310,7 @@ func (s *sub2RecoveryService) handleAction(w http.ResponseWriter, r *http.Reques
 	respondJSON(w, map[string]any{"success": true, "task": task})
 }
 
-func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64) (store.AccountRecoveryTask, bool, error) {
+func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, automatic ...bool) (store.AccountRecoveryTask, bool, error) {
 	account, err := s.store.GetAccountByID(ctx, accountID)
 	if err != nil {
 		return store.AccountRecoveryTask{}, false, err
@@ -304,8 +328,17 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64) (sto
 	if err != nil {
 		return store.AccountRecoveryTask{}, false, errors.New("Sub2 账号状态暂时无法核对")
 	}
-	if err := verifySub2RecoveryIdentity(detail, binding.Sub2AccountID, accountID, account); err != nil {
+	if err := verifySub2RecoveryIdentity(detail, binding.Sub2AccountID, accountID, account, binding); err != nil {
 		return store.AccountRecoveryTask{}, false, errors.New("Sub2 账号身份与 AUTH 绑定不一致")
+	}
+	if recoveryAccountDisabled(detail) {
+		return store.AccountRecoveryTask{}, false, errors.New("Sub2 账号已被禁用，请先在 Sub2 启用后恢复")
+	}
+	if len(automatic) > 0 && automatic[0] {
+		status, _ := detail["status"].(string)
+		if !s.autoRecovery.Load() || !strings.EqualFold(status, "error") {
+			return store.AccountRecoveryTask{}, false, errRecoveryNotCandidate
+		}
 	}
 	original, ok := boolField(detail, "schedulable")
 	if !ok {
@@ -348,21 +381,6 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64) (sto
 	return task, created, err
 }
 
-// enqueueAutomatic is called after AUTH has durably recorded a clear 401 or
-// credential failure. It reuses the manual enqueue path so the same binding,
-// identity, freshness and one-active-task checks apply to both entry points.
-func (s *sub2RecoveryService) enqueueAutomatic(accountID int64) {
-	if !s.configured() || s.paused.Load() {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_, _, err := s.enqueue(ctx, accountID)
-	if err != nil && !errors.Is(err, errRecoveryNotCandidate) {
-		log.Printf("自动恢复入队失败：account_id=%d", accountID)
-	}
-}
-
 func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.timeout)
 	defer cancel()
@@ -401,8 +419,28 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		s.fail(task.ID, store.RecoveryUnknown, "Sub2 账号状态无法核对，已暂停自动恢复")
 		return
 	}
-	if err := verifySub2RecoveryIdentity(detail, task.Sub2AccountID, task.AccountID, account); err != nil {
+	if err := verifySub2RecoveryIdentity(detail, task.Sub2AccountID, task.AccountID, account, binding); err != nil {
 		s.fail(task.ID, store.RecoveryFailed, "Sub2 账号身份与 AUTH 绑定不一致")
+		return
+	}
+	if account.ChatGPTAccountID == "" {
+		credentials, _ := detail["credentials"].(map[string]any)
+		workspace, _ := credentials["chatgpt_account_id"].(string)
+		if strings.TrimSpace(workspace) == "" {
+			s.fail(task.ID, store.RecoveryFailed, "Sub2 缺少账号工作区身份，无法核对重新登录结果")
+			return
+		}
+		// An account that has never logged in locally still has an identity in
+		// Sub2. Pin it before login; a different returned workspace must never
+		// overwrite that existing remote account.
+		account.ChatGPTAccountID = workspace
+	}
+	if recoveryAccountDisabled(detail) {
+		s.fail(task.ID, store.RecoveryFailed, "Sub2 账号已被禁用，停止恢复")
+		return
+	}
+	if status, _ := detail["status"].(string); strings.EqualFold(status, "active") && task.OriginalSchedulable && task.ResultCredentialAttemptID == 0 {
+		s.fail(task.ID, store.RecoveryCanceled, "Sub2 已恢复正常或转为人工暂停，停止重新登录")
 		return
 	}
 	scheduled, ok := boolField(detail, "schedulable")
@@ -471,7 +509,7 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		return
 	}
 	after, err := s.sub2Account(ctx, task.Sub2AccountID)
-	if err != nil || verifySub2RecoveryDetail(after, task.Sub2AccountID, task.AccountID, account) != nil || !recoveryMarkerMatches(after, task) {
+	if err != nil || verifySub2RecoveryDetail(after, task.Sub2AccountID, task.AccountID, account, binding) != nil || !recoveryMarkerMatches(after, task) {
 		s.fail(task.ID, store.RecoveryUnknown, "凭据已提交但 Sub2 状态回查不一致，可继续恢复")
 		return
 	}
@@ -487,7 +525,7 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		return
 	}
 	beforeEnable, err := s.sub2Account(ctx, task.Sub2AccountID)
-	if err != nil || verifySub2RecoveryDetail(beforeEnable, task.Sub2AccountID, task.AccountID, account) != nil || !recoveryMarkerMatches(beforeEnable, task) {
+	if err != nil || verifySub2RecoveryDetail(beforeEnable, task.Sub2AccountID, task.AccountID, account, binding) != nil || !recoveryMarkerMatches(beforeEnable, task) {
 		s.fail(task.ID, store.RecoveryUnknown, "检测后 Sub2 状态未通过核对，保持暂停")
 		return
 	}
@@ -511,7 +549,7 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 	}
 	enabled, err := s.sub2Account(ctx, task.Sub2AccountID)
 	value, ok := boolField(enabled, "schedulable")
-	if err != nil || !ok || !value || verifySub2RecoveryDetail(enabled, task.Sub2AccountID, task.AccountID, account) != nil || !recoveryMarkerMatches(enabled, task) {
+	if err != nil || !ok || !value || verifySub2RecoveryDetail(enabled, task.Sub2AccountID, task.AccountID, account, binding) != nil || !recoveryMarkerMatches(enabled, task) {
 		s.pauseSchedule(task.Sub2AccountID)
 		s.fail(task.ID, store.RecoveryUnknown, "最终状态无法确认，已请求暂停调度；可继续恢复")
 		return

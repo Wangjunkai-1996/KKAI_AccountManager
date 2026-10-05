@@ -372,8 +372,11 @@ func TestAccountCheckPrecheckAndNoRefreshRead(t *testing.T) {
 			}
 			batch := checkTestBatch(t, s, "precheck", 1, a)
 			work, err := s.ClaimAccountCheck(ctx)
-			if err != nil || work != nil {
-				t.Fatalf("unexpected request work=%+v err=%v", work, err)
+			if err != nil || work == nil || work.PrecheckResult == nil {
+				t.Fatalf("missing precheck work=%+v err=%v", work, err)
+			}
+			if _, err := s.FinishAccountCheck(ctx, work.Check.ID, *work.PrecheckResult); err != nil {
+				t.Fatal(err)
 			}
 			b, items, _ := s.GetAccountCheckBatch(ctx, batch.ID)
 			if b.State != "completed" || b.Counts.Precheck != 1 || items[0].Outcome != test.outcome || items[0].ErrorCode != test.code || items[0].RequestAttempted == nil || *items[0].RequestAttempted {

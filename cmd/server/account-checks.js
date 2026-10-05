@@ -562,7 +562,15 @@
     });
     ui.DetailsClose.addEventListener('click', () => ui.Details.close());
     ui.Details.addEventListener('close', () => { detailID = ''; detailGeneration++; restoreDetailsFocus(); });
-    document.addEventListener('auth-history-changed', () => { credentialGeneration++; return refreshAccounts({ invalidate: true }); });
+    document.addEventListener('auth-history-changed', event => {
+        credentialGeneration++;
+        if (!event.detail?.history) return refreshAccounts({ invalidate: true });
+        // Reuse the history page's snapshot instead of querying every Sub2 account twice.
+        historyGeneration++;
+        historyAgain = false;
+        try { applyHistory(event.detail.history); render(!activeID); }
+        catch (error) { available = false; notice(error.message); render(); }
+    });
     document.addEventListener('visibilitychange', () => { if (!document.hidden) void refreshAll(); else schedulePoll(); });
     document.addEventListener('auth-tab-changed', event => {
         if (event.detail.name === 'checks') void refreshAll();

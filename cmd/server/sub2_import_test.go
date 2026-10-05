@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,5 +136,149 @@ func TestListSub2AccountStatusesMarksTransportFailuresUnknown(t *testing.T) {
 	got := statuses[accountID]
 	if got.Exists || !got.Unknown || !got.Stale || got.Error == "" {
 		t.Fatalf("transport status = %+v", got)
+	}
+}
+
+func TestSyncSub2AccountAssociation(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		workspaces  []string
+		association string
+		wantLinked  bool
+	}{
+		{"unique_external", []string{"chatgpt-1"}, "linked", true},
+		{"workspace_disambiguates", []string{"other", "chatgpt-1"}, "linked", true},
+		{"ambiguous_on_next_page", []string{"chatgpt-1", "chatgpt-1"}, "ambiguous", false},
+		{"wrong_workspace", []string{"other"}, "conflict", false},
+		{"no_remote_account", nil, "unmatched", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			history, accountID := testOAuthStore(t)
+			// A binding for another destination must not hide current discovery.
+			if _, err := history.LinkSub2Account(context.Background(), "previous", accountID, 99, "linked-previous"); err != nil {
+				t.Fatal(err)
+			}
+			remote := func(index int) map[string]any {
+				return map[string]any{"id": index + 42, "name": "custom display name", "platform": "openai", "type": "oauth", "status": "error", "schedulable": false,
+					"credentials": map[string]any{"email": " SUB2@EXAMPLE.COM ", "chatgpt_account_id": tc.workspaces[index]}}
+			}
+			mutations := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					mutations++
+					t.Error("association mutated Sub2")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Path == "/api/v1/admin/accounts" {
+					if r.URL.Query().Get("search") != "" || r.URL.Query().Get("platform") != "openai" || r.URL.Query().Get("type") != "oauth" {
+						t.Error("identity discovery must cover all OpenAI OAuth names")
+					}
+					page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+					items := []map[string]any{}
+					if page <= len(tc.workspaces) {
+						items = append(items, remote(page-1))
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"items": items, "pages": len(tc.workspaces), "page": page, "total": len(tc.workspaces)}})
+					return
+				}
+				id, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/api/v1/admin/accounts/"))
+				if id < 42 || id-42 >= len(tc.workspaces) {
+					http.NotFound(w, r)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": remote(id - 42)})
+			}))
+			defer server.Close()
+			svc := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "current", client: server.Client()}
+			imports, statuses, err := svc.syncAccountStatuses(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, exists := statuses[accountID]
+			if !exists || snapshot.AssociationStatus != tc.association || (len(imports) == 1) != tc.wantLinked {
+				t.Fatalf("imports=%+v status=%+v", imports, snapshot)
+			}
+			if tc.wantLinked {
+				if !snapshot.Exists || snapshot.Unknown || imports[0].DestinationKey != "current" || !strings.HasPrefix(imports[0].OperationID, "linked-") {
+					t.Fatalf("invalid association %+v / %+v", imports, snapshot)
+				}
+				task, err := svc.ensureTask(context.Background(), accountID)
+				if err != nil || task.ID != imports[0].ID || task.State != "imported" {
+					t.Fatalf("import should reuse external association: %+v, %v", task, err)
+				}
+			} else if tc.association != "unmatched" {
+				if _, err := svc.ensureTask(context.Background(), accountID); err == nil {
+					t.Fatal("ambiguous or conflicting remote identity must block duplicate import")
+				}
+			}
+			queued, err := history.ListQueuedSub2Imports(context.Background(), 100)
+			if err != nil || len(queued) != 0 || mutations != 0 {
+				t.Fatalf("association created import work: %+v, mutations=%d, %v", queued, mutations, err)
+			}
+		})
+	}
+}
+
+func TestSyncSub2AccountStatusesFailureIncludesEveryAccount(t *testing.T) {
+	history, accountID := testOAuthStore(t)
+	second, err := history.UpsertCredentials(context.Background(), store.Credentials{Email: "other@example.test", Password: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &sub2ImportService{store: history, baseURL: "http://127.0.0.1:1/api/v1", adminAPIKey: "secret", destinationKey: "test", client: &http.Client{Timeout: 20 * time.Millisecond}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, statuses, err := service.syncAccountStatuses(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{accountID, second.ID} {
+		status, exists := statuses[id]
+		if !exists || !status.Unknown || !status.Stale || status.Error == "" || status.Exists {
+			t.Fatalf("failed status omitted or reported absent: %d, %+v", id, status)
+		}
+	}
+}
+
+func TestSub2ImportLinksExistingAccountBeforeCreatingTask(t *testing.T) {
+	history, accountID := testOAuthStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Error("existing account must not be imported again")
+		}
+		detail := map[string]any{"id": 42, "platform": "openai", "type": "oauth", "credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": "chatgpt-1"}}
+		var data any = detail
+		if r.URL.Path == "/admin/accounts" {
+			data = map[string]any{"items": []any{detail}, "total": 1, "pages": 1}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": data})
+	}))
+	defer server.Close()
+	svc := &sub2ImportService{store: history, baseURL: server.URL, adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
+	task, err := svc.ensureTask(context.Background(), accountID)
+	if err != nil || task.State != "imported" || task.Sub2AccountID != 42 || !strings.HasPrefix(task.OperationID, "linked-") {
+		t.Fatalf("direct import did not associate: %+v, %v", task, err)
+	}
+	queued, err := history.ListQueuedSub2Imports(context.Background(), 100)
+	if err != nil || len(queued) != 0 {
+		t.Fatalf("existing account queued: %+v, %v", queued, err)
+	}
+}
+
+func TestSyncSub2IncompletePaginationCannotConfirmAssociation(t *testing.T) {
+	history, accountID := testOAuthStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "2" {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":0,"data":{"items":[{"id":42,"platform":"openai","type":"oauth","credentials":{"email":"sub2@example.com","chatgpt_account_id":"chatgpt-1"}}],"pages":2,"total":2}}`))
+	}))
+	defer server.Close()
+	svc := &sub2ImportService{store: history, baseURL: server.URL, adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
+	imports, statuses, err := svc.syncAccountStatuses(context.Background())
+	status := statuses[accountID]
+	if err != nil || len(imports) != 0 || !status.Unknown || !status.Stale || status.AssociationStatus == "unmatched" || status.Exists {
+		t.Fatalf("partial list falsely confirmed a binding/absence: %+v, %+v, %v", imports, status, err)
 	}
 }

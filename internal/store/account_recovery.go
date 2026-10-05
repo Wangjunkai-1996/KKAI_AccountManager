@@ -491,7 +491,8 @@ func (s *Store) GetAccountCredentialVersion(ctx context.Context, accountID int64
 
 func validateRecoveryVersionTx(ctx context.Context, tx *sql.Tx, taskID, accountID int64) error {
 	var source, result, current, owner int64
-	err := tx.QueryRowContext(ctx, `SELECT t.account_id,t.source_credential_attempt_id,t.result_credential_attempt_id,COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=t.account_id AND status='success'),0) FROM account_recovery_tasks t WHERE t.id=?`, taskID).Scan(&owner, &source, &result, &current)
+	var observedMissing bool
+	err := tx.QueryRowContext(ctx, `SELECT t.account_id,t.source_credential_attempt_id,t.result_credential_attempt_id,COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=t.account_id AND status='success'),0),EXISTS(SELECT 1 FROM account_checks c WHERE c.id=t.check_id AND c.account_id=t.account_id AND c.state='finished' AND c.outcome='credential_missing' AND c.credential_attempt_id=0) FROM account_recovery_tasks t WHERE t.id=?`, taskID).Scan(&owner, &source, &result, &current, &observedMissing)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrAccountRecoveryNotFound
 	}
@@ -505,7 +506,10 @@ func validateRecoveryVersionTx(ctx context.Context, tx *sql.Tx, taskID, accountI
 	if result > 0 {
 		expected = result
 	}
-	if expected <= 0 || expected != current {
+	// A verified missing-token observation can start the first successful
+	// login. Version zero is still rejected for tasks without that observation,
+	// and any intervening successful login invalidates the task as usual.
+	if expected != current || (expected == 0 && !observedMissing) {
 		return ErrAccountRecoveryVersionChanged
 	}
 	return nil

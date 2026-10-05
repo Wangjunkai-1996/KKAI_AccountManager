@@ -4,7 +4,7 @@
 
 ## 当前结论
 
-项目源码在 `/Users/tokk/Desktop/KKAI_AUTH`。批量登录结果导入 Sub2、Sub2 状态同步和自动恢复开关已于北京时间 2026-10-05 10:13:47 部署到 sys1，即时及延迟健康检查、有效路由和回滚准备均通过；Sub2 源码、镜像和线上版本未改。本轮尚未进行真实 OAuth/401 恢复业务验收。此前 Tab UI 和账号状态检测记录分别见 [TAB_UI_REDESIGN.md](TAB_UI_REDESIGN.md) 和 [ACCOUNT_STATUS_CHECK_IMPLEMENTATION.md](ACCOUNT_STATUS_CHECK_IMPLEMENTATION.md)。
+项目源码在 `/Users/tokk/Desktop/KKAI_AUTH`。外部账号关联、历史恢复入口、后台 60 秒巡检及无本地令牌恢复已部署到 sys1（`20261005T035610Z-sub2-monitor-complete`）；Sub2 源码和线上版本未改。已观察真实自动检测与登录尝试；上游拒绝登录的账号明确显示失败，不作为恢复成功。完整证据见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。
 
 ## 历史列表优化（此前已发布）
 
@@ -18,17 +18,17 @@
 | 服务 | `openai-login.service` |
 | sys1 本机监听 | `127.0.0.1:18082` |
 | Mac 隧道 | `./open-sys1.sh` |
-| 当前 release | `20261005T020014Z-sub2-sync-auto` |
-| 回滚 release | `20261004T164742Z-sub2-recovery` |
+| 当前 release | `20261005T035610Z-sub2-monitor-complete` |
+| 回滚 release | `20261005T033000Z-sub2-monitor-link` |
 | 数据库 | `/var/lib/openai-login/data/accounts.db` |
 | 密钥 | `/var/lib/openai-login/data/accounts.key` |
-| 最近健康检查 | 2026-10-05 02:17:40 UTC 延迟复查 `active/running`、`NRestarts=0`、`/health = status: ok, max_concurrent: 10` |
-| 发布前备份 | `/var/lib/openai-login/backups/accounts-before-20261005T020014Z-sub2-sync-auto.db`，0600，`integrity_check=ok` |
-| 当前二进制 SHA-256 | `c7166a6e999eb2eb3c20f78d98944072a13abaf9ae20246d7c1433d6b2c0cbdc` |
+| 最近健康检查 | 2026-10-05 04:08:56 UTC：active/running，NRestarts=0，健康正常，回滚就绪 |
+| 发布前备份 | `/var/lib/openai-login/backups/accounts-before-20261005T035610Z-sub2-monitor-complete.db`，0600，`integrity_check=ok` |
+| 当前二进制 SHA-256 | `601b43cfd4b7ff567571bb27cfbbdeb0ab107f40125337c39a6a863d2de3f522` |
 | 导入配置 | `sub2_configured=true`；使用 Sub2 既有接口，Sub2 源码和线上版本未改 |
 | 公网身份验证 | 有效入口 Unix socket 健康通过，公网未认证 HTTP 401；未验证认证后公网业务 |
-| 本轮功能与 OAuth 验收 | 隔离候选已验证设置 GET/PUT 和只读 Sub2 状态，生产只做 GET 验证；未执行真实 OAuth/401 恢复业务验收 |
-| 自动恢复设置 | 当前关闭；运行时开关重启后按 `AUTH_AUTO_RECOVERY` 恢复默认值 |
+| 本轮功能与 OAuth 验收 | 后台扫描与真实 AUTH 重登已发生；4 个账号被上游拒绝（account_deactivated/403）；成功恢复链路有集成 fixture 验证 |
+| 自动恢复设置 | 开启并保存到 SQLite，立即及每 60 秒后台扫描，页面关闭后继续 |
 | sys1 IPv4 模型检测（历史） | 此前真实 HTTP200 / 完整模型完成事件，1,982ms |
 | 默认代理模型检测（历史） | 此前单账号连续两次成功；候选两个账号并发2正常，重叠3,035ms |
 | 浏览器直连历史限制 | 授权流程曾收到 `403 + cf-mitigated: challenge`；不可将该浏览器结论套用到模型检测 |
@@ -43,9 +43,11 @@
 - 默认 1 个并发，服务端硬上限可配置为 1–10 个；单账号总超时默认 3 分钟。
 - SSE 实时进度、单个失败重试和批量重试。
 - 认证成功的历史账号及批量登录结果可从页面导入 Sub2 未分组；任务状态持久化并通过来源标记回查确认。
-- 历史列表刷新时从 Sub2 既有详情接口读取状态，可见页面每 5 分钟同步；404 显示已删除，网络异常、5xx 和身份不一致显示未知。
-- 自动恢复开启后，现有 AUTH 检测任务得到明确 401/凭据失效结果时自动入队恢复，校验原 Sub2 账号仍存在及绑定身份；直接重新登录取得新凭据，取消 Refresh Token 优先路径。写回与检测成功后的调度策略依据 Sub2 状态判断，不能保证识别所有人工暂停情形。真实 401 恢复链路尚未验收。
-- 自动恢复开关默认关闭、仅进程运行时有效，重启后按 `AUTH_AUTO_RECOVERY` 恢复。本次没有新增定时 AUTH 模型检测。
+- 外部导入的 Sub2 账号按凭据邮箱和已知工作区自动关联；唯一匹配持久化，不重新导入。歧义、身份冲突、查询失败显示具体原因。
+- 历史行提供“检测并恢复”和断点“继续恢复”，显示 AUTH 检测、重新登录、凭据写回、调度恢复及失败原因；普通“重新登录”只更新 AUTH。
+- 自动恢复开关保存到 SQLite，开启立即扫描，此后每 60 秒在服务器运行，关闭页面后继续。仅检查 Sub2 异常账号；确认 401/失效/缺少本地凭据后直接 AUTH 登录，不走 RT 优先路径。缺少本地工作区时以 Sub2 身份核对新凭据。
+- 正常、禁用、删除、未知、正常但人工暂停的账号跳过。任务去重，自动恢复结束后冷却 30 分钟，同一凭据版本 24 小时内失败 3 次暂停自动重试。
+- 页面进行中每 5 秒刷新，自动开启且空闲时每 60 秒，关闭且空闲时每 5 分钟；显示上下次巡检与结果摘要。
 - HTTP 代理输入、代理测试和错误分类。
 - AUTH 本地凭据的手动模型检测；检测自身只读 AT、无 RT 刷新；明确区分本地过期、401、额度、权限与网络错误。符合条件的检测结果可触发已开启的自动恢复。
 
@@ -79,22 +81,20 @@ cd /Users/tokk/Desktop/KKAI_AUTH
 
 ## 本轮精确验证命令与结果
 
-本次 Sub2 状态同步与自动恢复发布的以下命令均通过：
+本轮以下定向验证通过；无本地令牌分支修正后重新执行相关 race 测试及 vet：
 
 ```bash
 go test ./cmd/server ./internal/store -timeout=90s
+go test -race ./cmd/server ./internal/store -run 'Test(Sub2Monitor|Sub2ManualCheck|Sub2AutomaticCheck|Sub2Recovery|AccountCheck|RecoveryRejects)' -timeout=90s
 go vet ./cmd/server ./internal/store
 node --check cmd/server/client.js
 node cmd/server/client.test.cjs
-./build-linux.sh /tmp/openai-login-web-20261005T020014Z-sub2-sync-auto
+node cmd/server/account-checks.test.cjs
+./build-linux.sh /tmp/openai-login-web-20261005T035610Z-sub2-monitor-complete
 git diff --check
 ```
 
-完整测试套件未运行。候选使用隔离数据库验证 `/api/account-recovery/settings` GET/PUT（开启后关闭）及 `/api/history` 的 Sub2 实时状态：33 个账号、12 项状态（9 正常、3 不存在）。生产切换后仅通过 GET 确认 33 个账号、12 项状态（8 正常、3 不存在、1 错误），自动恢复关闭；这是检查时的快照，不是固定状态。
-
-二进制和 3 个嵌入静态资源 SHA 已核对；Node `v24.19.0`、Playwright `1.62.1`、Chrome `154.0.8037.97` 沿用原环境，Sub2 代码没有参与构建或部署。02:17:40 UTC 延迟复查确认唯一实际服务进程 `1422128` 运行新 release，健康正常、无重启，33 个账号及 12 项 Sub2 快照可读，自动恢复关闭。panic、fatal、数据库锁、启动失败、存储故障日志聚合均为 0。
-
-02:17:38 UTC 实际入口 Unix socket 健康通过，公网未认证 HTTP 401；有效路由详见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。回滚二进制、Node 及 driver 的 111 个文件 hash 核对通过，备份再次确认 `0600`、`integrity_check=ok`，远端临时上传文件已清理。未执行真实 OAuth 登录或 401 恢复业务验收。
+完整测试套件未运行。候选隔离数据库、生产资产 hash、实际入口路由、真实任务进展和回滚核对见 [部署记录](SYS1_DEPLOYMENT.md)。浏览器已确认恢复按钮、巡检摘要、关联标签、正常账号禁用原因与实际失败原因。未验证认证后公网业务；不能将 fixture 成功写回视为真实账号成功。
 
 ## AUTH 恢复发布验证命令与结果（此前记录）
 

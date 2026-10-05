@@ -166,6 +166,7 @@ func main() {
 		BrowserCompatibility: *browserCompat,
 	})
 	recoveryService := newSub2RecoveryService(loginHistory, service, sub2Importer)
+	recoveryService.checker = accountChecker
 	accountRecoveryService = recoveryService
 	recoveryService.Start()
 	defer recoveryService.Stop()

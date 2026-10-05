@@ -122,6 +122,13 @@ const change = async (name, value) => { if (typeof value === 'boolean') el(name)
     await document.emit('auth-history-changed'); await flush();
     assert.equal(row(1), originalRow, 'summary refresh must retain row DOM'); assert.equal(el('Grid').replaceCount, replacements);
     assert.equal(tabPanel.scrollTop, 420, 'background history refresh must preserve scroll');
+    const beforeSharedSnapshot = requestCount('/api/history');
+    await document.emit('auth-history-changed', { detail: { history: {
+        data: accounts, imports: accounts.map(a => ({ account_id: a.id, sub2_account_id: a.id + 1000, state: 'imported' })),
+        checks, recoveries, imports_available: true, checks_available: true
+    } } });
+    assert.equal(requestCount('/api/history'), beforeSharedSnapshot, 'history polling shares its snapshot instead of repeating Sub2 reads');
+    assert.equal(row(1), originalRow, 'shared snapshots preserve row identity');
     checks[1].last_result = { id: 1, account_id: 1, state: 'finished', outcome: 'ok', freshness: 'current', finished_at: Date.now(), duration_ms: 25, model: capabilities.model, route_label: '服务器默认代理' };
     checks[1].latest_task = { id: 2, state: 'canceled' };
     await document.emit('auth-history-changed'); await flush();

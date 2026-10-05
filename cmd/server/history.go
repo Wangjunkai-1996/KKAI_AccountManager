@@ -84,10 +84,11 @@ func handleHistory() http.HandlerFunc {
 			respondJSONStatus(w, http.StatusInternalServerError, LoginResponse{Message: "读取历史记录失败", Code: "history_read_failed"})
 			return
 		}
-		imports, importsErr := loginHistory.ListSub2ImportStatuses(r.Context())
+		var imports []store.Sub2Import
+		var importsErr error
 		var sub2Statuses map[int64]sub2AccountStatus
-		if importsErr == nil && sub2Importer != nil && sub2Importer.configured() {
-			sub2Statuses = sub2Importer.listSub2AccountStatuses(r.Context(), imports)
+		if sub2Importer != nil && sub2Importer.configured() {
+			imports, sub2Statuses, importsErr = sub2Importer.syncAccountStatuses(r.Context())
 		}
 		checks, checksErr := loginHistory.ListAccountCheckSummaries(r.Context())
 		var recoveries map[int64]store.AccountRecoveryTask

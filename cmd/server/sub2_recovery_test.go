@@ -30,6 +30,7 @@ type recoveryFixture struct {
 	detailStatus    string
 	detailError     string
 	credentialReady bool
+	externalAccount bool
 	recoveryMarker  map[string]any
 	refreshMode     string
 	refreshCalls    int
@@ -133,7 +134,7 @@ func (f *recoveryFixture) handle(w http.ResponseWriter, r *http.Request) {
 	f.methods = append(f.methods, r.Method+" "+r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
 	switch r.URL.Path {
-	case "/admin/accounts/901":
+	case "/admin/accounts/901", "/admin/accounts":
 		detail := map[string]any{
 			"id": 901, "platform": "openai", "type": "oauth", "schedulable": f.schedule,
 			"status": f.detailStatus, "error_message": f.detailError,
@@ -141,10 +142,17 @@ func (f *recoveryFixture) handle(w http.ResponseWriter, r *http.Request) {
 			"credentials_status": map[string]any{"has_access_token": f.credentialReady, "has_refresh_token": f.credentialReady},
 			"extra":              map[string]any{"kkai_auth_import": map[string]any{"source_account_id": f.account.ID}},
 		}
+		if f.externalAccount {
+			detail["extra"] = map[string]any{}
+		}
 		if f.recoveryMarker != nil {
 			detail["extra"].(map[string]any)["kkai_auth_recovery"] = f.recoveryMarker
 		}
-		writeRecoveryEnvelope(w, detail)
+		if r.URL.Path == "/admin/accounts" {
+			writeRecoveryEnvelope(w, map[string]any{"items": []any{detail}, "total": 1, "pages": 1})
+		} else {
+			writeRecoveryEnvelope(w, detail)
+		}
 	case "/admin/openai/refresh-token":
 		f.refreshCalls++
 		f.events = append(f.events, "refresh")

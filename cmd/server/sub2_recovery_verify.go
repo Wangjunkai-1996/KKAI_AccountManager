@@ -126,7 +126,25 @@ func readRecoveryProbeEvents(body io.Reader) error {
 // verifySub2RecoveryIdentity validates the actual redacted account DTO. An
 // account may legitimately be in error before reauthorization, so this helper
 // checks identity and type independently from readiness.
-func verifySub2RecoveryIdentity(detail map[string]any, expectedSub2ID, accountID int64, account store.Account) error {
+func verifySub2RecoveryIdentity(detail map[string]any, expectedSub2ID, accountID int64, account store.Account, bindings ...store.Sub2Import) error {
+	if err := verifySub2AccountIdentity(detail, expectedSub2ID, accountID, account); err != nil {
+		return err
+	}
+	extra, _ := detail["extra"].(map[string]any)
+	if _, exists := extra["kkai_auth_import"]; exists {
+		return nil // A present marker was checked by verifySub2AccountIdentity.
+	}
+	for _, binding := range bindings {
+		if binding.AccountID == accountID && binding.Sub2AccountID == expectedSub2ID && binding.State == "imported" && strings.HasPrefix(binding.OperationID, "linked-") {
+			return nil
+		}
+	}
+	return errors.New("Sub2 import marker or verified local association missing")
+}
+
+// Association and recovery both validate credential identity, never the
+// editable display name. A present foreign import marker remains a conflict.
+func verifySub2AccountIdentity(detail map[string]any, expectedSub2ID, accountID int64, account store.Account) error {
 	if expectedSub2ID <= 0 || accountID <= 0 || toFloat(detail["id"]) != float64(expectedSub2ID) {
 		return errors.New("Sub2 account id mismatch")
 	}
@@ -155,24 +173,23 @@ func verifySub2RecoveryIdentity(detail map[string]any, expectedSub2ID, accountID
 			return errors.New("Sub2 email mismatch")
 		}
 	}
-	extra, ok := detail["extra"].(map[string]any)
-	if !ok {
-		return errors.New("Sub2 import marker missing")
-	}
+	extra, _ := detail["extra"].(map[string]any)
 	if synthetic, _ := extra["synthetic_ui_test"].(bool); synthetic {
 		return errors.New("Sub2 synthetic account cannot be recovered")
 	}
-	marker, ok := extra["kkai_auth_import"].(map[string]any)
-	if !ok || toFloat(marker["source_account_id"]) != float64(accountID) {
-		return errors.New("Sub2 import marker mismatch")
+	if rawMarker, exists := extra["kkai_auth_import"]; exists {
+		marker, ok := rawMarker.(map[string]any)
+		if !ok || toFloat(marker["source_account_id"]) != float64(accountID) {
+			return errors.New("Sub2 import marker mismatch")
+		}
 	}
 	return nil
 }
 
 // verifySub2RecoveryDetail is the post-apply gate. Token plaintext is never
 // returned by the DTO; credential existence plus the account probe verifies it.
-func verifySub2RecoveryDetail(detail map[string]any, expectedSub2ID, accountID int64, account store.Account) error {
-	if err := verifySub2RecoveryIdentity(detail, expectedSub2ID, accountID, account); err != nil {
+func verifySub2RecoveryDetail(detail map[string]any, expectedSub2ID, accountID int64, account store.Account, bindings ...store.Sub2Import) error {
+	if err := verifySub2RecoveryIdentity(detail, expectedSub2ID, accountID, account, bindings...); err != nil {
 		return err
 	}
 	if status, ok := detail["status"].(string); !ok || status != "active" {
