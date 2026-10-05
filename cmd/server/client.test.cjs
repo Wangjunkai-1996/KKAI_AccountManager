@@ -67,6 +67,11 @@ document.body = new Element();
 const historyEvents = [];
 document.dispatchEvent = event => { historyEvents.push(event.type); return Element.prototype.dispatchEvent.call(document, event); };
 let rows = Array.from({ length: 25 }, (_, index) => ({ id: index + 1, email: `account${String(index + 1).padStart(3, '0')}@example.test`, status: ['active', 'error', 'running', 'deleted', 'interrupted'][index % 5] }));
+let sub2Statuses = {
+    1: { configured: true, imported: true, exists: true, status: 'active', schedulable: true, checked_at: '2026-10-05T10:00:00Z' },
+    2: { configured: true, imported: true, exists: true, status: 'disabled', schedulable: false, checked_at: '2026-10-05T10:01:00Z' }
+};
+let recoverySettings = { auto_recovery_enabled: false };
 let imports = [], historyFailure = false, historyGate = null, deleteGate = null;
 let deletionFailures = new Map(), missingIDs = new Set(), acceptedImportIDs = null, importGate = null;
 let confirmations = [], confirmResult = true, requests = [];
@@ -82,7 +87,12 @@ const context = vm.createContext({ document, window, location, console, Event, C
         if (url === '/api/history') {
             if (historyGate) { const gate = historyGate; historyGate = null; await gate.promise; }
             if (historyFailure) return response({ message: 'fixture refresh unavailable' }, 503);
-            return response({ data: rows, imports, sub2_configured: true, imports_available: true });
+            return response({ data: rows, imports, sub2_configured: true, imports_available: true, sub2_statuses: sub2Statuses });
+        }
+        if (url === '/api/account-recovery/settings' && !options.method) return response(recoverySettings);
+        if (url === '/api/account-recovery/settings' && options.method === 'PUT') {
+            recoverySettings = { auto_recovery_enabled: Boolean(JSON.parse(options.body).auto_recovery_enabled) };
+            return response(recoverySettings);
         }
         if (url.startsWith('/api/history/') && !options.method) {
             const id = Number(url.split('/').pop());
@@ -176,6 +186,14 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.doesNotMatch(el('historyGrid').innerHTML, /data-history-import-select/);
     await change('historySelectAll', true);
     assert.equal(el('historyActionBar').hidden, false);
+    assert.match(el('historyGrid').innerHTML, /Sub2 正常/);
+    assert.match(el('historyGrid').innerHTML, /可调度/);
+    assert.match(el('historyGrid').innerHTML, /Sub2 已禁用/);
+    assert.equal(el('autoRecoveryToggle').checked, false);
+    await change('autoRecoveryToggle', true);
+    assert.equal(recoverySettings.auto_recovery_enabled, true);
+    assert.equal(el('autoRecoveryToggle').checked, true);
+    assert.equal(el('autoRecoveryStatus').textContent, '已开启');
     await click('tab-login');
     assert.equal(el('historyActionBar').hidden, true, 'history actions must not appear in login');
     await click('tab-history');
@@ -306,6 +324,18 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     const bulkRequests = requests.filter(item => item.url === '/api/sub2/import').slice(priorImports);
     assert.deepEqual(bulkRequests.map(item => JSON.parse(item.options.body).account_ids.length), [100, 1]);
     assert.deepEqual(selected(), []);
+    // Batch login results map by email to the persisted history ID before importing.
+    rows = [{ id: 2001, email: 'Login@Example.test', status: 'active' }, { id: 2002, email: 'skip@example.test', status: 'error' }];
+    imports = []; acceptedImportIDs = null; await click('refreshHistoryBtn');
+    run("results = [{ Email: 'login@example.test' }, { Email: 'missing@example.test' }]");
+    confirmResult = true;
+    const resultImportStart = requests.filter(item => item.url === '/api/sub2/import').length;
+    await run('importLoginResultsToSub2()');
+    const resultImports = requests.filter(item => item.url === '/api/sub2/import').slice(resultImportStart);
+    assert.deepEqual(resultImports.map(item => JSON.parse(item.options.body).account_ids), [[2001]]);
+    assert.match(confirmations.at(-1), /另有 1 个结果/);
+    rows = [{ id: 1000, email: 'details@example.test', status: 'active' }];
+    imports = []; await click('refreshHistoryBtn');
     // History details keep keyboard focus inside the dialog and return it to the opener.
     run("historySelectedIDs.add('1000'); renderHistory()");
     el('historyBatchDeleteBtn').disabled = false;
@@ -348,7 +378,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.equal(el('panel-checks').hidden, false);
     assert.deepEqual(tabs.map(tab => tab.tabIndex), [-1, -1, 0]);
     assert.deepEqual(tabs.map(tab => tab.attributes['aria-selected']), ['false', 'false', 'true']);
-    console.log('History selection checks passed: ordinary/cross-page select, cancellation, delete locking/409/404/timeouts/refresh failures, partial/chunked import, relogin retention.');
+    console.log('History checks passed: Sub2 status/settings, ordinary/cross-page select, cancellation, delete locking/409/404/timeouts/refresh failures, partial/chunked import, relogin retention.');
     console.log('Tab checks passed: selection isolation, navigation, keyboard, focus, hash/back navigation, panel scrolling.');
     console.log('Confirmation checks passed: plain text, cancellation/acceptance for all batch actions, modal focus/Tab/Escape/restore, repeat opens, navigation cancellation, stale-state guards.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

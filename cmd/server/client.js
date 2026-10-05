@@ -71,6 +71,7 @@ const modeSelect = document.getElementById('modeSelect');
 const concurrencyInput = document.getElementById('concurrency');
 const startBtn = document.getElementById('startBtn');
 const retryFailedBtn = document.getElementById('retryFailedBtn');
+const importSub2Btn = document.getElementById('importSub2Btn');
 const exportBtn = document.getElementById('exportBtn');
 const statusGrid = document.getElementById('statusGrid');
 const totalCount = document.getElementById('totalCount');
@@ -80,6 +81,8 @@ const pendingCount = document.getElementById('pendingCount');
 const historyGrid = document.getElementById('historyGrid');
 const refreshHistoryBtn = document.getElementById('refreshHistoryBtn');
 const historyRefreshStatus = document.getElementById('historyRefreshStatus');
+const autoRecoveryToggle = document.getElementById('autoRecoveryToggle');
+const autoRecoveryStatus = document.getElementById('autoRecoveryStatus');
 const historySearchInput = document.getElementById('historySearchInput');
 const historyStatusFilter = document.getElementById('historyStatusFilter');
 const historySort = document.getElementById('historySort');
@@ -168,6 +171,11 @@ let historyBatchSummary = '';
 let historyLoadError = '';
 let historySub2Configured = true;
 let historyImportsAvailable = true;
+let historySub2Statuses = new Map();
+let recoverySettings = { autoRecoveryEnabled: false };
+let recoverySettingsLoading = false;
+let recoverySettingsSaving = false;
+let historyRefreshTimer = null;
 let historyDetailID = '';
 let historyDetailAbort = null;
 let historyDetailTrigger = null;
@@ -298,6 +306,7 @@ modeSelect.addEventListener('change', () => {
 });
 
 refreshHistoryBtn.addEventListener('click', () => loadHistory());
+autoRecoveryToggle?.addEventListener('change', () => updateRecoverySetting(Boolean(autoRecoveryToggle.checked)));
 function resetHistoryScroll() {
     document.getElementById('panel-history').scrollTop = 0;
 }
@@ -411,6 +420,8 @@ document.addEventListener('keydown', event => {
 renderAccountPreflight();
 loadHistory();
 loadServerCapabilities();
+loadRecoverySettings();
+scheduleHistoryRefresh();
 
 startBtn.addEventListener('click', async () => {
     if (processing || historyBatchRunning) return;
@@ -442,13 +453,18 @@ retryFailedBtn.addEventListener('click', () => {
     return runAccounts(accounts.filter(account => account.status === 'error'));
 });
 
+importSub2Btn.addEventListener('click', () => importLoginResultsToSub2());
+
 window.retryAccount = function(id) {
     const account = accounts.find(account => account.id === id && account.status === 'error');
     if (account) return runAccounts([account]);
 };
 
 async function loadHistory() {
-    if (historyLoading) return;
+    if (historyLoading) {
+        while (historyLoading) await new Promise(resolve => setTimeout(resolve, 25));
+        return;
+    }
     historyLoading = true;
     historyLoadError = '';
     historySearchInput.disabled = true;
@@ -461,6 +477,8 @@ async function loadHistory() {
         if (!response.ok) throw new Error(payload.message || `历史请求失败（HTTP ${response.status}）`);
         historySub2Configured = payload.sub2_configured !== false;
         historyImportsAvailable = payload.imports_available !== false;
+        historySub2Statuses = normalizeSub2Statuses(payload.sub2_statuses ?? payload.sub2Statuses
+            ?? payload.data?.sub2_statuses ?? payload.data?.sub2Statuses);
         const candidate = Array.isArray(payload) ? payload
             : (Array.isArray(payload.accounts) ? payload.accounts
                 : (Array.isArray(payload.history) ? payload.history
@@ -473,7 +491,8 @@ async function loadHistory() {
             const accountID = String(item.account_id ?? item.accountId ?? '');
             if (accountID) historyImports.set(accountID, item);
         });
-        historyAccounts = rows.map(normalizeHistoryAccount).filter(account => account.id !== '').map(account => {
+        historyAccounts = rows.map(row => normalizeHistoryAccount(row, historySub2Statuses.get(String(row?.id ?? row?.account_id ?? ''))))
+            .filter(account => account.id !== '').map(account => {
             account.refreshToken = historyRefreshTokens.get(account.id) || '';
             return account;
         });
@@ -497,6 +516,66 @@ async function loadHistory() {
     }
 }
 
+function scheduleHistoryRefresh() {
+    if (historyRefreshTimer || typeof setInterval !== 'function') return;
+    historyRefreshTimer = setInterval(() => {
+        if (document.hidden || historyLoading || processing || historyBatchRunning) return;
+        loadHistory();
+    }, 5 * 60 * 1000);
+}
+
+async function loadRecoverySettings() {
+    if (!autoRecoveryToggle || recoverySettingsLoading) return;
+    recoverySettingsLoading = true;
+    autoRecoveryToggle.disabled = true;
+    try {
+        const response = await fetch('/api/account-recovery/settings', {
+            headers: { 'Accept': 'application/json' }, signal: AbortSignal.timeout(10000)
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.message || `设置读取失败（HTTP ${response.status}）`);
+        const settings = payload.settings || payload;
+        const enabled = Boolean(settings.auto_recovery_enabled ?? settings.autoRecoveryEnabled);
+        recoverySettings.autoRecoveryEnabled = enabled;
+        autoRecoveryToggle.checked = enabled;
+        if (autoRecoveryStatus) autoRecoveryStatus.textContent = enabled ? '已开启' : '已关闭';
+    } catch (error) {
+        if (autoRecoveryStatus) autoRecoveryStatus.textContent = '设置读取失败';
+    } finally {
+        recoverySettingsLoading = false;
+        autoRecoveryToggle.disabled = recoverySettingsSaving;
+    }
+}
+
+async function updateRecoverySetting(enabled) {
+    if (!autoRecoveryToggle || recoverySettingsSaving) return;
+    const previous = recoverySettings.autoRecoveryEnabled;
+    recoverySettingsSaving = true;
+    autoRecoveryToggle.disabled = true;
+    if (autoRecoveryStatus) autoRecoveryStatus.textContent = '保存中…';
+    try {
+        const response = await fetch('/api/account-recovery/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({ auto_recovery_enabled: enabled }),
+            signal: AbortSignal.timeout(10000)
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.message || `设置保存失败（HTTP ${response.status}）`);
+        const settings = payload.settings || payload;
+        recoverySettings.autoRecoveryEnabled = Boolean(settings.auto_recovery_enabled ?? settings.autoRecoveryEnabled ?? enabled);
+        autoRecoveryToggle.checked = recoverySettings.autoRecoveryEnabled;
+        if (autoRecoveryStatus) autoRecoveryStatus.textContent = recoverySettings.autoRecoveryEnabled ? '已开启' : '已关闭';
+    } catch (error) {
+        recoverySettings.autoRecoveryEnabled = previous;
+        autoRecoveryToggle.checked = previous;
+        if (autoRecoveryStatus) autoRecoveryStatus.textContent = error.message || '设置保存失败';
+    } finally {
+        recoverySettingsSaving = false;
+        autoRecoveryToggle.disabled = recoverySettingsLoading;
+    }
+}
+
 async function loadServerCapabilities() {
     try {
         const response = await fetch('/health', { headers: { 'Accept': 'application/json' }, cache: 'no-store' });
@@ -513,7 +592,33 @@ async function loadServerCapabilities() {
     }
 }
 
-function normalizeHistoryAccount(row) {
+function normalizeSub2Statuses(value) {
+    const entries = Array.isArray(value)
+        ? value.map(item => [item?.account_id ?? item?.accountId ?? item?.id, item])
+        : Object.entries(value || {});
+    return new Map(entries.filter(([id, item]) => id !== undefined && id !== null && item)
+        .map(([id, item]) => [String(id), normalizeSub2Status(item)]));
+}
+
+function normalizeSub2Status(value) {
+    const source = value || {};
+    return {
+        present: Boolean(value),
+        configured: source.configured !== false,
+        imported: source.imported !== false,
+        exists: source.exists !== false,
+        sub2AccountID: String(source.sub2_account_id ?? source.sub2AccountId ?? source.id ?? ''),
+        status: String(source.status || 'unknown').toLowerCase(),
+        schedulable: typeof source.schedulable === 'boolean' ? source.schedulable : null,
+        errorMessage: String(source.error_message || source.errorMessage || ''),
+        checkedAt: source.checked_at || source.checkedAt || '',
+        stale: Boolean(source.stale),
+        unknown: Boolean(source.unknown),
+        error: String(source.error || '')
+    };
+}
+
+function normalizeHistoryAccount(row, sub2Status = null) {
     const source = row || {};
     const status = String(source.status || source.account_status || 'unknown').toLowerCase();
     return {
@@ -530,8 +635,35 @@ function normalizeHistoryAccount(row) {
         planType: String(source.plan_type || source.planType || ''),
         expiresAt: Number(source.expires_at ?? source.expiresAt ?? 0) || 0,
         refreshToken: '',
-        reloginMessage: ''
+        reloginMessage: '',
+        sub2Status: sub2Status || normalizeSub2Status(null)
     };
+}
+
+function sub2StatusName(status) {
+    return ({
+        active: '正常', available: '正常', enabled: '正常',
+        error: '异常', inactive: '已禁用', disabled: '已禁用', deleted: '已删除',
+        paused: '已暂停', unknown: '未知'
+    }[status] || status || '未知');
+}
+
+function renderSub2Status(account) {
+    const state = account.sub2Status || normalizeSub2Status(null);
+    if (!historySub2Configured) return '<span class="history-status sub2-unknown">Sub2 未配置</span>';
+    if (!state.present) return '<span class="history-status sub2-unknown">Sub2 未同步</span>';
+    if (!state.configured) return '<span class="history-status sub2-unknown">Sub2 未配置</span>';
+    if (!state.imported && !state.sub2AccountID) return '<span class="history-status sub2-unknown">Sub2 未导入</span>';
+    if (state.stale || state.unknown) return `<span class="history-status sub2-unknown"${state.errorMessage || state.error ? ` title="${escapeHTML(state.errorMessage || state.error)}"` : ''}>Sub2 状态未知${state.checkedAt ? ` · 同步 ${formatHistoryTime(state.checkedAt)}` : ''}</span>`;
+    if (!state.exists) return '<span class="history-status sub2-error">Sub2 已删除</span>';
+    const status = state.status;
+    const className = status === 'active' || status === 'available' || status === 'enabled' ? 'sub2-ok'
+        : status === 'unknown' || status === 'stale' ? 'sub2-unknown' : 'sub2-error';
+    const schedule = state.schedulable === true ? '可调度' : state.schedulable === false ? '暂停调度' : '';
+    const checked = state.checkedAt ? ` · 同步 ${formatHistoryTime(state.checkedAt)}` : '';
+    const reason = state.errorMessage || state.error;
+    const title = reason ? ` title="${escapeHTML(reason)}"` : '';
+    return `<span class="history-status ${className}"${title}>Sub2 ${escapeHTML(sub2StatusName(status))}${schedule ? ` · ${schedule}` : ''}${checked}</span>`;
 }
 
 function historyStatusName(status) {
@@ -741,6 +873,7 @@ function renderHistory() {
                     </button>` : '';
         const meta = [
             `<span class="history-status ${statusClass}">${escapeHTML(historyStatusName(account.status))}</span>`,
+            renderSub2Status(account),
             expiryBadge,
             `尝试 ${Number.isFinite(account.attemptCount) ? account.attemptCount : 0} 次`,
             account.planType ? `方案 ${escapeHTML(account.planType)}` : '',
@@ -1113,6 +1246,55 @@ async function batchImportHistory() {
     await importHistoryAccounts(ids);
 }
 
+async function importLoginResultsToSub2() {
+    if (processing || historyBatchRunning || results.length === 0) return;
+    importSub2Btn.disabled = true;
+    historyBatchRunning = true;
+    historyBatchSummary = '正在准备批量登录结果导入…';
+    renderHistory();
+    try {
+        await loadHistory();
+        if (historyLoadError) {
+            window.alert('账号历史读取失败，请刷新后重试');
+            return;
+        }
+        if (!historySub2Configured) {
+            window.alert('Sub2 未配置，请先设置服务端 SUB2API_BASE_URL 和 SUB2API_ADMIN_API_KEY');
+            return;
+        }
+        if (!historyImportsAvailable) {
+            window.alert('导入状态读取失败，请刷新后重试');
+            return;
+        }
+
+        const accountsByEmail = new Map(historyAccounts.map(account => [account.email.toLowerCase(), account]));
+        const ids = [];
+        const seen = new Set();
+        results.forEach(result => {
+            const email = String(result.Email || result.email || '').trim().toLowerCase();
+            const account = accountsByEmail.get(email);
+            if (account && canImportToSub2(account) && !seen.has(account.id)) {
+                seen.add(account.id);
+                ids.push(account.id);
+            }
+        });
+        if (!ids.length) {
+            window.alert('没有可导入的批量登录成功账号，可能已经导入 Sub2 或状态尚未可用');
+            return;
+        }
+        const skipped = results.length - ids.length;
+        const message = `将 ${ids.length} 个批量登录成功账号导入到 Sub2 未分组。${skipped ? `另有 ${skipped} 个结果已导入、不可用或未找到对应历史记录，将跳过。` : ''}\n\n是否继续？`;
+        if (!await confirmAction({ title: '导入 Sub2', message, confirmLabel: '确认导入' })) return;
+        historyBatchRunning = false;
+        renderHistory();
+        await importHistoryAccounts(ids);
+    } finally {
+        historyBatchRunning = false;
+        importSub2Btn.disabled = processing || results.length === 0;
+        renderHistory();
+    }
+}
+
 async function reconcileHistoryImport(id) {
     if (historyActionsLocked()) return;
     const item = historyImports.get(String(id));
@@ -1143,6 +1325,7 @@ async function runAccounts(targetAccounts) {
     startBtn.innerHTML = '<span class="spinner"></span> 处理中';
     document.body.classList.add('processing');
     proxyCheckBtn.disabled = true;
+    importSub2Btn.disabled = true;
     exportBtn.disabled = true;
     refreshHistoryBtn.disabled = true;
     const proxy = proxyInput.value.trim();
@@ -1177,7 +1360,8 @@ async function runAccounts(targetAccounts) {
         proxyCheckBtn.disabled = proxyChecking;
         exportBtn.disabled = results.length === 0;
         refreshHistoryBtn.disabled = false;
-        loadHistory();
+        await loadHistory();
+        importSub2Btn.disabled = results.length === 0;
         renderStatus();
         updateStats();
     }

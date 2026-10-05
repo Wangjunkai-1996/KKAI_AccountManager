@@ -19,14 +19,15 @@
 
 当前部署基线（2026-10-05 发布后确认）：
 
-- 当前 release：`20261004T164742Z-sub2-recovery`
-- 回滚 release：`20261004T104640Z-tab-ui`
+- 当前 release：`20261005T020014Z-sub2-sync-auto`
+- 回滚 release：`20261004T164742Z-sub2-recovery`
 - 当前服务应保持 `active (running)`，且 `NRestarts=0`
 - 当前服务端并发硬上限：10；页面选择的并发数由前端 worker 控制，实际不超过该上限。
 - 页面代理留空时使用 sys1 默认认证 HTTP 代理（节点地址仅记录为 `45.39.200.204:7269`，凭据保存在 `/etc/openai-login/proxy.env`，不写入文档）。
 - 历史列表中的 `expires_at` 表示 OAuth Access Token 有效期；Access Token 过期不等于账号或 Refresh Token 失效。
 - AUTH → Sub2 导入已启用；Sub2 地址、管理密钥和实例标识保存在 `/etc/openai-login/sub2api.env`（权限 `0600`），由 systemd drop-in 注入服务进程。
-- 本次仅发布 AUTH 恢复流程；Sub2 源码、镜像和线上版本未改，恢复阶段调用 Sub2 既有接口。
+- 本次仅发布 AUTH：批量登录结果导入、Sub2 状态同步及自动恢复开关；Sub2 源码、镜像和线上版本未改，状态同步及恢复调用 Sub2 既有接口。
+- 自动恢复启动默认值为关闭；页面开关是进程级设置，重启后重新读取 `AUTH_AUTO_RECOVERY`。每 5 分钟刷新的是可见历史页面的 Sub2 状态，不是定时启动 AUTH 模型检测。
 
 ## 从 Mac 访问
 
@@ -65,7 +66,21 @@ ssh sys1 'curl -fsS http://127.0.0.1:18082/health'
 
 本项目是独立的登录工具，不要把它误认为 Sub2API 主服务，也不要用 Sub2API 的 Compose 发布流程替代本服务的 systemd 发布方式。
 
-## AUTH 恢复流程发布记录（2026-10-05）
+## Sub2 状态同步与自动恢复发布记录（2026-10-05）
+
+- 发布时间：2026-10-05 02:13:47 UTC（北京时间 10:13:47）；release：`20261005T020014Z-sub2-sync-auto`；回滚：`20261004T164742Z-sub2-recovery`。
+- 批量登录结果可直接导入 Sub2；账号历史刷新读取 Sub2 现有详情接口，可见页面每 5 分钟同步一次。404 显示已删除，网络异常、5xx 或身份不一致显示状态未知，不据此误报删除。
+- 开启“自动检测恢复”后，现有 AUTH 检测任务得到明确 401/凭据失效结果时自动创建恢复任务；仍须满足原 Sub2 账号存在、绑定和身份校验。恢复直接调用 AUTH 重新登录，不再先尝试 Refresh Token。调度恢复沿用 `status=error` 等状态判断；该判断无法保证识别所有人工暂停情形。
+- 本次没有新增后台定时 AUTH 模型检测。自动恢复开关启动默认关闭，运行时修改不持久化，重启后按 `AUTH_AUTO_RECOVERY` 恢复默认值。Sub2 源码、镜像和线上版本未改。
+- Mac 构建的 Linux amd64 二进制 SHA-256：`c7166a6e999eb2eb3c20f78d98944072a13abaf9ae20246d7c1433d6b2c0cbdc`；3 个嵌入静态资源 SHA 与本地一致。Node `v24.19.0`、Playwright `1.62.1` 和 Chrome `154.0.8037.97` 沿用原运行环境。
+- 发布前 SQLite 一致性备份：`/var/lib/openai-login/backups/accounts-before-20261005T020014Z-sub2-sync-auto.db`，权限 `0600`，`integrity_check=ok`。切换后即时检查为 `active/running`、`NRestarts=0`、`/health={"status":"ok","max_concurrent":10}`；旧 release 保留。
+- 候选使用隔离数据库验证设置接口 GET/PUT（开启后关闭）及只读 Sub2 状态同步：33 个账号、12 项 Sub2 状态（9 正常、3 不存在）。生产切换后只读检查为 33 个账号、12 项状态（8 正常、3 不存在、1 错误）；这些是检查当时的实时快照。
+- 02:17:40 UTC 延迟复查仍为 `active/running`、`NRestarts=0`，唯一实际服务进程 `1422128` 运行新 release，健康检查正常；账号 33 条、Sub2 快照 12 项、自动恢复关闭。发布以来 panic、fatal、数据库锁、启动失败和存储故障日志聚合均为 0。
+- 有效入口链路为 `kkai-edge` Nginx 的 `auth.kkrich.ltd:8443` TLS → `/run/tls/auth/login.sock` → `openai-login-gateway.socket`（宿主路径 `/srv/kkai/secrets/tls/kkrich-ltd/auth/login.sock`）→ `socket-proxyd` → `127.0.0.1:18082`。02:17:38 UTC 实际 Unix socket 健康检查通过，公网未认证返回 HTTP 401；未验证认证后公网业务。
+- 回滚二进制 SHA 与此前记录一致，Node 完整 hash 与 driver 的 111 个文件树 hash 核对通过，备份再次确认 `0600`、`integrity_check=ok`，回滚准备完成；远端临时上传文件已清理。
+- 定向 Go 测试、vet、前端检查及 Linux 构建通过，精确命令见 [STATUS.md](STATUS.md)。完整测试套件未运行；未执行真实 OAuth 登录或 401 账号恢复的业务验收，不能以健康检查替代该验收。
+
+## AUTH 恢复流程发布记录（2026-10-05，此前版本）
 
 - 发布时间：2026-10-04 16:53:09 UTC（北京时间 2026-10-05 00:53:09）；release：`20261004T164742Z-sub2-recovery`；回滚：`20261004T104640Z-tab-ui`。
 - 本次只发布 AUTH。检测到明确的 401/凭据失效后，AUTH 可重新登录取得新 Refresh Token，调用 Sub2 既有凭据写回接口，重新检测成功后开启调度；失败或不确定时保持停用。Sub2 源码、镜像和线上版本未改。

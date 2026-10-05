@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/store"
 )
@@ -87,5 +88,51 @@ func TestSub2ImportPostsAndReconcilesUnGroupedAccount(t *testing.T) {
 	got, err := history.GetSub2ImportByID(context.Background(), task.ID)
 	if err != nil || got.State != "imported" || got.Sub2AccountID != 42 || importedName == "" {
 		t.Fatalf("import task = %+v err=%v", got, err)
+	}
+}
+
+func TestListSub2AccountStatusesReadsDetailAndDistinguishesMissing(t *testing.T) {
+	history, accountID := testOAuthStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/admin/accounts/42":
+			_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"id":42,"status":"active","schedulable":true,"error_message":""}}`))
+		case "/api/v1/admin/accounts/404":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"code":1,"message":"not found"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	service := &sub2ImportService{
+		store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client(),
+	}
+	statuses := service.listSub2AccountStatuses(context.Background(), []store.Sub2Import{
+		{DestinationKey: "test", AccountID: accountID, Sub2AccountID: 42, State: "imported"},
+		{DestinationKey: "test", AccountID: accountID + 1, Sub2AccountID: 404, State: "imported"},
+	})
+	active := statuses[accountID]
+	if !active.Exists || active.Unknown || active.Stale || active.Status != "active" || active.Schedulable == nil || !*active.Schedulable {
+		t.Fatalf("active status = %+v", active)
+	}
+	missing := statuses[accountID+1]
+	if missing.Exists || missing.Unknown || missing.Stale || missing.Error == "" {
+		t.Fatalf("missing status = %+v", missing)
+	}
+}
+
+func TestListSub2AccountStatusesMarksTransportFailuresUnknown(t *testing.T) {
+	history, accountID := testOAuthStore(t)
+	service := &sub2ImportService{
+		store: history, baseURL: "http://127.0.0.1:1/api/v1", adminAPIKey: "secret", destinationKey: "test",
+		client: &http.Client{Timeout: 20 * time.Millisecond},
+	}
+	statuses := service.listSub2AccountStatuses(context.Background(), []store.Sub2Import{{DestinationKey: "test", AccountID: accountID, Sub2AccountID: 42, State: "imported"}})
+	got := statuses[accountID]
+	if got.Exists || !got.Unknown || !got.Stale || got.Error == "" {
+		t.Fatalf("transport status = %+v", got)
 	}
 }

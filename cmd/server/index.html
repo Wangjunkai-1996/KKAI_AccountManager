@@ -519,6 +519,27 @@
             font-size: 0.8125rem;
         }
 
+        .history-setting-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.45rem;
+            color: var(--text-secondary);
+            font-size: 0.8125rem;
+            margin: 0;
+            white-space: nowrap;
+        }
+
+        .history-setting-toggle input {
+            width: 1rem;
+            height: 1rem;
+            accent-color: var(--accent);
+        }
+
+        .history-setting-status {
+            color: var(--text-dim);
+            font-size: 0.75rem;
+        }
+
         .history-grid {
             max-height: 520px;
             overflow-y: auto;
@@ -685,7 +706,9 @@
             background: var(--bg-elevated);
         }
 
-        .history-status.success { color: var(--success); border-color: rgba(110, 231, 183, 0.35); }
+        .history-status.success, .history-status.sub2-ok { color: var(--success); border-color: rgba(110, 231, 183, 0.35); }
+        .history-status.sub2-error { color: var(--error); border-color: rgba(248, 113, 113, 0.35); }
+        .history-status.sub2-unknown { color: var(--warning); border-color: rgba(233, 165, 104, 0.35); }
         .history-status.error, .history-status.deleted, .history-status.deactivated,
         .history-status.deleted_or_deactivated { color: var(--error); border-color: rgba(248, 113, 113, 0.35); }
         .history-status.running { color: var(--accent); border-color: rgba(59, 109, 255, 0.35); }
@@ -1114,6 +1137,9 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                     <button class="btn-secondary" id="retryFailedBtn" disabled>
                         重试全部失败
                     </button>
+                    <button class="btn-secondary" id="importSub2Btn" disabled>
+                        导入 Sub2
+                    </button>
                     <button class="btn-secondary" id="exportBtn" disabled>
                         导出结果
                     </button>
@@ -1157,6 +1183,11 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                 <h2 class="card-title">账号历史</h2>
                 <div class="history-toolbar">
                     <span class="history-refresh-status" id="historyRefreshStatus" role="status" aria-live="polite"></span>
+                    <label class="history-setting-toggle" title="AUTH 检测确认 401 或凭据失效，且账号仍在 Sub2 池中时，自动重新登录并恢复调度；人工暂停保持不变">
+                        <input type="checkbox" id="autoRecoveryToggle">
+                        <span>自动检测恢复</span>
+                    </label>
+                    <span class="history-setting-status" id="autoRecoveryStatus" role="status" aria-live="polite"></span>
                     <button class="btn-secondary" id="refreshHistoryBtn" type="button">刷新历史</button>
                 </div>
             </div>
@@ -1235,7 +1266,7 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                 <h2 class="card-title" id="checkTitle">账号检测</h2>
                 <button class="btn-secondary" id="checkRefresh" type="button">刷新检测账号</button>
             </div>
-            <p class="hint">检测 AUTH 记录已导入 Sub2 的账号，使用 AUTH 当前保存的访问令牌。一次小模型请求可能产生用量；结果不代表 Sub2 当前凭据状态。明确收到 401 或凭据失效时，可在账号行点击“恢复账号”，重新登录并写回原 Sub2 账号。</p>
+            <p class="hint">检测 AUTH 记录已导入 Sub2 的账号，使用 AUTH 当前保存的访问令牌。一次小模型请求可能产生用量；账号历史中的 Sub2 徽章来自 Sub2 状态同步。明确收到 401 或凭据失效时，可在账号行点击“恢复账号”，重新登录并写回原 Sub2 账号。</p>
             <div class="input-group">
                 <label for="checkSearch">搜索检测账号</label>
                 <input type="search" id="checkSearch" placeholder="输入邮箱或邮箱片段" autocomplete="off" spellcheck="false">

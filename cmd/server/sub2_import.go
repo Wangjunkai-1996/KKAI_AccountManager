@@ -294,28 +294,159 @@ type sub2ListResponse struct {
 	PageSize int              `json:"page_size"`
 }
 
+// sub2AccountStatus is the latest read-only view of an AUTH account in Sub2.
+// It intentionally lives in the response layer rather than the import task
+// state: an import task records delivery, while this snapshot records the
+// current remote account state. A failed lookup is marked stale/unknown so a
+// transient management API failure cannot be mistaken for a deleted account.
+type sub2AccountStatus struct {
+	Exists        bool      `json:"exists"`
+	Imported      bool      `json:"imported"`
+	Sub2AccountID int64     `json:"sub2_account_id,omitempty"`
+	Status        string    `json:"status,omitempty"`
+	Schedulable   *bool     `json:"schedulable,omitempty"`
+	ErrorMessage  string    `json:"error_message,omitempty"`
+	CheckedAt     time.Time `json:"checked_at"`
+	Stale         bool      `json:"stale,omitempty"`
+	Error         string    `json:"error,omitempty"`
+	Unknown       bool      `json:"unknown,omitempty"`
+}
+
+// listSub2AccountStatuses fetches the details for imported accounts in
+// parallel. The endpoint is deliberately read-only and does not call Sub2's
+// account test action, which can mutate error/scheduling state.
+func (s *sub2ImportService) listSub2AccountStatuses(ctx context.Context, imports []store.Sub2Import) map[int64]sub2AccountStatus {
+	statuses := make(map[int64]sub2AccountStatus)
+	if s == nil || !s.configured() || len(imports) == 0 {
+		return statuses
+	}
+
+	type item struct {
+		accountID int64
+		task      store.Sub2Import
+	}
+	items := make([]item, 0, len(imports))
+	checkedAt := time.Now().UTC()
+	for _, task := range imports {
+		if task.DestinationKey != s.destinationKey {
+			continue
+		}
+		if task.AccountID <= 0 {
+			continue
+		}
+		// Include acknowledged tasks as well, so an import that is waiting for
+		// reconciliation remains visible in the history response.
+		status := sub2AccountStatus{Imported: task.State == "imported", Sub2AccountID: task.Sub2AccountID, CheckedAt: checkedAt}
+		if task.Sub2AccountID <= 0 {
+			status.Unknown = true
+			status.Stale = true
+			status.Error = "Sub2 账号尚未完成核对"
+			statuses[task.AccountID] = status
+			continue
+		}
+		items = append(items, item{accountID: task.AccountID, task: task})
+	}
+	if len(items) == 0 {
+		return statuses
+	}
+	statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	// Keep a history request bounded even when a user has many imported
+	// accounts. A slow/unavailable Sub2 API cannot hold the history page open
+	// for the import client's longer request timeout.
+	jobs := make(chan item)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	workers := len(items)
+	if workers > 8 {
+		workers = 8
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for current := range jobs {
+				snapshot := s.sub2AccountStatus(statusCtx, current.task.Sub2AccountID, checkedAt)
+				snapshot.Imported = current.task.State == "imported"
+				mu.Lock()
+				statuses[current.accountID] = snapshot
+				mu.Unlock()
+			}
+		}()
+	}
+send:
+	for _, current := range items {
+		select {
+		case jobs <- current:
+		case <-statusCtx.Done():
+			break send
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	return statuses
+}
+
+func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, checkedAt time.Time) sub2AccountStatus {
+	status := sub2AccountStatus{Sub2AccountID: id, CheckedAt: checkedAt}
+	var detail map[string]any
+	code, err := s.apiJSONStatus(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(id, 10), nil, &detail)
+	if err != nil {
+		if code == http.StatusNotFound {
+			status.Exists = false
+			status.Error = "Sub2 账号不存在"
+			return status
+		}
+		status.Unknown = true
+		status.Stale = true
+		status.Error = err.Error()
+		return status
+	}
+	if remoteID := int64(toFloat(detail["id"])); remoteID <= 0 || remoteID != id {
+		status.Unknown = true
+		status.Stale = true
+		status.Error = "Sub2 账号身份核对不一致"
+		return status
+	}
+	status.Exists = true
+	status.Status, _ = detail["status"].(string)
+	status.ErrorMessage, _ = detail["error_message"].(string)
+	if value, ok := detail["schedulable"].(bool); ok {
+		status.Schedulable = &value
+	}
+	return status
+}
+
 func (s *sub2ImportService) apiJSON(ctx context.Context, method, path string, query url.Values, out any) error {
+	_, err := s.apiJSONStatus(ctx, method, path, query, out)
+	return err
+}
+
+// apiJSONStatus is apiJSON with the HTTP status retained for read-only
+// account snapshots, where 404 (deleted) differs from an unavailable API.
+func (s *sub2ImportService) apiJSONStatus(ctx context.Context, method, path string, query url.Values, out any) (int, error) {
 	u := s.baseURL + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
 	request, err := http.NewRequestWithContext(ctx, method, u, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("x-api-key", s.adminAPIKey)
 	response, err := s.client.Do(request)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 2<<20))
 	if err != nil {
-		return err
+		return response.StatusCode, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("Sub2 查询失败（HTTP %d）", response.StatusCode)
+		return response.StatusCode, fmt.Errorf("Sub2 查询失败（HTTP %d）", response.StatusCode)
 	}
 	var envelope struct {
 		Code    int             `json:"code"`
@@ -323,15 +454,19 @@ func (s *sub2ImportService) apiJSON(ctx context.Context, method, path string, qu
 		Data    json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return errors.New("Sub2 查询返回格式无效")
+		return response.StatusCode, errors.New("Sub2 查询返回格式无效")
 	}
 	if envelope.Code != 0 {
-		return errors.New(envelope.Message)
+		message := envelope.Message
+		if message == "" {
+			message = "Sub2 查询失败"
+		}
+		return response.StatusCode, errors.New(message)
 	}
 	if err := json.Unmarshal(envelope.Data, out); err != nil {
-		return err
+		return response.StatusCode, err
 	}
-	return nil
+	return response.StatusCode, nil
 }
 
 func (s *sub2ImportService) reconcile(ctx context.Context, id int64) error {

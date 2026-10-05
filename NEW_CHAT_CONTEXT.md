@@ -21,13 +21,27 @@
 - 数据库：`/var/lib/openai-login/data/accounts.db`
 - 加密密钥：`/var/lib/openai-login/data/accounts.key`
 - release 根目录：`/opt/openai-login/releases`
-- 当前 release：`20261004T164742Z-sub2-recovery`
-- 回滚 release：`20261004T104640Z-tab-ui`
+- 当前 release：`20261005T020014Z-sub2-sync-auto`
+- 回滚 release：`20261004T164742Z-sub2-recovery`
 - 浏览器运行方式：sys1 上的 Google Chrome + Xvfb，有头模式；浏览器流程实际发生在 sys1
 
-最近一次线上复核结果：服务为 `active`，`NRestarts=0`，`/health` 返回 `{"status":"ok","max_concurrent":10}`。当前 AUTH release 已包含账号检测和恢复任务流程；真实 401 账号恢复链路尚未验收。历史搜索、分页、多选批量复活、详情时间线、状态筛选/排序、Token 有效期提示、输入预检、Refresh Token 复制、状态列表原地刷新和阶段进度条继续可用；页面代理留空时使用 sys1 的默认认证代理，凭据只保存在 sys1 的 systemd 环境文件中。
+2026-10-05 02:17:40 UTC 延迟复查：服务为 `active/running`，`NRestarts=0`，`/health` 返回 `{"status":"ok","max_concurrent":10}`。当前 AUTH release 已包含批量登录结果导入 Sub2、Sub2 状态同步、账号检测和自动恢复开关；真实 OAuth/401 恢复业务链路本轮尚未验收。历史搜索、分页、多选批量复活、详情时间线、状态筛选/排序、Token 有效期提示、输入预检、Refresh Token 复制、状态列表原地刷新和阶段进度条继续可用；页面代理留空时使用 sys1 的默认认证代理，凭据只保存在 sys1 的 systemd 环境文件中。
 
-## 本轮 Tab UI 优化（已发布）
+## 本轮 Sub2 状态同步与自动恢复（已发布）
+
+2026-10-05 02:13:47 UTC（北京时间 10:13:47）发布 `20261005T020014Z-sub2-sync-auto`，回滚点为 `20261004T164742Z-sub2-recovery`。本次只发布 AUTH，复用 Sub2 既有详情、凭据写回等接口；Sub2 源码、镜像和线上版本未改。
+
+历史列表刷新时读取 Sub2 状态，可见页面每 5 分钟同步一次；404 显示已删除，网络错误、5xx 和身份不一致显示未知。批量登录结果可直接导入 Sub2。“自动检测恢复”开启后，现有 AUTH 检测任务得到明确 401/凭据失效结果时自动入队恢复，沿用账号绑定、身份和任务去重校验；恢复直接调用 AUTH 重新登录，已取消 Refresh Token 优先路径。Sub2 错误与调度状态用于决定恢复后的调度策略，这一判断不能保证识别所有人工暂停情形。
+
+自动恢复默认关闭；页面开关为进程级运行时设置，重启后读取 `AUTH_AUTO_RECOVERY`，尚未持久化。本次没有实现定时 AUTH 模型检测，5 分钟刷新只同步 Sub2 状态。
+
+发布前备份为 `/var/lib/openai-login/backups/accounts-before-20261005T020014Z-sub2-sync-auto.db`（`0600`、`integrity_check=ok`），二进制 SHA-256 为 `c7166a6e999eb2eb3c20f78d98944072a13abaf9ae20246d7c1433d6b2c0cbdc`，3 个静态资源 SHA 与本地一致。沿用 Node `v24.19.0`、Playwright `1.62.1`、Chrome `154.0.8037.97`。
+
+候选使用隔离数据库验证设置接口 GET/PUT（开启后关闭）和只读 Sub2 状态读取：33 个账号、12 项状态（9 正常、3 不存在）。生产切换后仅 GET 验证：33 个账号、12 项状态（8 正常、3 不存在、1 错误），自动恢复关闭；状态会随上游变化。本轮未执行真实 OAuth 登录或 401 恢复业务验收。定向验证和构建通过，完整测试套件未运行，精确命令见 [STATUS.md](STATUS.md)。
+
+02:17:40 UTC 延迟复查确认唯一实际服务进程 `1422128` 运行新 release，服务与健康正常、无重启，33 个账号和 12 项快照可读。发布以来 panic、fatal、数据库锁、启动失败及存储故障日志聚合均为 0。实际入口 Unix socket 健康通过，公网未认证 HTTP 401；回滚二进制、Node 和 driver 文件 hash 已核对，备份再次确认 `0600`、`integrity_check=ok`，远端临时上传文件已清理。有效路由及完整证据见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。
+
+## Tab UI 优化（此前已发布）
 
 2026-10-04 10:54:05 UTC（北京时间 18:54:05）发布 `20261004T104640Z-tab-ui`，回滚点为 `20261004T045750Z-history-actions`。三栏 Tab、移动端布局、导航、焦点管理和应用内确认框已上线，3 个静态资源 SHA 与本地一致。账号总数发布前后均为 30，导入和检测摘要可用，`sub2_configured=true`。Node `v24.19.0`、Playwright `1.62.1` 原样保留，Chrome `154.0.8037.97`。
 
@@ -35,7 +49,7 @@
 
 用户明确本次功能与真实 OAuth 验收由用户自行完成；没有进行认证后公网业务、真实账号登录或模型检测验收，不能沿用历史成功记录作为本轮结果。Linux amd64 构建和 Go 定向测试已通过，前端验证沿用 [TAB_UI_REDESIGN.md](TAB_UI_REDESIGN.md) 本轮记录；全仓测试未运行。精确命令见 [STATUS.md](STATUS.md)，二进制 SHA 和完整发布事实见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。
 
-## 本轮 AUTH 恢复发布（已发布）
+## AUTH 恢复发布（此前已发布）
 
 2026-10-04 16:53:09 UTC 发布 `20261004T164742Z-sub2-recovery`，回滚点为 `20261004T104640Z-tab-ui`。本次只发布 AUTH；Sub2 源码、镜像和线上版本未改，恢复阶段调用 Sub2 既有接口。发布前 SQLite 备份为 `/var/lib/openai-login/backups/accounts-before-20261004T164742Z-sub2-recovery.db`，权限 `0600`，`integrity_check=ok`；二进制 SHA-256 为 `2aabc5ad3c767f015ee55b9452ee39620be49c8b8eec2be0575936e4cd62eba4`。
 

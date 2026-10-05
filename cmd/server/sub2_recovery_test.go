@@ -108,8 +108,19 @@ func newRecoveryFixture(t *testing.T, schedulable bool) *recoveryFixture {
 		store: history, baseURL: f.server.URL, adminAPIKey: "fixture-key", destinationKey: "fixture", client: f.server.Client(),
 	}
 	f.service = newSub2RecoveryService(history, nil, importer)
+	f.service.loginWithProxies = func(_ context.Context, email, password, totp, proxy, upstream string) (*login.LoginResult, error) {
+		f.loginCalls++
+		if email != f.account.Email || password != "password" {
+			t.Fatalf("login did not use saved account credentials")
+		}
+		return &login.LoginResult{Email: email, AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "workspace"}, nil
+	}
 	t.Cleanup(f.service.Stop)
-	f.task, _, err = history.CreateOrGetAccountRecoveryTask(ctx, account.ID, work.Check.ID, 901, schedulable)
+	// Sub2's error state represents an automatic pause after an auth failure;
+	// the successful recovery should reopen that schedule. An active account
+	// with schedulable=false below remains a manual pause case.
+	restoreSchedule := schedulable || f.detailStatus == "error"
+	f.task, _, err = history.CreateOrGetAccountRecoveryTask(ctx, account.ID, work.Check.ID, 901, restoreSchedule)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +276,25 @@ func TestSub2RecoveryValidateCandidateRecognizesAuthFailures(t *testing.T) {
 	}
 }
 
-func TestSub2RecoveryRefreshesAppliesProbesAndEnables(t *testing.T) {
+func TestSub2RecoveryAutoSettings(t *testing.T) {
+	f := newRecoveryFixture(t, false)
+	f.service.autoRecovery.Store(false)
+	put := httptest.NewRequest(http.MethodPut, "/api/account-recovery/settings", strings.NewReader(`{"auto_recovery_enabled":true}`))
+	put.Header.Set("Content-Type", "application/json")
+	putRecorder := httptest.NewRecorder()
+	f.service.handleAction(putRecorder, put)
+	if putRecorder.Code != http.StatusOK || !f.service.autoRecovery.Load() {
+		t.Fatalf("settings PUT code=%d enabled=%v body=%s", putRecorder.Code, f.service.autoRecovery.Load(), putRecorder.Body.String())
+	}
+	get := httptest.NewRequest(http.MethodGet, "/api/account-recovery/settings", nil)
+	getRecorder := httptest.NewRecorder()
+	f.service.handleAction(getRecorder, get)
+	if getRecorder.Code != http.StatusOK || !strings.Contains(getRecorder.Body.String(), `"auto_recovery_enabled":true`) {
+		t.Fatalf("settings GET code=%d body=%s", getRecorder.Code, getRecorder.Body.String())
+	}
+}
+
+func TestSub2RecoveryLogsInAppliesProbesAndRestoresSchedule(t *testing.T) {
 	for _, initialSchedule := range []bool{false, true} {
 		t.Run(map[bool]string{true: "enabled", false: "disabled"}[initialSchedule], func(t *testing.T) {
 			f := newRecoveryFixture(t, initialSchedule)
@@ -276,8 +305,8 @@ func TestSub2RecoveryRefreshesAppliesProbesAndEnables(t *testing.T) {
 			}
 			f.mu.Lock()
 			defer f.mu.Unlock()
-			if f.refreshCalls != 1 || f.applyCalls != 1 || f.testCalls != 1 || !f.schedule {
-				t.Fatalf("refresh=%d apply=%d test=%d schedule=%v", f.refreshCalls, f.applyCalls, f.testCalls, f.schedule)
+			if f.refreshCalls != 0 || f.loginCalls != 1 || f.applyCalls != 1 || f.testCalls != 1 || !f.schedule {
+				t.Fatalf("refresh=%d login=%d apply=%d test=%d schedule=%v", f.refreshCalls, f.loginCalls, f.applyCalls, f.testCalls, f.schedule)
 			}
 			credentials, _ := f.applyBody["credentials"].(map[string]any)
 			if credentials["access_token"] != "new-at" || credentials["refresh_token"] != "new-rt" {
@@ -286,9 +315,9 @@ func TestSub2RecoveryRefreshesAppliesProbesAndEnables(t *testing.T) {
 			if f.applyBody["require_recovery_verification"] != nil || f.recoveryMarker["task_id"] != float64(got.ID) || f.recoveryMarker["credential_attempt_id"] != float64(got.ResultCredentialAttemptID) {
 				t.Fatalf("apply body=%v", f.applyBody)
 			}
-			want := "refresh apply test enable"
+			want := "apply test enable"
 			if initialSchedule {
-				want = "disable " + want
+				want = "disable apply test enable"
 			}
 			if strings.Join(f.events, " ") != want {
 				t.Fatalf("side effect order=%v want=%s", f.events, want)
@@ -301,6 +330,24 @@ func TestSub2RecoveryRefreshesAppliesProbesAndEnables(t *testing.T) {
 	}
 }
 
+func TestSub2RecoveryPreservesManualPause(t *testing.T) {
+	f := newRecoveryFixture(t, false)
+	f.detailStatus = "active"
+	if _, err := f.db.Exec(`UPDATE account_recovery_tasks SET original_schedulable=0 WHERE id=?`, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.task.OriginalSchedulable = false
+	f.service.process(f.task)
+	if got := f.state(t); got.State != store.RecoveryCompleted {
+		t.Fatalf("state=%s error=%q", got.State, got.LastError)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.schedule || strings.Contains(strings.Join(f.events, " "), "enable") {
+		t.Fatalf("manual pause was reopened: schedule=%v events=%v", f.schedule, f.events)
+	}
+}
+
 func TestSub2RecoveryRejectsIdentityAndNeverWrites(t *testing.T) {
 	for _, stage := range []string{"existing", "refreshed"} {
 		t.Run(stage, func(t *testing.T) {
@@ -308,7 +355,10 @@ func TestSub2RecoveryRejectsIdentityAndNeverWrites(t *testing.T) {
 			if stage == "existing" {
 				f.detailEmail = "wrong@example.test"
 			} else {
-				f.refreshMode = "wrong_identity"
+				f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
+					f.loginCalls++
+					return &login.LoginResult{Email: "wrong@example.test", AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "workspace"}, nil
+				}
 			}
 			f.service.process(f.task)
 			got := f.state(t)
@@ -353,7 +403,6 @@ func TestSub2RecoveryCannotEnableWhenPostApplyChecksFail(t *testing.T) {
 
 func TestSub2RecoveryInvalidGrantLogsInAndCheckpointsVersion(t *testing.T) {
 	f := newRecoveryFixture(t, true)
-	f.refreshMode = "invalid_grant"
 	f.service.loginWithProxies = func(_ context.Context, email, password, totp, proxy, upstream string) (*login.LoginResult, error) {
 		f.loginCalls++
 		if email != f.account.Email || password != "password" {
@@ -371,7 +420,7 @@ func TestSub2RecoveryInvalidGrantLogsInAndCheckpointsVersion(t *testing.T) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.refreshCalls != 1 || f.loginCalls != 1 || f.applyCalls != 1 || !f.schedule {
+	if f.refreshCalls != 0 || f.loginCalls != 1 || f.applyCalls != 1 || !f.schedule {
 		t.Fatalf("refresh=%d login=%d apply=%d schedule=%v", f.refreshCalls, f.loginCalls, f.applyCalls, f.schedule)
 	}
 	_, saved, err := f.store.GetOAuthResultByID(context.Background(), f.account.ID)
@@ -380,59 +429,21 @@ func TestSub2RecoveryInvalidGrantLogsInAndCheckpointsVersion(t *testing.T) {
 	}
 }
 
-func TestSub2RecoveryTransientErrorsDoNotFallback(t *testing.T) {
+func TestSub2RecoveryDoesNotUseRefreshEndpoint(t *testing.T) {
 	for _, mode := range []string{"invalid_client", "429", "502", "400_invalid_grant", "502_invalid_grant_wrong_reason", "500_invalid_grant"} {
 		t.Run(mode, func(t *testing.T) {
-			f := newRecoveryFixture(t, false)
+			f := newRecoveryFixture(t, true)
 			f.refreshMode = mode
-			f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
-				f.loginCalls++
-				return &login.LoginResult{Email: f.account.Email, AccessToken: "login-at", RefreshToken: "login-rt", ChatGPTAccountID: "workspace"}, nil
-			}
 			f.service.process(f.task)
-			if got := f.state(t); got.State != store.RecoveryUnknown || got.ResultCredentialAttemptID != 0 {
+			if got := f.state(t); got.State != store.RecoveryCompleted || got.ResultCredentialAttemptID == 0 {
 				t.Fatalf("mode=%s state=%+v", mode, got)
 			}
 			f.mu.Lock()
 			defer f.mu.Unlock()
-			if f.loginCalls != 0 || f.applyCalls != 0 || f.schedule {
-				t.Fatalf("mode=%s login=%d apply=%d schedule=%v", mode, f.loginCalls, f.applyCalls, f.schedule)
+			if f.refreshCalls != 0 || f.loginCalls != 1 || f.applyCalls != 1 || !f.schedule {
+				t.Fatalf("mode=%s refresh=%d login=%d apply=%d schedule=%v", mode, f.refreshCalls, f.loginCalls, f.applyCalls, f.schedule)
 			}
 		})
-	}
-}
-
-func TestSub2RecoveryNewCheckAfterUncertainRefreshForcesLogin(t *testing.T) {
-	f := newRecoveryFixture(t, false)
-	f.refreshMode = "502"
-	f.service.process(f.task)
-	first := f.state(t)
-	if first.State != store.RecoveryUnknown || first.ResultCredentialAttemptID != 0 {
-		t.Fatalf("first attempt=%+v", first)
-	}
-
-	f.service.loginWithProxies = func(_ context.Context, email, password, totp, proxy, upstream string) (*login.LoginResult, error) {
-		f.loginCalls++
-		return &login.LoginResult{Email: email, AccessToken: "login-at", RefreshToken: "login-rt", ChatGPTAccountID: "workspace"}, nil
-	}
-	checkID := finishRecoveryCheck(t, f.store, f.db, f.account.ID, "candidate-after-uncertain-refresh", "unauthorized", "unauthorized", "", func() *int { v := http.StatusUnauthorized; return &v }())
-	queued, created, err := f.service.enqueue(context.Background(), f.account.ID)
-	if err != nil || !created || queued.CheckID != checkID || queued.SourceCredentialAttemptID != first.SourceCredentialAttemptID {
-		t.Fatalf("new task=%+v created=%v err=%v", queued, created, err)
-	}
-	claimed, err := f.store.ClaimAccountRecoveryTask(context.Background(), queued.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.task = claimed
-	f.service.process(claimed)
-	if got := f.state(t); got.State != store.RecoveryCompleted {
-		t.Fatalf("recovered task=%+v", got)
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.refreshCalls != 1 || f.loginCalls != 1 || f.applyCalls != 1 || !f.schedule {
-		t.Fatalf("refresh=%d login=%d apply=%d schedule=%v", f.refreshCalls, f.loginCalls, f.applyCalls, f.schedule)
 	}
 }
 
@@ -477,8 +488,8 @@ func TestSub2RecoveryResumeUsesCheckpointWithoutRefresh(t *testing.T) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.refreshCalls != 1 || f.applyCalls != 2 || !f.schedule {
-		t.Fatalf("resume consumed RT again: refresh=%d apply=%d schedule=%v", f.refreshCalls, f.applyCalls, f.schedule)
+	if f.refreshCalls != 0 || f.loginCalls != 1 || f.applyCalls != 2 || !f.schedule {
+		t.Fatalf("resume reused checkpoint incorrectly: refresh=%d login=%d apply=%d schedule=%v", f.refreshCalls, f.loginCalls, f.applyCalls, f.schedule)
 	}
 }
 
@@ -499,9 +510,9 @@ func TestSub2RecoveryRejectsStaleCheckAfterNewLogin(t *testing.T) {
 }
 
 func TestSub2RecoveryStorageFailureStopsBeforeSideEffects(t *testing.T) {
-	for _, state := range []string{store.RecoveryValidating, store.RecoveryRefreshingCredentials, store.RecoveryApplyingCredentials, store.RecoveryEnablingSchedule} {
+	for _, state := range []string{store.RecoveryValidating, store.RecoveryApplyingCredentials, store.RecoveryEnablingSchedule} {
 		t.Run(state, func(t *testing.T) {
-			f := newRecoveryFixture(t, false)
+			f := newRecoveryFixture(t, state == store.RecoveryEnablingSchedule)
 			if _, err := f.db.Exec(`CREATE TRIGGER recovery_state_failure BEFORE UPDATE OF state ON account_recovery_tasks WHEN NEW.state='` + state + `' BEGIN SELECT RAISE(ABORT,'state persistence failed'); END`); err != nil {
 				t.Fatal(err)
 			}
@@ -514,13 +525,10 @@ func TestSub2RecoveryStorageFailureStopsBeforeSideEffects(t *testing.T) {
 			if state == store.RecoveryValidating && len(f.methods) != 0 {
 				t.Fatalf("validation state failure made external calls: %v", f.methods)
 			}
-			if state == store.RecoveryRefreshingCredentials && f.refreshCalls != 0 {
-				t.Fatal("refresh request sent despite state persistence failure")
-			}
 			if state == store.RecoveryApplyingCredentials && f.applyCalls != 0 {
 				t.Fatal("apply request sent despite state persistence failure")
 			}
-			if f.schedule || strings.Contains(strings.Join(f.events, " "), "enable") {
+			if strings.Contains(strings.Join(f.events, " "), "enable") {
 				t.Fatalf("enabled despite storage failure: %v", f.events)
 			}
 		})
@@ -538,8 +546,8 @@ func TestSub2RecoveryCheckpointFailureCannotApplyUnstoredCredentials(t *testing.
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.refreshCalls != 1 || f.applyCalls != 0 || f.schedule {
-		t.Fatalf("unpersisted tokens reached Sub2: refresh=%d apply=%d schedule=%v", f.refreshCalls, f.applyCalls, f.schedule)
+	if f.refreshCalls != 0 || f.loginCalls != 1 || f.applyCalls != 0 || f.schedule {
+		t.Fatalf("unpersisted tokens reached Sub2: refresh=%d login=%d apply=%d schedule=%v", f.refreshCalls, f.loginCalls, f.applyCalls, f.schedule)
 	}
 	version, err := f.store.GetAccountCredentialVersion(context.Background(), f.account.ID)
 	if err != nil || version != f.task.SourceCredentialAttemptID {

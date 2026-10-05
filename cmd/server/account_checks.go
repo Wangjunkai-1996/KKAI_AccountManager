@@ -128,6 +128,10 @@ func (s *accountCheckService) cancelBatch(batchID string) {
 
 func (s *accountCheckService) process(work *store.AccountCheckWork) {
 	ctx, cancel := context.WithTimeout(s.ctx, 20*time.Second)
+	accountID := int64(0)
+	if work.Check.AccountID != nil {
+		accountID = *work.Check.AccountID
+	}
 	s.mu.Lock()
 	s.running[work.Check.ID] = accountCheckRunning{work.Batch.ID, cancel}
 	if s.paused.Load() {
@@ -151,15 +155,15 @@ func (s *accountCheckService) process(work *store.AccountCheckWork) {
 		return
 	}
 	if batch.State != "active" || ctx.Err() != nil {
-		s.finish(work.Check.ID, store.AccountCheckResult{Canceled: true})
+		s.finish(work.Check.ID, accountID, store.AccountCheckResult{Canceled: true})
 		return
 	}
 	if probe.AccessTokenExpired(work.AccessToken, time.Now()) {
-		s.finish(work.Check.ID, store.AccountCheckResult{Outcome: "access_token_expired", ErrorCode: "access_token_expired", Message: "本地访问令牌已过期，请重新登录后检测", FailureStage: "precheck"})
+		s.finish(work.Check.ID, accountID, store.AccountCheckResult{Outcome: "access_token_expired", ErrorCode: "access_token_expired", Message: "本地访问令牌已过期，请重新登录后检测", FailureStage: "precheck"})
 		return
 	}
 	if strings.ContainsAny(work.AccessToken+work.ChatGPTAccountID, "\r\n") {
-		s.finish(work.Check.ID, store.AccountCheckResult{Outcome: "credential_incomplete", ErrorCode: "credential_incomplete", Message: "本地凭据格式不完整，请重新登录", FailureStage: "precheck"})
+		s.finish(work.Check.ID, accountID, store.AccountCheckResult{Outcome: "credential_incomplete", ErrorCode: "credential_incomplete", Message: "本地凭据格式不完整，请重新登录", FailureStage: "precheck"})
 		return
 	}
 	markCtx, markCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -168,18 +172,18 @@ func (s *accountCheckService) process(work *store.AccountCheckWork) {
 	notAttempted := false
 	if err != nil {
 		if ctx.Err() != nil {
-			s.finish(work.Check.ID, store.AccountCheckResult{Canceled: errors.Is(ctx.Err(), context.Canceled), Outcome: "timeout", Message: "检测等待超时", FailureStage: "precheck", RequestAttempted: &notAttempted})
+			s.finish(work.Check.ID, accountID, store.AccountCheckResult{Canceled: errors.Is(ctx.Err(), context.Canceled), Outcome: "timeout", Message: "检测等待超时", FailureStage: "precheck", RequestAttempted: &notAttempted})
 		} else {
 			s.pause()
 		}
 		return
 	}
 	if !allowed || ctx.Err() != nil {
-		s.finish(work.Check.ID, store.AccountCheckResult{Canceled: !allowed || errors.Is(ctx.Err(), context.Canceled), Outcome: "timeout", Message: "检测等待超时", FailureStage: "precheck", RequestAttempted: &notAttempted})
+		s.finish(work.Check.ID, accountID, store.AccountCheckResult{Canceled: !allowed || errors.Is(ctx.Err(), context.Canceled), Outcome: "timeout", Message: "检测等待超时", FailureStage: "precheck", RequestAttempted: &notAttempted})
 		return
 	}
 	result := s.runProbe(ctx, work.Proxy, work.AccessToken, work.ChatGPTAccountID)
-	s.finish(work.Check.ID, store.AccountCheckResult{
+	s.finish(work.Check.ID, accountID, store.AccountCheckResult{
 		Outcome: result.Outcome, HTTPStatus: optionalCheckInt(result.HTTPStatus),
 		ProxyHTTPStatus: optionalCheckInt(result.ProxyHTTPStatus), StreamErrorStatus: optionalCheckInt(result.StreamErrorStatus),
 		ErrorCode: result.ErrorCode, StreamErrorCode: result.StreamErrorCode, Message: result.Message,
@@ -196,7 +200,7 @@ func optionalCheckInt(value int) *int {
 	return &value
 }
 
-func (s *accountCheckService) finish(id int64, result store.AccountCheckResult) {
+func (s *accountCheckService) finish(id, accountID int64, result store.AccountCheckResult) {
 	// A canceled request context must never prevent its durable final state.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -208,7 +212,23 @@ func (s *accountCheckService) finish(id int64, result store.AccountCheckResult) 
 	if batch.State == "stopping" {
 		s.cancelBatch(batch.ID)
 	}
+	if !result.Canceled && batch.State != "stopping" && batch.State != "stopped" && accountID > 0 && accountRecoveryService != nil && accountRecoveryService.autoRecovery.Load() && recoveryCheckCandidate(result) {
+		accountRecoveryService.enqueueAutomatic(accountID)
+	}
 	s.notify()
+}
+
+func recoveryCheckCandidate(result store.AccountCheckResult) bool {
+	if result.HTTPStatus != nil && *result.HTTPStatus == http.StatusUnauthorized {
+		return true
+	}
+	for _, value := range []string{result.Outcome, result.ErrorCode, result.StreamErrorCode} {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "credential_missing", "credential_incomplete", "access_token_expired", "token_expired", "token_revoked", "credential_revoked", "unauthorized", "auth_failed", "authentication_failed":
+			return true
+		}
+	}
+	return false
 }
 
 type accountCheckRequest struct {

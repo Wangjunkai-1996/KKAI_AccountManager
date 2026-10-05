@@ -154,8 +154,6 @@ func main() {
 	sub2Importer = newSub2ImportService(loginHistory)
 	sub2Importer.Start()
 	accountChecker = newAccountCheckService(loginHistory, *proxy, *upstreamProxy)
-	accountChecker.Start()
-	defer accountChecker.Stop()
 
 	// 创建登录服务
 	service := login.NewService(login.Config{
@@ -168,8 +166,11 @@ func main() {
 		BrowserCompatibility: *browserCompat,
 	})
 	recoveryService := newSub2RecoveryService(loginHistory, service, sub2Importer)
+	accountRecoveryService = recoveryService
 	recoveryService.Start()
 	defer recoveryService.Stop()
+	accountChecker.Start()
+	defer accountChecker.Stop()
 
 	// 设置路由
 	http.HandleFunc("/", serveIndex)

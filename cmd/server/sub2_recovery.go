@@ -13,6 +13,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ const recoveryClientID = sub2OAuthClientID
 var (
 	errRecoveryNotCandidate = errors.New("账号没有可恢复的最新认证失败检测结果")
 	errRecoveryManualReview = errors.New("上次恢复未能确认结果，Sub2 调度仍处于暂停状态，请先人工核对")
+	accountRecoveryService  *sub2RecoveryService
 )
 
 type sub2RecoveryService struct {
@@ -35,12 +37,13 @@ type sub2RecoveryService struct {
 	loginWithProxies func(context.Context, string, string, string, string, string) (*login.LoginResult, error)
 	sub2             *sub2ImportService
 
-	timeout time.Duration
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	wake    chan struct{}
-	paused  atomic.Bool
+	timeout      time.Duration
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	wake         chan struct{}
+	paused       atomic.Bool
+	autoRecovery atomic.Bool
 }
 
 type sub2RecoveryRequest struct {
@@ -60,11 +63,10 @@ type recoveryOAuthCredentials struct {
 }
 
 type sub2APIError struct {
-	Status    int
-	Code      int
-	Reason    string
-	OAuthCode string
-	Message   string
+	Status  int
+	Code    int
+	Reason  string
+	Message string
 }
 
 func (e *sub2APIError) Error() string {
@@ -77,10 +79,20 @@ func (e *sub2APIError) Error() string {
 func newSub2RecoveryService(history *store.Store, loginService *login.Service, importer *sub2ImportService) *sub2RecoveryService {
 	ctx, cancel := context.WithCancel(context.Background())
 	service := &sub2RecoveryService{store: history, sub2: importer, timeout: 6 * time.Minute, ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1)}
+	service.autoRecovery.Store(envBool("AUTH_AUTO_RECOVERY"))
 	if loginService != nil {
 		service.loginWithProxies = loginService.LoginWithProxiesContext
 	}
 	return service
+}
+
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *sub2RecoveryService) configured() bool {
@@ -221,11 +233,43 @@ func (s *sub2RecoveryService) handleCollection(w http.ResponseWriter, r *http.Re
 }
 
 func (s *sub2RecoveryService) handleAction(w http.ResponseWriter, r *http.Request) {
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/account-recovery/"), "/")
+	if path == "settings" {
+		if s == nil || s.store == nil {
+			recoveryAPIError(w, http.StatusServiceUnavailable, "recovery_unavailable", "恢复服务不可用")
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			respondJSON(w, map[string]any{"success": true, "enabled": s.autoRecovery.Load(), "auto_recovery_enabled": s.autoRecovery.Load()})
+		case http.MethodPut:
+			var req struct {
+				Enabled            *bool `json:"enabled"`
+				AutoRecoveryEnable *bool `json:"auto_recovery_enabled"`
+			}
+			if !decodeRecoveryJSON(w, r, &req) {
+				return
+			}
+			enabled := req.Enabled
+			if enabled == nil {
+				enabled = req.AutoRecoveryEnable
+			}
+			if enabled == nil {
+				recoveryAPIError(w, http.StatusBadRequest, "invalid_request", "enabled 必须是布尔值")
+				return
+			}
+			s.autoRecovery.Store(*enabled)
+			respondJSON(w, map[string]any{"success": true, "enabled": *enabled, "auto_recovery_enabled": *enabled})
+		default:
+			recoveryAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "请求方法不支持")
+		}
+		return
+	}
 	if r.Method != http.MethodGet {
 		recoveryAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "请求方法不支持")
 		return
 	}
-	id, err := strconv.ParseInt(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/account-recovery/"), "/"), 10, 64)
+	id, err := strconv.ParseInt(path, 10, 64)
 	if err != nil || id <= 0 {
 		recoveryAPIError(w, http.StatusBadRequest, "invalid_task_id", "恢复任务 ID 无效")
 		return
@@ -267,6 +311,15 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64) (sto
 	if !ok {
 		return store.AccountRecoveryTask{}, false, errors.New("Sub2 未返回账号调度状态")
 	}
+	// Sub2 marks credentials that fail upstream authentication as error and
+	// pauses their scheduler. Once AUTH has a current 401 observation, that
+	// pause is recoverable; an active account that was manually paused remains
+	// paused.
+	if !original {
+		if status, _ := detail["status"].(string); strings.EqualFold(strings.TrimSpace(status), "error") {
+			original = true
+		}
+	}
 	previous, previousErr := s.store.GetLatestAccountRecoveryTask(ctx, accountID)
 	if previousErr != nil && !errors.Is(previousErr, store.ErrAccountRecoveryNotFound) {
 		return previous, false, previousErr
@@ -293,6 +346,21 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64) (sto
 		s.notify()
 	}
 	return task, created, err
+}
+
+// enqueueAutomatic is called after AUTH has durably recorded a clear 401 or
+// credential failure. It reuses the manual enqueue path so the same binding,
+// identity, freshness and one-active-task checks apply to both entry points.
+func (s *sub2RecoveryService) enqueueAutomatic(accountID int64) {
+	if !s.configured() || s.paused.Load() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, _, err := s.enqueue(ctx, accountID)
+	if err != nil && !errors.Is(err, errRecoveryNotCandidate) {
+		log.Printf("自动恢复入队失败：account_id=%d", accountID)
+	}
 }
 
 func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
@@ -338,7 +406,11 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		return
 	}
 	scheduled, ok := boolField(detail, "schedulable")
-	if !ok || (task.ResultCredentialAttemptID == 0 && scheduled != task.OriginalSchedulable) {
+	// A Sub2 account in error is commonly auto-paused before AUTH starts the
+	// recovery task. In that case the desired post-recovery state is true even
+	// though the current state is false. A manually paused active account keeps
+	// the desired false state and a surprising re-enable is still rejected.
+	if !ok || (task.ResultCredentialAttemptID == 0 && !task.OriginalSchedulable && scheduled) {
 		s.fail(task.ID, store.RecoveryUnknown, "Sub2 调度状态在恢复期间发生变化，请人工核对")
 		return
 	}
@@ -362,19 +434,10 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 			ClientID: recoveryClientID, Email: account.Email, ChatGPTAccountID: saved.ChatGPTAccountID,
 			OrganizationID: saved.OrganizationID, PlanType: saved.PlanType, ExpiresAt: saved.ExpiresAt, ExpiresIn: saved.ExpiresIn}
 	} else {
-		forceLogin, readErr := s.store.AccountRecoveryNeedsLogin(ctx, task.ID)
-		if readErr != nil {
-			s.pauseRecovery(task.ID)
+		if !s.setState(task.ID, store.RecoveryLoggingIn, "正在重新登录 AUTH 取得新凭据") {
 			return
 		}
-		if forceLogin {
-			if !s.setState(task.ID, store.RecoveryLoggingIn, "上次凭据兑换未完成，正在重新登录取得新凭据") {
-				return
-			}
-			oauth, err = s.loginAgain(ctx, task.ID, account, lease)
-		} else {
-			oauth, err = s.refreshFromAuth(ctx, task, account, lease)
-		}
+		oauth, err = s.loginAgain(ctx, task.ID, account, lease)
 		if err != nil {
 			if s.paused.Load() {
 				return
@@ -432,6 +495,12 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		s.fail(task.ID, store.RecoveryUnknown, "凭据版本无法确认")
 		return
 	}
+	if !task.OriginalSchedulable {
+		if !s.setState(task.ID, store.RecoveryCompleted, "凭据已更新，Sub2 检测通过并保持原调度状态") {
+			s.pauseSchedule(task.Sub2AccountID)
+		}
+		return
+	}
 	if !s.setState(task.ID, store.RecoveryEnablingSchedule, "检测成功，正在开启 Sub2 调度") {
 		return
 	}
@@ -458,49 +527,6 @@ func (s *sub2RecoveryService) pauseSchedule(id int64) {
 	if err := s.setSchedulable(ctx, id, false); err != nil {
 		log.Printf("恢复任务无法确认暂停调度：sub2_account_id=%d", id)
 	}
-}
-
-func (s *sub2RecoveryService) refreshFromAuth(ctx context.Context, task store.AccountRecoveryTask, account store.Account, lease *store.AccountRecoveryLease) (recoveryOAuthCredentials, error) {
-	_, stored, err := s.store.GetOAuthResultByID(ctx, task.AccountID)
-	if err != nil && !errors.Is(err, store.ErrOAuthCredentialsMissing) {
-		s.pauseRecovery(task.ID)
-		return recoveryOAuthCredentials{}, errors.New("AUTH 凭据读取失败")
-	}
-	if err == nil && strings.TrimSpace(stored.RefreshToken) != "" {
-		if !s.setState(task.ID, store.RecoveryRefreshingCredentials, "正在使用现有 Refresh Token 获取新凭据") {
-			return recoveryOAuthCredentials{}, errors.New("recovery storage unavailable")
-		}
-		refreshed, refreshErr := s.refreshToken(ctx, stored.RefreshToken)
-		if refreshErr == nil {
-			if refreshed.RefreshToken == "" {
-				refreshed.RefreshToken = stored.RefreshToken
-			}
-			if refreshed.ClientID == "" {
-				refreshed.ClientID = recoveryClientID
-			}
-			if err := verifyOAuthIdentity(refreshed, account); err != nil {
-				return recoveryOAuthCredentials{}, err
-			}
-			result := store.Result{
-				AccessToken: refreshed.AccessToken, RefreshToken: refreshed.RefreshToken,
-				ChatGPTAccountID: refreshed.ChatGPTAccountID, OrganizationID: refreshed.OrganizationID,
-				PlanType: refreshed.PlanType, ExpiresAt: refreshed.ExpiresAt, ExpiresIn: refreshed.ExpiresIn,
-			}
-			if _, err := lease.UpdateOAuthResult(ctx, task.ID, result); err != nil {
-				s.pauseRecovery(task.ID)
-				return recoveryOAuthCredentials{}, errors.New("AUTH 新凭据保存失败")
-			}
-			return refreshed, nil
-		}
-		var apiErr *sub2APIError
-		if !errors.As(refreshErr, &apiErr) || !isRefreshTokenInvalid(apiErr) {
-			return recoveryOAuthCredentials{}, errors.New("Sub2 Refresh Token 暂时不可用")
-		}
-	}
-	if !s.setState(task.ID, store.RecoveryLoggingIn, "现有 Refresh Token 不可用，正在重新登录 AUTH") {
-		return recoveryOAuthCredentials{}, errors.New("recovery storage unavailable")
-	}
-	return s.loginAgain(ctx, task.ID, account, lease)
 }
 
 func (s *sub2RecoveryService) loginAgain(ctx context.Context, taskID int64, account store.Account, lease *store.AccountRecoveryLease) (recoveryOAuthCredentials, error) {
@@ -606,17 +632,6 @@ func (s *sub2RecoveryService) sub2Account(ctx context.Context, id int64) (map[st
 	return detail, err
 }
 
-func (s *sub2RecoveryService) refreshToken(ctx context.Context, refresh string) (recoveryOAuthCredentials, error) {
-	var out recoveryOAuthCredentials
-	if err := s.sub2JSONBody(ctx, http.MethodPost, "/admin/openai/refresh-token", map[string]any{"refresh_token": refresh, "client_id": recoveryClientID}, &out); err != nil {
-		return out, err
-	}
-	if strings.TrimSpace(out.AccessToken) == "" {
-		return out, errors.New("Sub2 refresh response missing access token")
-	}
-	return out, nil
-}
-
 func (s *sub2RecoveryService) setSchedulable(ctx context.Context, id int64, enabled bool) error {
 	return s.sub2JSONBody(ctx, http.MethodPost, "/admin/accounts/"+strconv.FormatInt(id, 10)+"/schedulable", map[string]any{"schedulable": enabled}, nil)
 }
@@ -711,7 +726,7 @@ func (s *sub2RecoveryService) sub2JSONBody(ctx context.Context, method, path str
 		return &sub2APIError{Status: resp.StatusCode, Message: "Sub2 响应格式无效"}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || envelope.Code != 0 {
-		return &sub2APIError{Status: resp.StatusCode, Code: envelope.Code, Reason: envelope.Reason, OAuthCode: recoveryOAuthErrorCode(envelope.Message), Message: "Sub2 请求未成功"}
+		return &sub2APIError{Status: resp.StatusCode, Code: envelope.Code, Reason: envelope.Reason, Message: "Sub2 请求未成功"}
 	}
 	if out != nil && len(envelope.Data) != 0 && string(envelope.Data) != "null" {
 		if err := json.Unmarshal(envelope.Data, out); err != nil {
@@ -727,60 +742,7 @@ func recoveryMarkerMatches(detail map[string]any, task store.AccountRecoveryTask
 	return task.ResultCredentialAttemptID > 0 && toFloat(marker["task_id"]) == float64(task.ID) && toFloat(marker["credential_attempt_id"]) == float64(task.ResultCredentialAttemptID)
 }
 
-// Keep only the exact OAuth error enum. Upstream bodies may include secrets.
-func recoveryOAuthErrorCode(message string) string {
-	rest, ok := strings.CutPrefix(message, "token refresh failed: status ")
-	if !ok {
-		return ""
-	}
-	statusText, body, ok := strings.Cut(rest, ", body: ")
-	status, err := strconv.Atoi(statusText)
-	if !ok || err != nil || (status != 400 && status != 401) {
-		return ""
-	}
-	var payload struct {
-		Error json.RawMessage `json:"error"`
-	}
-	if json.Unmarshal([]byte(body), &payload) != nil {
-		return ""
-	}
-	var code string
-	if json.Unmarshal(payload.Error, &code) != nil {
-		var inner struct {
-			Code string `json:"code"`
-			Type string `json:"type"`
-		}
-		if json.Unmarshal(payload.Error, &inner) != nil {
-			return ""
-		}
-		code = inner.Code
-		if code == "" {
-			code = inner.Type
-		}
-	}
-	switch code {
-	case "invalid_grant", "invalid_refresh_token", "refresh_token_reused":
-		return code
-	}
-	return ""
-}
-
-func isRefreshTokenInvalid(err *sub2APIError) bool {
-	if err == nil || err.Status != http.StatusBadGateway || err.Reason != "OPENAI_OAUTH_TOKEN_REFRESH_FAILED" {
-		return false
-	}
-	switch err.OAuthCode {
-	case "invalid_grant", "invalid_refresh_token", "refresh_token_reused":
-		return true
-	}
-	return false
-}
-
 func recoveryStageMessage(err error) string {
-	var apiErr *sub2APIError
-	if errors.As(err, &apiErr) && isRefreshTokenInvalid(apiErr) {
-		return "Refresh Token 已失效，AUTH 重新登录失败"
-	}
 	return "认证恢复失败，Sub2 保持停止调度"
 }
 

@@ -53,6 +53,7 @@ type historyListResponse struct {
 	Success          bool                                `json:"success"`
 	Data             []store.Account                     `json:"data"`
 	Imports          []store.Sub2Import                  `json:"imports,omitempty"`
+	Sub2Statuses     map[int64]sub2AccountStatus         `json:"sub2_statuses,omitempty"`
 	Sub2Configured   bool                                `json:"sub2_configured"`
 	ImportsAvailable bool                                `json:"imports_available"`
 	ChecksAvailable  bool                                `json:"checks_available"`
@@ -84,6 +85,10 @@ func handleHistory() http.HandlerFunc {
 			return
 		}
 		imports, importsErr := loginHistory.ListSub2ImportStatuses(r.Context())
+		var sub2Statuses map[int64]sub2AccountStatus
+		if importsErr == nil && sub2Importer != nil && sub2Importer.configured() {
+			sub2Statuses = sub2Importer.listSub2AccountStatuses(r.Context(), imports)
+		}
 		checks, checksErr := loginHistory.ListAccountCheckSummaries(r.Context())
 		var recoveries map[int64]store.AccountRecoveryTask
 		if tasks, recoveryErr := loginHistory.ListLatestAccountRecoveryTasks(r.Context()); recoveryErr == nil {
@@ -95,7 +100,7 @@ func handleHistory() http.HandlerFunc {
 			}
 		}
 		configured := sub2Importer != nil && sub2Importer.configured()
-		respondJSON(w, historyListResponse{Success: true, Data: accounts, Imports: imports, Sub2Configured: configured,
+		respondJSON(w, historyListResponse{Success: true, Data: accounts, Imports: imports, Sub2Statuses: sub2Statuses, Sub2Configured: configured,
 			ImportsAvailable: importsErr == nil, ChecksAvailable: checksErr == nil, Checks: checks, Recoveries: recoveries})
 	}
 }
