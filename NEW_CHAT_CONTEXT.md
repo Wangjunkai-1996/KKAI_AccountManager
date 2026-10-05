@@ -21,15 +21,15 @@
 - 数据库：`/var/lib/openai-login/data/accounts.db`
 - 加密密钥：`/var/lib/openai-login/data/accounts.key`
 - release 根目录：`/opt/openai-login/releases`
-- 当前 release：`20261005T105500Z-sub2-status-ui`
-- 当前 commit：`9a08749`
-- 当前二进制 SHA-256：`5bcd2aaa1c82efa35428172c95ded6a6f592e846d7639263403ed129bc5c6462`
-- 回滚 release：`20261005T035610Z-sub2-monitor-complete`
+- 当前 release：`20261005T124744Z-sub2-auth401-recovery`
+- 当前 commit：`4591e80`
+- 当前二进制 SHA-256：`d869c0c16498a8ab362e0be78c3aff617eec0ab96a469244244cd49099006714`
+- 回滚 release：`20261005T105500Z-sub2-status-ui`
 - 浏览器运行方式：sys1 上的 Google Chrome + Xvfb，有头模式；浏览器流程实际发生在 sys1
 
-2026-10-05 发布 `20261005T105500Z-sub2-status-ui`（commit `9a08749`）；回滚为 `20261005T035610Z-sub2-monitor-complete`。发布后服务 `active/running`、`NRestarts=0`，`/health` 返回 `status: ok`、`max_concurrent: 10`，有效入口 Unix socket 健康通过，公网未认证返回 HTTP 401。候选验证时自动恢复关闭，生产 SQLite 开关保持开启；生产快照为 history 31、imports 27、statuses 31。账号 117/118/119 均观察到 AUTH HTTP 401 与 Sub2 未来限流窗口，未将其计为恢复成功。完整健康、回滚和业务结果见 `SYS1_DEPLOYMENT.md`，精确验证命令见 `STATUS.md`。
+2026-10-05 发布 `20261005T124744Z-sub2-auth401-recovery`（commit `4591e80`）；回滚为 `20261005T105500Z-sub2-status-ui`。发布前备份为 `/var/lib/openai-login/backups/accounts-before-20261005T124744Z-sub2-auth401-recovery.db`。发布后服务 `active/running`、`NRestarts=0`，`/health` 返回 `status: ok`，有效入口 socket 返回 HTTP 200，公网未认证返回 HTTP 401。候选验证时自动恢复关闭，生产自动恢复 `enabled` 且 SQLite 开关保持开启；生产快照为 history 31、imports 27、statuses 31。账号 117/118/119 的 AUTH current 检测均为 HTTP 401 `credential_revoked`，Sub2 仍为 `active` 但 `schedulable=false`、`effective_schedulable=false`；自动恢复任务为 `unknown`，保持停止调度。完整健康、回滚和业务结果见 `SYS1_DEPLOYMENT.md`，精确验证命令见 `STATUS.md`。
 
-本轮已上线批量登录结果导入的终态等待和展示、Sub2 导入名称 `AUTH_MMDDHHmm_email`、AUTH 401 与 Sub2 凭据/调度状态的独立呈现、原始 `schedulable`/`effective_schedulable` 及限流/过载/临时暂停信息展示。历史页新增“立即检测”快捷入口；“账号检测”Tab 仍保留批量检测、进度和单账号详情/恢复。
+本轮已上线 AUTH 401 恢复判定、批量登录结果导入的终态等待和展示、Sub2 导入名称 `AUTH_MMDDHHmm_email`、AUTH 401 与 Sub2 凭据/调度状态的独立呈现、原始 `schedulable`/`effective_schedulable` 及限流/过载/临时暂停信息展示。历史页新增“立即检测”快捷入口；“账号检测”Tab 仍保留批量检测、进度和单账号详情/恢复。
 
 ## 当前账号关联和恢复行为
 

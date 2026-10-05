@@ -89,7 +89,7 @@ AUTH 默认只监听 `127.0.0.1`。如果通过反向代理或 `-bind` 暴露到
 
 公网入口为 `https://auth.kkrich.ltd`，使用平台入口用户名和密码进入。当前 sys1 IPv4 直连在 OAuth 授权页仍可能收到 Cloudflare `403 cf-mitigated: challenge`；从 sys1 使用指定 HTTP 代理节点已完成真实账号连续登录验收。需要指定节点时，在页面唯一的 HTTP 代理输入框填写节点地址。开始处理前会按邮箱自动去重，重复账号只执行第一条。线上服务、release、回滚和验收记录见 `SYS1_DEPLOYMENT.md`。
 
-当前线上 release 为 `20261005T105500Z-sub2-status-ui`（commit `9a08749`，二进制 SHA-256 `5bcd2aaa1c82efa35428172c95ded6a6f592e846d7639263403ed129bc5c6462`），回滚为 `20261005T035610Z-sub2-monitor-complete`。发布后服务保持 `active/running`、`NRestarts=0`，`/health` 返回 `status: ok`、`max_concurrent: 10`，有效入口 Unix socket 健康通过，公网未认证返回 HTTP 401。候选验证时自动恢复关闭，生产开关保持开启；线上快照为 history 31、imports 27、statuses 31。账号 117/118/119 同时显示 AUTH HTTP 401 与 Sub2 未来限流窗口，页面不会将其计为恢复成功。
+当前线上 release 为 `20261005T124744Z-sub2-auth401-recovery`（commit `4591e80`，二进制 SHA-256 `d869c0c16498a8ab362e0be78c3aff617eec0ab96a469244244cd49099006714`），回滚为 `20261005T105500Z-sub2-status-ui`。发布前备份为 `/var/lib/openai-login/backups/accounts-before-20261005T124744Z-sub2-auth401-recovery.db`。发布后服务保持 `active/running`、`NRestarts=0`，`/health` 返回 `status: ok`，有效入口 socket 返回 HTTP 200，公网未认证返回 HTTP 401。候选验证时自动恢复关闭，生产自动恢复 `enabled` 且开关保持开启；线上快照为 history 31、imports 27、statuses 31。账号 117/118/119 的 AUTH current 检测均为 HTTP 401 `credential_revoked`，Sub2 为 `active` 且 `schedulable=false`、`effective_schedulable=false`，自动恢复任务为 `unknown`，保持停止调度。
 
 sys1 的部署方式是独立运行本工具、Google Chrome 和 Xvfb。Xvfb 提供虚拟显示环境，让服务器运行有头 Chrome；无需打开公开管理端口，也无需安装桌面环境。该工具独立于 Sub2API 服务。
 

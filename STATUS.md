@@ -4,11 +4,11 @@
 
 ## 当前结论
 
-项目源码在 `/Users/tokk/Desktop/KKAI_AUTH`。批量导入终态展示、Sub2 状态字段展示、历史页立即检测及账号检测 Tab 保留已部署到 sys1（`20261005T105500Z-sub2-status-ui`，commit `9a08749`）；回滚为 `20261005T035610Z-sub2-monitor-complete`。Sub2 源码和线上版本未改。已观察真实 AUTH 检测与 Sub2 状态，完整证据见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。
+项目源码在 `/Users/tokk/Desktop/KKAI_AUTH`。AUTH 401 恢复与状态展示已部署到 sys1（`20261005T124744Z-sub2-auth401-recovery`，commit `4591e80`）；回滚为 `20261005T105500Z-sub2-status-ui`。Sub2 源码和线上版本未改。已观察真实 AUTH 检测、恢复任务和 Sub2 状态，完整证据见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。
 
 ## 本轮批量导入与状态展示变更（2026-10-05）
 
-以下行为已随 `20261005T105500Z-sub2-status-ui` 上线。
+以下行为已随 `20261005T124744Z-sub2-auth401-recovery` 上线。
 
 - 从批量登录结果导入 Sub2 时，前端等待已受理任务进入终态，并持续显示总数、已完成数、成功数、失败数和仍在队列中的数量；超时仍明确标记为待核对，不把“已受理”当作成功。
 - 新建 Sub2 账号名称统一为 `AUTH_MMDDHHmm_email`（服务端使用 Asia/Shanghai 时间）；来源仍通过独立来源标记和账号身份核对确认。
@@ -29,32 +29,31 @@
 | 服务 | `openai-login.service` |
 | sys1 本机监听 | `127.0.0.1:18082` |
 | Mac 隧道 | `./open-sys1.sh` |
-| 当前 release | `20261005T105500Z-sub2-status-ui` |
-| 回滚 release | `20261005T035610Z-sub2-monitor-complete` |
-| 当前 commit | `9a08749` |
+| 当前 release | `20261005T124744Z-sub2-auth401-recovery` |
+| 回滚 release | `20261005T105500Z-sub2-status-ui` |
+| 当前 commit | `4591e80` |
 | 数据库 | `/var/lib/openai-login/data/accounts.db` |
 | 密钥 | `/var/lib/openai-login/data/accounts.key` |
-| 最近健康检查 | 发布后复核：active/running，NRestarts=0，`/health` 返回 `status: ok`、`max_concurrent: 10`，回滚就绪 |
-| 发布前备份 | 当前 release 发布前已按流程保留并通过 `integrity_check`；备份路径不在本摘要中展开 |
-| 当前二进制 SHA-256 | `5bcd2aaa1c82efa35428172c95ded6a6f592e846d7639263403ed129bc5c6462` |
+| 最近健康检查 | 发布后复核：active/running，NRestarts=0，`/health` 返回 `status: ok`，入口 socket HTTP 200，回滚就绪 |
+| 发布前备份 | `/var/lib/openai-login/backups/accounts-before-20261005T124744Z-sub2-auth401-recovery.db`，已完成一致性校验 |
+| 当前二进制 SHA-256 | `d869c0c16498a8ab362e0be78c3aff617eec0ab96a469244244cd49099006714` |
 | 导入配置 | `sub2_configured=true`；使用 Sub2 既有接口，Sub2 源码和线上版本未改 |
-| 公网身份验证 | 有效入口 Unix socket 健康通过，公网未认证 HTTP 401；未验证认证后公网业务 |
-| 本轮功能与 OAuth 验收 | 新 UI 与状态同步已上线；117/118/119 均观察到 AUTH HTTP 401，同时 Sub2 有未来限流窗口，未将其计为恢复成功 |
-| 自动恢复设置 | 候选验证时关闭；生产 SQLite 开关保持开启，立即及每 60 秒后台扫描，页面关闭后继续 |
+| 公网身份验证 | 有效入口 socket HTTP 200，公网未认证 HTTP 401；未验证认证后公网业务 |
+| 本轮功能与 OAuth 验收 | 117/118/119 均为 AUTH current HTTP 401 `credential_revoked`；Sub2 仍 `active`，但 `schedulable=false`、`effective_schedulable=false`；自动恢复任务为 `unknown`，保持停止调度 |
+| 自动恢复设置 | 生产自动恢复 `enabled` 并保存到 SQLite，立即及每 60 秒后台扫描，页面关闭后继续 |
 | 线上快照 | history 31、imports 27、statuses 31 |
 | sys1 IPv4 模型检测（历史） | 此前真实 HTTP200 / 完整模型完成事件，1,982ms |
 | 默认代理模型检测（历史） | 此前单账号连续两次成功；候选两个账号并发2正常，重叠3,035ms |
 | 浏览器直连历史限制 | 授权流程曾收到 `403 + cf-mitigated: challenge`；不可将该浏览器结论套用到模型检测 |
 | sys1 默认代理 | 节点 `45.39.200.204:7269`；此前完整 OAuth 登录 18.93 秒、模型检测通过，本轮未重测 |
 
-## `20261005T105500Z-sub2-status-ui` 发布验收
+## `20261005T124744Z-sub2-auth401-recovery` 发布验收
 
-- release commit：`9a08749`；Linux amd64 二进制 SHA-256：`5bcd2aaa1c82efa35428172c95ded6a6f592e846d7639263403ed129bc5c6462`。
-- 发布后服务保持 `active/running`、`NRestarts=0`，`/health` 返回 `status: ok`、`max_concurrent: 10`；回滚 release `20261005T035610Z-sub2-monitor-complete` 保留可用。
-- 有效入口 Unix socket 健康检查通过，公网未认证请求返回 HTTP 401；这只证明入口保护和本机链路，不代表认证后业务验收。
-- 候选验证显式关闭自动恢复；切换生产后 SQLite 中的自动恢复开关保持开启，立即扫描和每 60 秒后台巡检继续运行。
-- 生产状态快照为 history 31、imports 27、statuses 31。账号 117、118、119 均同时出现 AUTH HTTP 401 与 Sub2 未来限流窗口，页面保留两条独立证据；未人工暂停的账号仍可按 AUTH 401 进入恢复，Sub2 限流只会影响后续探测和调度恢复确认。
-- 本轮上线事实包括批量登录导入等待并展示终态、`AUTH_MMDDHHmm_email` 名称、`schedulable`/`effective_schedulable` 与限流/过载/临时暂停展示、历史页立即检测，以及保留账号检测 Tab 的批量/详情入口。
+- release commit：`4591e80`；Linux amd64 二进制 SHA-256：`d869c0c16498a8ab362e0be78c3aff617eec0ab96a469244244cd49099006714`。
+- 发布前备份：`/var/lib/openai-login/backups/accounts-before-20261005T124744Z-sub2-auth401-recovery.db`；发布后服务保持 `active/running`、`NRestarts=0`，`/health` 返回 `status: ok`，入口 socket HTTP 200；回滚 release `20261005T105500Z-sub2-status-ui` 保留可用。
+- 公网未认证请求返回 HTTP 401；这只证明入口保护，不代表认证后业务验收。
+- 生产自动恢复为 `enabled`；117/118/119 的 AUTH current 检测均为 HTTP 401 `credential_revoked`，对应 Sub2 状态为 `active`、`schedulable=false`、`effective_schedulable=false`。自动恢复任务状态为 `unknown`，因此保持停止调度。
+- 生产状态快照为 history 31、imports 27、statuses 31；本轮上线事实包括 AUTH 401 恢复判定、批量导入终态展示、Sub2 调度字段与运行时窗口展示、历史页立即检测，以及保留账号检测 Tab 的批量/详情入口。
 
 ## 目前已实现
 
@@ -112,7 +111,7 @@ go vet ./cmd/server ./internal/store
 node --check cmd/server/client.js
 node cmd/server/client.test.cjs
 node cmd/server/account-checks.test.cjs
-./build-linux.sh /tmp/openai-login-web-20261005T105500Z-sub2-status-ui
+./build-linux.sh /tmp/openai-login-web-20261005T124744Z-sub2-auth401-recovery
 git diff --check
 ```
 

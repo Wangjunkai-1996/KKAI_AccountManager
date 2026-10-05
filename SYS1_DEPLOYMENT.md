@@ -19,27 +19,27 @@
 
 当前部署基线（2026-10-05 发布后确认）：
 
-- 当前 release：`20261005T105500Z-sub2-status-ui`
-- 当前 commit：`9a08749`
-- 当前二进制 SHA-256：`5bcd2aaa1c82efa35428172c95ded6a6f592e846d7639263403ed129bc5c6462`
-- 回滚 release：`20261005T035610Z-sub2-monitor-complete`
+- 当前 release：`20261005T124744Z-sub2-auth401-recovery`
+- 当前 commit：`4591e80`
+- 当前二进制 SHA-256：`d869c0c16498a8ab362e0be78c3aff617eec0ab96a469244244cd49099006714`
+- 回滚 release：`20261005T105500Z-sub2-status-ui`
 - 当前服务应保持 `active (running)`，且 `NRestarts=0`
 - 当前服务端并发硬上限：10；页面选择的并发数由前端 worker 控制，实际不超过该上限。
 - 页面代理留空时使用 sys1 默认认证 HTTP 代理（节点地址仅记录为 `45.39.200.204:7269`，凭据保存在 `/etc/openai-login/proxy.env`，不写入文档）。
 - 历史列表中的 `expires_at` 表示 OAuth Access Token 有效期；Access Token 过期不等于账号或 Refresh Token 失效。
 - AUTH → Sub2 导入已启用；Sub2 地址、管理密钥和实例标识保存在 `/etc/openai-login/sub2api.env`（权限 `0600`），由 systemd drop-in 注入服务进程。
 - 本次仅发布 AUTH：外部账号关联、历史恢复入口、持久化后台巡检及缺少令牌恢复；Sub2 源码、镜像和线上版本未改。
-- 候选验证时自动恢复显式关闭；生产 SQLite 开关保持开启，开启立即扫描，此后每 60 秒后台检查 Sub2 异常账号。仅未保存选择时读取 `AUTH_AUTO_RECOVERY` 启动默认值。
+- 候选验证时自动恢复显式关闭；生产自动恢复为 `enabled` 并保持 SQLite 开关开启，开启立即扫描，此后每 60 秒后台检查 Sub2 异常账号。仅未保存选择时读取 `AUTH_AUTO_RECOVERY` 启动默认值。
 
-## Sub2 状态 UI 发布验收（2026-10-05）
+## AUTH 401 恢复发布验收（2026-10-05）
 
-- release：`20261005T105500Z-sub2-status-ui`；commit：`9a08749`；回滚：`20261005T035610Z-sub2-monitor-complete`。
-- 当前 Linux amd64 二进制 SHA-256：`5bcd2aaa1c82efa35428172c95ded6a6f592e846d7639263403ed129bc5c6462`。
-- 发布后健康复核：`openai-login.service` 为 `active/running`，`NRestarts=0`，`/health` 返回 `status: ok`、`max_concurrent: 10`；旧 release 保留可回滚。
-- 有效入口 Unix socket 健康检查通过，公网未认证请求仍返回 HTTP 401；这只证明入口保护和本机链路，不代表认证后业务验收。
-- 候选环境显式关闭自动恢复；生产环境的 SQLite 开关保持开启，发布后立即扫描及每 60 秒后台巡检继续运行。
-- 生产快照为 history 31、imports 27、statuses 31。账号 117、118、119 均出现 AUTH HTTP 401 与 Sub2 未来限流窗口；两套状态独立展示，未人工暂停的账号可按 AUTH 401 进入恢复，限流窗口只影响后续探测和调度恢复确认。
-- 本轮上线批量登录结果导入终态等待与展示、`AUTH_MMDDHHmm_email` 名称、AUTH 401/Sub2 凭据独立状态、`schedulable`/`effective_schedulable` 及限流/过载/临时暂停展示、历史页立即检测，以及账号检测 Tab 的批量/详情入口保留。
+- release：`20261005T124744Z-sub2-auth401-recovery`；commit：`4591e80`；回滚：`20261005T105500Z-sub2-status-ui`。
+- 当前 Linux amd64 二进制 SHA-256：`d869c0c16498a8ab362e0be78c3aff617eec0ab96a469244244cd49099006714`。
+- 发布前备份：`/var/lib/openai-login/backups/accounts-before-20261005T124744Z-sub2-auth401-recovery.db`。
+- 发布后健康复核：`openai-login.service` 为 `active/running`，`NRestarts=0`，`/health` 返回 `status: ok`；有效入口 socket 返回 HTTP 200，公网未认证请求返回 HTTP 401。旧 release 保留可回滚。
+- 候选环境显式关闭自动恢复；生产自动恢复为 `enabled`，SQLite 开关保持开启，发布后立即扫描及每 60 秒后台巡检继续运行。
+- 生产快照为 history 31、imports 27、statuses 31。账号 117、118、119 的 AUTH current 检测均为 HTTP 401 `credential_revoked`；对应 Sub2 状态为 `active`、`schedulable=false`、`effective_schedulable=false`。自动恢复任务状态为 `unknown`，保持停止调度。
+- 本轮上线 AUTH 401 恢复判定、批量登录结果终态等待与展示、`AUTH_MMDDHHmm_email` 名称、Sub2 调度字段与运行时窗口展示、历史页立即检测，以及账号检测 Tab 的批量/详情入口保留。
 - Sub2 源码、镜像和线上版本未改；文档不记录管理密钥、代理凭据或 OAuth token。
 
 ## 从 Mac 访问
