@@ -21,13 +21,15 @@
 - 数据库：`/var/lib/openai-login/data/accounts.db`
 - 加密密钥：`/var/lib/openai-login/data/accounts.key`
 - release 根目录：`/opt/openai-login/releases`
-- 当前 release：`20261005T035610Z-sub2-monitor-complete`
-- 回滚 release：`20261005T033000Z-sub2-monitor-link`
+- 当前 release：`20261005T105500Z-sub2-status-ui`
+- 当前 commit：`9a08749`
+- 当前二进制 SHA-256：`5bcd2aaa1c82efa35428172c95ded6a6f592e846d7639263403ed129bc5c6462`
+- 回滚 release：`20261005T035610Z-sub2-monitor-complete`
 - 浏览器运行方式：sys1 上的 Google Chrome + Xvfb，有头模式；浏览器流程实际发生在 sys1
 
-2026-10-05 04:02:18 UTC 发布 `20261005T035610Z-sub2-monitor-complete`；当前自动恢复开启并持久化。真实扫描已关联 16 个外部账号并触发 AUTH 检测和恢复尝试；4 个账号登录返回 `account_deactivated`/403，不能作为恢复成功。三个新导入账号 117/118/119 目前 Sub2 正常且可调度。04:08:56 UTC 延迟健康、实际路由及回滚核对通过；自动恢复仍开启。完整健康、回滚和业务结果见 `SYS1_DEPLOYMENT.md`，精确验证命令见 `STATUS.md`。
+2026-10-05 发布 `20261005T105500Z-sub2-status-ui`（commit `9a08749`）；回滚为 `20261005T035610Z-sub2-monitor-complete`。发布后服务 `active/running`、`NRestarts=0`，`/health` 返回 `status: ok`、`max_concurrent: 10`，有效入口 Unix socket 健康通过，公网未认证返回 HTTP 401。候选验证时自动恢复关闭，生产 SQLite 开关保持开启；生产快照为 history 31、imports 27、statuses 31。账号 117/118/119 均观察到 AUTH HTTP 401 与 Sub2 未来限流窗口，未将其计为恢复成功。完整健康、回滚和业务结果见 `SYS1_DEPLOYMENT.md`，精确验证命令见 `STATUS.md`。
 
-本轮工作区变更补充了批量登录结果导入的终态等待和展示、Sub2 导入名称 `AUTH_MMDDHHmm_email`、AUTH 401 与 Sub2 凭据/调度状态的独立呈现、原始 `schedulable`/`effective_schedulable` 及限流/过载/临时暂停信息展示。历史页新增“立即检测”快捷入口；“账号检测”Tab 仍保留批量检测、进度和单账号详情/恢复。若尚未生成新的 sys1 release，线上行为仍以本文上方的当前 release 和 `SYS1_DEPLOYMENT.md` 为准。
+本轮已上线批量登录结果导入的终态等待和展示、Sub2 导入名称 `AUTH_MMDDHHmm_email`、AUTH 401 与 Sub2 凭据/调度状态的独立呈现、原始 `schedulable`/`effective_schedulable` 及限流/过载/临时暂停信息展示。历史页新增“立即检测”快捷入口；“账号检测”Tab 仍保留批量检测、进度和单账号详情/恢复。
 
 ## 当前账号关联和恢复行为
 
@@ -35,7 +37,7 @@
 
 状态同步保留 Sub2 原始 `schedulable` 与 `effective_schedulable` 字段；历史行按有效值显示可调度性，并显示未来限流、过载或临时暂停的截止时间/原因。AUTH 的 HTTP 401 只说明 AUTH 当前本地凭据鉴权失败，不覆盖 Sub2 自身凭据或调度结论；两者会同时展示，便于决定是否恢复。
 
-“自动检测恢复”保存到 SQLite，服务重启后保留；未保存时使用 `AUTH_AUTO_RECOVERY` 默认值。开启立即扫描，此后每 60 秒在后端巡检，关闭网页不影响运行；页面显示上次/下次扫描、摘要、检测及恢复进度。仅对仍在 Sub2 池中的异常账号安排 AUTH 检测，确认 401、令牌过期、凭据失效或缺少本地令牌后直接 AUTH 重新登录，写回原 Sub2 账号并验证、恢复调度。正常、禁用、删除、未知及正常但人工暂停的账号跳过，不因 AUTH 本地令牌过期而重登健康的 Sub2 账号。
+“自动检测恢复”保存到 SQLite，服务重启后保留；未保存时使用 `AUTH_AUTO_RECOVERY` 默认值。开启立即扫描，此后每 60 秒在后端巡检，关闭网页不影响运行；页面显示上次/下次扫描、摘要、检测及恢复进度。仍在 Sub2 池中且未人工暂停的账号，只有 AUTH 当前确认 401、令牌过期、凭据失效或缺少本地令牌后才直接 AUTH 重新登录，写回原 Sub2 账号并验证、恢复调度。Sub2 `status=error` 或 `schedulable=false` 不单独证明 401；正常、禁用、删除、未知及人工暂停的账号不会仅凭 Sub2 状态恢复。
 
 历史页提供“检测并恢复”和可恢复任务的“继续恢复”，人工操作不依赖自动开关；普通“重新登录”只更新 AUTH，不写回 Sub2。复用检测冷却和任务去重；自动恢复结束后冷却 30 分钟，同一凭据版本 24 小时内失败 3 次后停止自动重试。Sub2 异常不等于 401，AUTH 检测正常时不强制重登；异常加暂停仍不能完全判定人工/自动暂停来源。真实账号业务验收与上线证据以本次部署记录为准，不沿用历史成功结果。
 

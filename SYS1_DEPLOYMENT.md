@@ -19,27 +19,28 @@
 
 当前部署基线（2026-10-05 发布后确认）：
 
-- 当前 release：`20261005T035610Z-sub2-monitor-complete`
-- 回滚 release：`20261005T033000Z-sub2-monitor-link`
+- 当前 release：`20261005T105500Z-sub2-status-ui`
+- 当前 commit：`9a08749`
+- 当前二进制 SHA-256：`5bcd2aaa1c82efa35428172c95ded6a6f592e846d7639263403ed129bc5c6462`
+- 回滚 release：`20261005T035610Z-sub2-monitor-complete`
 - 当前服务应保持 `active (running)`，且 `NRestarts=0`
 - 当前服务端并发硬上限：10；页面选择的并发数由前端 worker 控制，实际不超过该上限。
 - 页面代理留空时使用 sys1 默认认证 HTTP 代理（节点地址仅记录为 `45.39.200.204:7269`，凭据保存在 `/etc/openai-login/proxy.env`，不写入文档）。
 - 历史列表中的 `expires_at` 表示 OAuth Access Token 有效期；Access Token 过期不等于账号或 Refresh Token 失效。
 - AUTH → Sub2 导入已启用；Sub2 地址、管理密钥和实例标识保存在 `/etc/openai-login/sub2api.env`（权限 `0600`），由 systemd drop-in 注入服务进程。
 - 本次仅发布 AUTH：外部账号关联、历史恢复入口、持久化后台巡检及缺少令牌恢复；Sub2 源码、镜像和线上版本未改。
-- 自动恢复当前开启并保存到 SQLite；开启立即扫描，此后每 60 秒后台检查 Sub2 异常账号。仅未保存选择时读取 `AUTH_AUTO_RECOVERY` 启动默认值。
+- 候选验证时自动恢复显式关闭；生产 SQLite 开关保持开启，开启立即扫描，此后每 60 秒后台检查 Sub2 异常账号。仅未保存选择时读取 `AUTH_AUTO_RECOVERY` 启动默认值。
 
-## 本轮工作区变更记录（2026-10-05）
+## Sub2 状态 UI 发布验收（2026-10-05）
 
-本节记录本轮 AUTH 工作区对批量导入和状态展示的变更；它不改变上方当前 release 的线上事实。只有在新的 release 完成发布、健康检查和业务验收后，才能把这些行为追加到线上基线。
-
-- 从批量登录结果导入 Sub2 时，前端等待已受理任务进入终态，并展示成功、失败和仍在队列中的数量；超时会保留“仍在处理/待核对”提示。
-- 新建 Sub2 账号名称采用 `AUTH_MMDDHHmm_email`（按服务端 Asia/Shanghai 时间生成），来源标记和身份核对仍是关联依据。
-- AUTH 检测的 HTTP 401 与 Sub2 自身凭据/调度状态独立保存和展示。Sub2 状态正常但 AUTH 当前凭据 401 时，页面显示本地凭据失效待处理并保留恢复入口。
-- 状态同步保留 Sub2 原始 `schedulable`、`effective_schedulable`，并展示限流窗口、上游过载窗口、临时暂停截止时间及原因；有效调度窗口存在时不把账号误报为可立即恢复。
-- 历史页增加“立即检测”快捷操作，可按当前筛选或已选账号提交检测；“账号检测”Tab 保留批量选择、进度和单账号详情/恢复。
-
-若当前 release 尚未包含本节改动，新对话应把它们视为待发布工作区行为，继续以当前 release、健康检查和下方已完成验收记录判断线上状态。
+- release：`20261005T105500Z-sub2-status-ui`；commit：`9a08749`；回滚：`20261005T035610Z-sub2-monitor-complete`。
+- 当前 Linux amd64 二进制 SHA-256：`5bcd2aaa1c82efa35428172c95ded6a6f592e846d7639263403ed129bc5c6462`。
+- 发布后健康复核：`openai-login.service` 为 `active/running`，`NRestarts=0`，`/health` 返回 `status: ok`、`max_concurrent: 10`；旧 release 保留可回滚。
+- 有效入口 Unix socket 健康检查通过，公网未认证请求仍返回 HTTP 401；这只证明入口保护和本机链路，不代表认证后业务验收。
+- 候选环境显式关闭自动恢复；生产环境的 SQLite 开关保持开启，发布后立即扫描及每 60 秒后台巡检继续运行。
+- 生产快照为 history 31、imports 27、statuses 31。账号 117、118、119 均出现 AUTH HTTP 401 与 Sub2 未来限流窗口；两套状态独立展示，未人工暂停的账号可按 AUTH 401 进入恢复，限流窗口只影响后续探测和调度恢复确认。
+- 本轮上线批量登录结果导入终态等待与展示、`AUTH_MMDDHHmm_email` 名称、AUTH 401/Sub2 凭据独立状态、`schedulable`/`effective_schedulable` 及限流/过载/临时暂停展示、历史页立即检测，以及账号检测 Tab 的批量/详情入口保留。
+- Sub2 源码、镜像和线上版本未改；文档不记录管理密钥、代理凭据或 OAuth token。
 
 ## 从 Mac 访问
 
@@ -78,7 +79,7 @@ ssh sys1 'curl -fsS http://127.0.0.1:18082/health'
 
 本项目是独立的登录工具，不要把它误认为 Sub2API 主服务，也不要用 Sub2API 的 Compose 发布流程替代本服务的 systemd 发布方式。
 
-## 外部关联与后台自动恢复发布（2026-10-05）
+## 外部关联与后台自动恢复发布（2026-10-05，前次 release）
 
 - 最终发布时间：2026-10-05 04:02:18 UTC（北京时间 12:02:18）；release：`20261005T035610Z-sub2-monitor-complete`；回滚：`20261005T033000Z-sub2-monitor-link`。回滚版本是本轮已验证的初版；更早的 `20261005T020014Z-sub2-sync-auto` 也完整保留。
 - 外部导入的 Sub2 账号按凭据邮箱和已知工作区自动关联；唯一匹配持久化，不重新导入。歧义、身份冲突、查询失败显示具体原因。
@@ -89,7 +90,7 @@ ssh sys1 'curl -fsS http://127.0.0.1:18082/health'
 - Linux amd64 二进制 SHA-256：`601b43cfd4b7ff567571bb27cfbbdeb0ab107f40125337c39a6a863d2de3f522`；3 个嵌入静态资源与本地 SHA 一致。Node/driver 从旧 release 保留；新增设置表兼容旧二进制，回滚不覆盖业务数据库。
 - 隔离候选在 SQLite 中显式关闭自动恢复，验证 `/health`、静态资源、历史关联和设置读取，未执行远端恢复。36 个历史账号：15 原导入绑定、16 外部关联、4 未匹配、1 多条匹配。
 - 发布前确认无活跃登录、导入、检测和恢复；SQLite 一致性备份 `/var/lib/openai-login/backups/accounts-before-20261005T035610Z-sub2-monitor-complete.db`，0600、`integrity_check=ok`。切换后健康和资源检查通过，再恢复用户此前开启的自动恢复选择。
-- 真实业务结果：首次自动扫描确认 3 个账号 AT 已撤销（HTTP401），实际调用 AUTH 重新登录，均被 OpenAI 返回 `account_deactivated`/HTTP403，保持 Sub2 暂停；原未关联账号 63 在其中。另 1 个 Sub2 403 账号 AUTH 检测 HTTP200，未强制重登。原截图三个新导入账号 117/118/119 均正常可调度，未生成恢复任务。
+- 真实业务结果（前次 release 快照）：首次自动扫描确认 3 个账号 AT 已撤销（HTTP401），实际调用 AUTH 重新登录，均被 OpenAI 返回 `account_deactivated`/HTTP403，保持 Sub2 暂停；原未关联账号 63 在其中。另 1 个 Sub2 403 账号 AUTH 检测 HTTP200，未强制重登。该快照中的三个新导入账号 117/118/119 均正常可调度，未生成恢复任务；当前 release 的最新快照见上方发布验收。
 - 无本地令牌的账号 67 在最终修正后也自动完成登录尝试，被 OpenAI 返回 `account_deactivated`/403；本轮共 4 次真实重新登录均被上游拒绝，无成功凭据写回。
 - 04:08:56 UTC 延迟复查：服务 `active/running`、`NRestarts=0`，唯一实际进程 `1778321` 运行最终 release，健康正常；数据库中的开关值为 1，已持续按 60 秒执行扫描，4 个失败任务在冷却中。
 - 有效 Nginx `auth.kkrich.ltd` 路由仍指向 `/run/tls/auth/login.sock`；实际 Unix socket 健康通过，公网未认证 HTTP401。panic、fatal、数据库锁、存储故障、启动失败日志聚合均为0。旧二进制、Node、driver 111个文件 hash 及0600完整性备份核对通过，回滚就绪。

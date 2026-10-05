@@ -680,8 +680,11 @@ function normalizeSub2Status(value) {
 
 function localAuthFailure(account) {
     const result = historyChecks.get(account.id)?.last_result;
-    return Boolean(result && result.freshness !== 'stale' &&
-        (Number(result.http_status) === 401 || ['unauthorized', 'credential_revoked', 'access_token_expired', 'token_expired', 'auth_failed', 'authentication_failed'].includes(result.outcome)));
+    if (!result || result.freshness !== 'current') return false;
+    if (Number(result.http_status) === 401) return true;
+    const outcomes = ['credential_missing', 'credential_incomplete', 'access_token_expired', 'token_expired', 'token_revoked', 'credential_revoked', 'unauthorized', 'auth_failed', 'authentication_failed'];
+    return [result.outcome, result.error_code, result.stream_error_code]
+        .some(value => outcomes.includes(String(value || '').toLowerCase()));
 }
 
 function normalizeHistoryAccount(row, sub2Status = null) {
@@ -794,7 +797,7 @@ function historyRecoveryAction(account) {
     else if (state.stale || state.unknown) reason = 'Sub2 状态未知，请刷新后重试';
     else if (!state.exists) reason = '该账号已从 Sub2 删除';
     else if (['inactive', 'disabled', 'deleted'].includes(state.status)) reason = 'Sub2 账号已禁用或删除，请先在 Sub2 中确认';
-    else if (sub2RuntimePause(state) && !resumable) reason = sub2RuntimePause(state).label;
+    else if (sub2RuntimePause(state) && !resumable && !localAuthFailure(account)) reason = sub2RuntimePause(state).label;
     else if (!resumable && ['active', 'available', 'enabled'].includes(state.status) && state.schedulable === false) reason = '账号已人工暂停，保持暂停状态';
     else if (account.status === 'deleted') reason = '该账号已删除';
     else if (account.status === 'running') reason = '账号正在登录';
@@ -1450,10 +1453,21 @@ async function importHistoryAccounts(ids, { waitForCompletion = false } = {}) {
             historyBatchSummary = `正在提交导入：${submitted} / ${uniqueIDs.length}，已受理 ${accepted} 个`;
             renderHistory();
         }
-        if (accepted && waitForCompletion) {
-            const outcome = await waitForImportCompletion(acceptedIDsForWait);
+        if (waitForCompletion && accepted) {
+            const outcome = await waitForImportCompletion(acceptedIDsForWait, 90000, {
+                total: uniqueIDs.length,
+                initialFailed: uniqueIDs.length - accepted
+            });
             historyBatchSummary = outcome.pending ? `已受理 ${accepted} 个；${outcome.message}`
                 : `Sub2 导入完成：成功 ${outcome.success} 个${outcome.failed ? `，失败 ${outcome.failed} 个` : ''}。`;
+        } else if (waitForCompletion) {
+            batchImportProgress = {
+                total: uniqueIDs.length, done: uniqueIDs.length, success: 0,
+                failed: uniqueIDs.length, pending: 0, running: false,
+                error: true, message: '没有账号被 Sub2 受理'
+            };
+            renderBatchImportStatus();
+            historyBatchSummary = `没有账号被 Sub2 受理；${uniqueIDs.length} 个未受理，已保留选中。`;
         } else {
             historyBatchSummary = accepted
                 ? `已加入 Sub2 导入队列 ${accepted} 个${uniqueIDs.length > accepted ? `；${uniqueIDs.length - accepted} 个未受理，已保留选中` : ''}。`
@@ -1461,6 +1475,19 @@ async function importHistoryAccounts(ids, { waitForCompletion = false } = {}) {
         }
     } catch (error) {
         historyBatchSummary = `已受理 ${accepted} 个；其余选中账号已保留。${error.message || '提交导入失败，请刷新后核对'}`;
+        if (waitForCompletion) {
+            batchImportProgress = {
+                total: uniqueIDs.length,
+                done: uniqueIDs.length - accepted,
+                success: 0,
+                failed: uniqueIDs.length - accepted,
+                pending: accepted,
+                running: false,
+                error: true,
+                message: error.message || '提交导入失败，请刷新后核对'
+            };
+            renderBatchImportStatus();
+        }
     } finally {
         await loadHistory();
         historyBatchRunning = false;
@@ -1491,15 +1518,30 @@ async function importLoginResultsToSub2() {
     try {
         await loadHistory();
         if (historyLoadError) {
-            window.alert('账号历史读取失败，请刷新后重试');
+            const message = '账号历史读取失败，请刷新后重试';
+            historyBatchSummary = message;
+            batchImportProgress = { total: results.length, done: 0, success: 0, failed: 0,
+                pending: results.length, running: false, error: true, message };
+            renderBatchImportStatus();
+            window.alert(message);
             return;
         }
         if (!historySub2Configured) {
-            window.alert('Sub2 未配置，请先设置服务端 SUB2API_BASE_URL 和 SUB2API_ADMIN_API_KEY');
+            const message = 'Sub2 未配置，请先设置服务端 SUB2API_BASE_URL 和 SUB2API_ADMIN_API_KEY';
+            historyBatchSummary = message;
+            batchImportProgress = { total: results.length, done: 0, success: 0, failed: 0,
+                pending: results.length, running: false, error: true, message };
+            renderBatchImportStatus();
+            window.alert(message);
             return;
         }
         if (!historyImportsAvailable) {
-            window.alert('导入状态读取失败，请刷新后重试');
+            const message = '导入状态读取失败，请刷新后重试';
+            historyBatchSummary = message;
+            batchImportProgress = { total: results.length, done: 0, success: 0, failed: 0,
+                pending: results.length, running: false, error: true, message };
+            renderBatchImportStatus();
+            window.alert(message);
             return;
         }
 
@@ -1515,7 +1557,12 @@ async function importLoginResultsToSub2() {
             }
         });
         if (!ids.length) {
-            window.alert('没有可导入的批量登录成功账号，可能已经导入 Sub2 或状态尚未可用');
+            const message = '没有可导入的批量登录成功账号，可能已经导入 Sub2 或状态尚未可用';
+            historyBatchSummary = message;
+            batchImportProgress = { total: results.length, done: results.length, success: 0, failed: results.length,
+                pending: 0, running: false, error: true, message };
+            renderBatchImportStatus();
+            window.alert(message);
             return;
         }
         const skipped = results.length - ids.length;
@@ -1876,29 +1923,40 @@ function renderBatchImportStatus() {
     }
     const p = batchImportProgress;
     const terminal = p.failed === 0 && p.pending === 0;
-    const prefix = p.running ? '正在同步到 Sub2' : terminal ? 'Sub2 导入完成' : p.failed ? 'Sub2 导入部分失败' : 'Sub2 导入仍在处理';
+    const prefix = p.error ? 'Sub2 导入未完成' : p.running ? '正在同步到 Sub2' : terminal ? 'Sub2 导入完成' : p.failed ? 'Sub2 导入部分失败' : 'Sub2 导入仍在处理';
     batchImportStatus.textContent = `${prefix}：${p.done} / ${p.total}，成功 ${p.success}，${p.failed ? `失败 ${p.failed}` : '失败 0'}${p.pending ? `，处理中 ${p.pending}` : ''}${p.message ? ` · ${p.message}` : ''}`;
     batchImportStatus.hidden = false;
 }
 
-async function waitForImportCompletion(ids, timeoutMs = 90000) {
+async function waitForImportCompletion(ids, timeoutMs = 90000, { total = ids.length, initialFailed = 0 } = {}) {
     const wanted = new Set(ids.map(String));
     const started = Date.now();
     let last = null;
     while (Date.now() - started < timeoutMs) {
         await loadHistory();
+        if (historyLoadError) {
+            last = { total, done: initialFailed, success: 0, failed: initialFailed,
+                pending: wanted.size, running: false, error: true,
+                message: '历史读取失败，请刷新后重试' };
+            batchImportProgress = last;
+            renderBatchImportStatus();
+            return last;
+        }
         const states = [...wanted].map(id => String(historyImports.get(id)?.state || 'unknown').toLowerCase());
         const terminal = states.filter(state => ['imported', 'completed', 'failed', 'error', 'rejected'].includes(state));
         const success = terminal.filter(state => ['imported', 'completed'].includes(state)).length;
         const failed = terminal.filter(state => ['failed', 'error', 'rejected'].includes(state)).length;
         const pending = states.length - terminal.length;
-        last = { total: states.length, done: terminal.length, success, failed, pending, running: pending > 0 };
+        last = { total, done: initialFailed + terminal.length, success, failed: initialFailed + failed,
+            pending, running: pending > 0 };
         batchImportProgress = last;
         renderBatchImportStatus();
         if (!pending) return last;
         await new Promise(resolve => setTimeout(resolve, 2500));
     }
-    const result = last || { total: ids.length, done: 0, success: 0, failed: 0, pending: ids.length, running: false };
+    const result = last || { total, done: initialFailed, success: 0, failed: initialFailed,
+        pending: wanted.size, running: false };
+    result.running = false;
     result.message = '部分任务仍在队列中，请稍后刷新历史';
     batchImportProgress = result;
     renderBatchImportStatus();

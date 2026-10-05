@@ -439,11 +439,11 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		s.fail(task.ID, store.RecoveryFailed, "Sub2 账号已被禁用，停止恢复")
 		return
 	}
-	if status, _ := detail["status"].(string); strings.EqualFold(status, "active") && task.OriginalSchedulable && task.ResultCredentialAttemptID == 0 {
-		s.fail(task.ID, store.RecoveryCanceled, "Sub2 已恢复正常或转为人工暂停，停止重新登录")
+	scheduled, ok := boolField(detail, "schedulable")
+	if status, _ := detail["status"].(string); strings.EqualFold(strings.TrimSpace(status), "active") && !scheduled && task.OriginalSchedulable && task.ResultCredentialAttemptID == 0 {
+		s.fail(task.ID, store.RecoveryCanceled, "Sub2 已转为人工暂停，停止重新登录")
 		return
 	}
-	scheduled, ok := boolField(detail, "schedulable")
 	// A Sub2 account in error is commonly auto-paused before AUTH starts the
 	// recovery task. In that case the desired post-recovery state is true even
 	// though the current state is false. A manually paused active account keeps

@@ -97,6 +97,35 @@ func sub2RecoverySuspect(status sub2AccountStatus) bool {
 	return status.Imported && status.Exists && !status.Unknown && !status.Stale && strings.EqualFold(status.Status, "error") && status.Schedulable != nil
 }
 
+func sub2RecoveryPoolCandidate(status sub2AccountStatus) bool {
+	if !status.Imported || !status.Exists || status.Unknown || status.Stale || status.Schedulable == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(status.Status), "error") {
+		return true
+	}
+	// An active account may still have an expired AUTH-local credential. The
+	// check result must prove that failure before the account can be recovered;
+	// the raw Sub2 status alone never triggers this path.
+	return strings.EqualFold(strings.TrimSpace(status.Status), "active") && *status.Schedulable
+}
+
+func accountCheckRecoveryCandidate(check *store.AccountCheck) bool {
+	if check == nil || check.State != "finished" || check.Freshness != "current" {
+		return false
+	}
+	if check.HTTPStatus != nil && *check.HTTPStatus == http.StatusUnauthorized {
+		return true
+	}
+	for _, value := range []string{check.Outcome, check.ErrorCode, check.StreamErrorCode} {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "credential_missing", "credential_incomplete", "access_token_expired", "token_expired", "token_revoked", "credential_revoked", "unauthorized", "auth_failed", "authentication_failed":
+			return true
+		}
+	}
+	return false
+}
+
 func (s *sub2RecoveryService) scanSub2Accounts() {
 	if !s.configured() || !s.autoRecovery.Load() || s.ctx.Err() != nil {
 		return
@@ -131,6 +160,7 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 		return
 	}
 	ids := make([]int64, 0, len(statuses))
+	direct := make([]int64, 0)
 	unknown := 0
 	for id, status := range statuses {
 		if status.Unknown || status.Stale {
@@ -138,9 +168,12 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 		}
 		if sub2RecoverySuspect(status) {
 			ids = append(ids, id)
+		} else if sub2RecoveryPoolCandidate(status) && accountCheckRecoveryCandidate(checks[id].LastResult) {
+			direct = append(direct, id)
 		}
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	sort.Slice(direct, func(i, j int) bool { return direct[i] < direct[j] })
 	queued, waiting, submitted, toCheck := 0, 0, 0, make([]int64, 0)
 	for _, id := range ids {
 		if !s.autoRecovery.Load() || ctx.Err() != nil {
@@ -175,6 +208,26 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 			break
 		}
 	}
+	for _, id := range direct {
+		if !s.autoRecovery.Load() || ctx.Err() != nil {
+			return
+		}
+		allowed, err := s.automaticRecoveryAllowed(ctx, id)
+		if err != nil {
+			lastError = "读取恢复记录失败"
+			return
+		}
+		if !allowed {
+			waiting++
+			continue
+		}
+		if _, _, err := s.enqueue(ctx, id); err == nil {
+			queued++
+		} else {
+			waiting++
+			lastError = "部分账号恢复入队失败，请查看账号检测和恢复详情"
+		}
+	}
 	if len(toCheck) > 0 && s.autoRecovery.Load() {
 		batch, err := s.queueRecoveryChecks(ctx, toCheck, false)
 		if err != nil {
@@ -191,7 +244,7 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 			s.monitorMu.Unlock()
 		}
 	}
-	summary = fmt.Sprintf("Sub2 异常 %d 个，提交检测 %d 个，直接提交恢复 %d 个，等待或冷却 %d 个", len(ids), submitted, queued, waiting)
+	summary = fmt.Sprintf("待恢复账号 %d 个，提交检测 %d 个，直接提交恢复 %d 个，等待或冷却 %d 个", len(ids)+len(direct), submitted, queued, waiting)
 	if unknown > 0 {
 		summary += fmt.Sprintf("；%d 个状态暂时未知", unknown)
 	}
@@ -230,7 +283,7 @@ func (s *sub2RecoveryService) enqueueAutomatic(accountID int64) {
 	if !s.remoteRecoverySuspect(ctx, accountID) {
 		return
 	}
-	if _, _, err := s.enqueue(ctx, accountID, true); err != nil {
+	if _, _, err := s.enqueue(ctx, accountID); err != nil {
 		s.monitorMu.Lock()
 		s.monitorState.LastError = "部分账号自动恢复入队失败，请查看检测与恢复详情"
 		s.monitorMu.Unlock()
@@ -244,7 +297,7 @@ func (s *sub2RecoveryService) remoteRecoverySuspect(ctx context.Context, account
 	}
 	status := s.sub2.sub2AccountStatus(ctx, binding.Sub2AccountID, time.Now().UTC())
 	status.Imported = true
-	return sub2RecoverySuspect(status)
+	return sub2RecoveryPoolCandidate(status)
 }
 
 func (s *sub2RecoveryService) recordRecoveryEnqueueFailure(accountID int64) {

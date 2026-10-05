@@ -233,7 +233,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.equal(run('historyRefreshDelay()'), 5000, 'active tasks are refreshed promptly');
     await run("checkAndRecoverHistory('2')");
     assert.equal(requests.filter(item => item.url === '/api/account-recovery/check').length, 1, 'duplicate clicks during checking do not submit again');
-    checks[2] = { latest_task: { id: 10, state: 'finished' }, last_result: { id: 10, state: 'finished', outcome: 'unauthorized', http_status: 401 } };
+    checks[2] = { latest_task: { id: 10, state: 'finished' }, last_result: { id: 10, state: 'finished', outcome: 'unauthorized', http_status: 401, freshness: 'current' } };
     recoveries[2] = { state: 'logging_in', updated_at: '2026-10-05T11:00:00Z' };
     await click('refreshHistoryBtn');
     assert.match(el('historyGrid').innerHTML, /HTTP 401/);
@@ -245,13 +245,17 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.match(el('historyGrid').innerHTML, /Sub2 正常 · 本地凭据失效待处理/);
     assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), false,
         'an AUTH 401 keeps recovery available when Sub2 is healthy');
+    checks[2].last_result = { outcome: 'error', error_code: 'credential_missing', freshness: 'current' };
+    await click('refreshHistoryBtn');
+    assert.match(el('historyGrid').innerHTML, /本地凭据失效待处理/);
+    checks[2].last_result = { outcome: 'unauthorized', http_status: 401, freshness: 'current' };
     sub2Statuses[2] = { ...sub2Statuses[2], rate_limit_reset_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(), effective_schedulable: false };
     await click('refreshHistoryBtn');
     assert.match(el('historyGrid').innerHTML, /Sub2 限流至/);
     assert.match(el('historyGrid').innerHTML, /暂不可调度/);
     assert.match(el('historyGrid').innerHTML, /本地凭据失效待处理/);
-    assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), true,
-        'a future Sub2 rate-limit window blocks immediate recovery');
+    assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), false,
+        'a confirmed AUTH 401 keeps immediate recovery available during a Sub2 cooldown');
     checks[2].eligible = true;
     run("historySelectedIDs.clear(); window.AccountChecks = { startMany: async ids => { globalThis.immediateCheckIDs = ids; return true; } }");
     rows = [{ id: 2, email: 'account002@example.test', status: 'active' }];
@@ -468,6 +472,33 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.deepEqual(resultImports.map(item => JSON.parse(item.options.body).account_ids), [[2001]]);
     assert.match(el('batchImportStatus').textContent, /Sub2 导入完成：1 \/ 1，成功 1/);
     assert.match(confirmations.at(-1), /另有 1 个结果/);
+    // A submission that accepts nothing must settle the visible login status.
+    imports = [];
+    acceptedImportIDs = new Set();
+    await run('importLoginResultsToSub2()');
+    assert.equal(run('batchImportProgress.running'), false, 'zero accepted imports must not remain running');
+    assert.equal(el('batchImportStatus').hidden, false, 'import feedback remains visible on the login panel');
+    assert.match(el('batchImportStatus').textContent, /没有账号被 Sub2 受理/);
+    // Accepted and unaccepted IDs are both reflected in the terminal result.
+    rows[1].status = 'active';
+    imports = [];
+    acceptedImportIDs = new Set([2001]);
+    run("results = [{ Email: 'login@example.test' }, { Email: 'skip@example.test' }]");
+    await run('importLoginResultsToSub2()');
+    assert.equal(run('batchImportProgress.running'), false, 'partial acceptance must settle the import status');
+    assert.match(el('batchImportStatus').textContent, /成功 1，失败 1/);
+    // A history read failure must not reuse a previous terminal import state.
+    acceptedImportIDs = null;
+    historyFailure = true;
+    await run('importLoginResultsToSub2()');
+    assert.equal(run('batchImportProgress.running'), false, 'history read failure must settle the import status');
+    assert.match(el('batchImportStatus').textContent, /账号历史读取失败/);
+    historyFailure = false;
+    // Polling timeout returns a non-running pending result for later refresh.
+    imports = [{ account_id: 2001, state: 'queued' }];
+    const timedOutImport = await run('waitForImportCompletion(["2001"], 0)');
+    assert.equal(timedOutImport.running, false, 'poll timeout must clear running');
+    assert.equal(timedOutImport.pending, 1);
     rows = [{ id: 1000, email: 'details@example.test', status: 'active' }];
     imports = []; await click('refreshHistoryBtn');
     // History details keep keyboard focus inside the dialog and return it to the opener.

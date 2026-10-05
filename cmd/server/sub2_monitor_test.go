@@ -111,6 +111,14 @@ func TestSub2MonitorSkipsDisabledHealthyAndPausedAccounts(t *testing.T) {
 			t.Fatalf("unsafe candidate %+v", status)
 		}
 	}
+	active := true
+	if !sub2RecoveryPoolCandidate(sub2AccountStatus{Imported: true, Exists: true, Status: "active", Schedulable: &active}) {
+		t.Fatal("active schedulable account should be eligible only after an AUTH 401 result")
+	}
+	paused := false
+	if sub2RecoveryPoolCandidate(sub2AccountStatus{Imported: true, Exists: true, Status: "active", Schedulable: &paused}) {
+		t.Fatal("active manually paused account became a recovery candidate")
+	}
 }
 
 func TestSub2MonitorReusesFresh401AndHonorsFailureCooldown(t *testing.T) {
@@ -134,6 +142,42 @@ func TestSub2MonitorReusesFresh401AndHonorsFailureCooldown(t *testing.T) {
 	checks, err := f.store.ListAccountChecks(context.Background(), f.account.ID, 20)
 	if err != nil || len(checks) != 1 {
 		t.Fatalf("unnecessary repeated AUTH checks=%d err=%v", len(checks), err)
+	}
+}
+
+func TestSub2MonitorQueuesActiveAccountWithCurrent401(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.detailStatus = "active"
+	if _, err := f.db.Exec(`DELETE FROM account_recovery_tasks`); err != nil {
+		t.Fatal(err)
+	}
+	f.service.autoRecovery.Store(true)
+	f.service.scanSub2Accounts()
+	task, active, err := f.store.GetActiveAccountRecoveryTask(context.Background(), f.account.ID)
+	if err != nil || !active {
+		t.Fatalf("active 401 was not queued: active=%v err=%v", active, err)
+	}
+	f.service.process(task)
+	if got, err := f.store.GetAccountRecoveryTaskByID(context.Background(), task.ID); err != nil || got.State != store.RecoveryCompleted {
+		t.Fatalf("recovery=%+v err=%v", got, err)
+	}
+}
+
+func TestSub2AutomaticCheckEnqueuesActiveAccountWith401(t *testing.T) {
+	f := newMonitorFixture(t)
+	f.detailStatus, f.schedule = "active", true
+	f.service.autoRecovery.Store(true)
+	batch, err := f.service.queueRecoveryChecks(context.Background(), []int64{f.account.ID}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	work, err := f.store.ClaimAccountCheck(context.Background())
+	if err != nil || work == nil || work.Batch.ID != batch.ID {
+		t.Fatalf("check work=%+v err=%v", work, err)
+	}
+	f.service.checker.process(work)
+	if _, active, err := f.store.GetActiveAccountRecoveryTask(context.Background(), f.account.ID); err != nil || !active {
+		t.Fatalf("active 401 check did not enqueue recovery: active=%v err=%v", active, err)
 	}
 }
 
@@ -237,10 +281,35 @@ func TestSub2RecoveryStopsIfAccountBecomesHealthyOrManuallyPaused(t *testing.T) 
 	for _, schedulable := range []bool{true, false} {
 		f := newRecoveryFixture(t, false)
 		f.detailStatus, f.schedule = "active", schedulable
-		f.service.process(f.task)
-		if f.state(t).State != store.RecoveryCanceled || f.loginCalls != 0 || f.applyCalls != 0 || f.schedule != schedulable {
-			t.Fatalf("changed account was recovered: schedule=%v", schedulable)
+		if _, err := f.db.Exec(`UPDATE account_checks SET outcome='ok', error_code='', stream_error_code='', http_status=NULL WHERE account_id=?`, f.account.ID); err != nil {
+			t.Fatal(err)
 		}
+		f.service.process(f.task)
+		got := f.state(t)
+		if got.State != store.RecoveryFailed || f.loginCalls != 0 || f.applyCalls != 0 || f.schedule != schedulable {
+			t.Fatalf("changed account was recovered: task=%+v login=%d apply=%d schedule=%v", got, f.loginCalls, f.applyCalls, f.schedule)
+		}
+	}
+}
+
+func TestSub2RecoveryAllowsActiveAccountWithCurrent401(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.detailStatus = "active"
+	f.service.process(f.task)
+	if got := f.state(t); got.State != store.RecoveryCompleted {
+		t.Fatalf("state=%s error=%q", got.State, got.LastError)
+	}
+	if f.loginCalls != 1 || f.applyCalls != 1 || !f.schedule {
+		t.Fatalf("active 401 was not recovered: login=%d apply=%d schedule=%v", f.loginCalls, f.applyCalls, f.schedule)
+	}
+}
+
+func TestSub2RecoveryDoesNotReopenActiveManualPause(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.detailStatus, f.schedule = "active", false
+	f.service.process(f.task)
+	if got := f.state(t); got.State != store.RecoveryCanceled || f.loginCalls != 0 || f.applyCalls != 0 || f.schedule {
+		t.Fatalf("manual pause was reopened: task=%+v login=%d apply=%d schedule=%v", got, f.loginCalls, f.applyCalls, f.schedule)
 	}
 }
 

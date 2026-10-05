@@ -4,16 +4,16 @@
 
 ## 当前结论
 
-项目源码在 `/Users/tokk/Desktop/KKAI_AUTH`。外部账号关联、历史恢复入口、后台 60 秒巡检及无本地令牌恢复已部署到 sys1（`20261005T035610Z-sub2-monitor-complete`）；Sub2 源码和线上版本未改。已观察真实自动检测与登录尝试；上游拒绝登录的账号明确显示失败，不作为恢复成功。完整证据见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。
+项目源码在 `/Users/tokk/Desktop/KKAI_AUTH`。批量导入终态展示、Sub2 状态字段展示、历史页立即检测及账号检测 Tab 保留已部署到 sys1（`20261005T105500Z-sub2-status-ui`，commit `9a08749`）；回滚为 `20261005T035610Z-sub2-monitor-complete`。Sub2 源码和线上版本未改。已观察真实 AUTH 检测与 Sub2 状态，完整证据见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。
 
 ## 本轮批量导入与状态展示变更（2026-10-05）
 
-以下记录本轮工作区新增行为；sys1 是否已切换到包含这些改动的 release，以 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md) 当前 release 和验收记录为准。
+以下行为已随 `20261005T105500Z-sub2-status-ui` 上线。
 
 - 从批量登录结果导入 Sub2 时，前端等待已受理任务进入终态，并持续显示总数、已完成数、成功数、失败数和仍在队列中的数量；超时仍明确标记为待核对，不把“已受理”当作成功。
 - 新建 Sub2 账号名称统一为 `AUTH_MMDDHHmm_email`（服务端使用 Asia/Shanghai 时间）；来源仍通过独立来源标记和账号身份核对确认。
 - AUTH 检测的 HTTP 401 与 Sub2 返回的凭据/调度状态分开记录。Sub2 显示正常而 AUTH 当前凭据返回 401 时，历史行同时保留两条证据并显示“本地凭据失效待处理”，恢复入口仍可用。
-- Sub2 状态同步保留原始 `schedulable` 和 `effective_schedulable`，以有效字段显示当前可调度性，并展示未来限流、过载、临时暂停的截止时间和原因；这些运行时窗口会阻止不适合的自动恢复。
+- Sub2 状态同步保留原始 `schedulable` 和 `effective_schedulable`，以有效字段显示当前可调度性，并展示未来限流、过载、临时暂停的截止时间和原因；仍在池中且未人工暂停的账号，只有 AUTH 当前确认 401/凭据失效后才进入恢复。
 - 历史页增加“立即检测”快捷入口，可对当前筛选或所选的已关联账号提交检测；任务详情、批量进度和单账号详情继续在“账号检测”Tab 查看。
 - “账号检测”Tab 保留批量选择、分页、并发控制和详情/恢复操作，历史页快捷入口不替代原有批量与详情页面。
 
@@ -29,21 +29,32 @@
 | 服务 | `openai-login.service` |
 | sys1 本机监听 | `127.0.0.1:18082` |
 | Mac 隧道 | `./open-sys1.sh` |
-| 当前 release | `20261005T035610Z-sub2-monitor-complete` |
-| 回滚 release | `20261005T033000Z-sub2-monitor-link` |
+| 当前 release | `20261005T105500Z-sub2-status-ui` |
+| 回滚 release | `20261005T035610Z-sub2-monitor-complete` |
+| 当前 commit | `9a08749` |
 | 数据库 | `/var/lib/openai-login/data/accounts.db` |
 | 密钥 | `/var/lib/openai-login/data/accounts.key` |
-| 最近健康检查 | 2026-10-05 04:08:56 UTC：active/running，NRestarts=0，健康正常，回滚就绪 |
-| 发布前备份 | `/var/lib/openai-login/backups/accounts-before-20261005T035610Z-sub2-monitor-complete.db`，0600，`integrity_check=ok` |
-| 当前二进制 SHA-256 | `601b43cfd4b7ff567571bb27cfbbdeb0ab107f40125337c39a6a863d2de3f522` |
+| 最近健康检查 | 发布后复核：active/running，NRestarts=0，`/health` 返回 `status: ok`、`max_concurrent: 10`，回滚就绪 |
+| 发布前备份 | 当前 release 发布前已按流程保留并通过 `integrity_check`；备份路径不在本摘要中展开 |
+| 当前二进制 SHA-256 | `5bcd2aaa1c82efa35428172c95ded6a6f592e846d7639263403ed129bc5c6462` |
 | 导入配置 | `sub2_configured=true`；使用 Sub2 既有接口，Sub2 源码和线上版本未改 |
 | 公网身份验证 | 有效入口 Unix socket 健康通过，公网未认证 HTTP 401；未验证认证后公网业务 |
-| 本轮功能与 OAuth 验收 | 后台扫描与真实 AUTH 重登已发生；4 个账号被上游拒绝（account_deactivated/403）；成功恢复链路有集成 fixture 验证 |
-| 自动恢复设置 | 开启并保存到 SQLite，立即及每 60 秒后台扫描，页面关闭后继续 |
+| 本轮功能与 OAuth 验收 | 新 UI 与状态同步已上线；117/118/119 均观察到 AUTH HTTP 401，同时 Sub2 有未来限流窗口，未将其计为恢复成功 |
+| 自动恢复设置 | 候选验证时关闭；生产 SQLite 开关保持开启，立即及每 60 秒后台扫描，页面关闭后继续 |
+| 线上快照 | history 31、imports 27、statuses 31 |
 | sys1 IPv4 模型检测（历史） | 此前真实 HTTP200 / 完整模型完成事件，1,982ms |
 | 默认代理模型检测（历史） | 此前单账号连续两次成功；候选两个账号并发2正常，重叠3,035ms |
 | 浏览器直连历史限制 | 授权流程曾收到 `403 + cf-mitigated: challenge`；不可将该浏览器结论套用到模型检测 |
 | sys1 默认代理 | 节点 `45.39.200.204:7269`；此前完整 OAuth 登录 18.93 秒、模型检测通过，本轮未重测 |
+
+## `20261005T105500Z-sub2-status-ui` 发布验收
+
+- release commit：`9a08749`；Linux amd64 二进制 SHA-256：`5bcd2aaa1c82efa35428172c95ded6a6f592e846d7639263403ed129bc5c6462`。
+- 发布后服务保持 `active/running`、`NRestarts=0`，`/health` 返回 `status: ok`、`max_concurrent: 10`；回滚 release `20261005T035610Z-sub2-monitor-complete` 保留可用。
+- 有效入口 Unix socket 健康检查通过，公网未认证请求返回 HTTP 401；这只证明入口保护和本机链路，不代表认证后业务验收。
+- 候选验证显式关闭自动恢复；切换生产后 SQLite 中的自动恢复开关保持开启，立即扫描和每 60 秒后台巡检继续运行。
+- 生产状态快照为 history 31、imports 27、statuses 31。账号 117、118、119 均同时出现 AUTH HTTP 401 与 Sub2 未来限流窗口，页面保留两条独立证据；未人工暂停的账号仍可按 AUTH 401 进入恢复，Sub2 限流只会影响后续探测和调度恢复确认。
+- 本轮上线事实包括批量登录导入等待并展示终态、`AUTH_MMDDHHmm_email` 名称、`schedulable`/`effective_schedulable` 与限流/过载/临时暂停展示、历史页立即检测，以及保留账号检测 Tab 的批量/详情入口。
 
 ## 目前已实现
 
@@ -56,7 +67,7 @@
 - 认证成功的历史账号及批量登录结果可从页面导入 Sub2 未分组；批量登录导入等待并展示任务终态，名称采用 `AUTH_MMDDHHmm_email`，任务状态持久化并通过来源标记回查确认。
 - 外部导入的 Sub2 账号按凭据邮箱和已知工作区自动关联；唯一匹配持久化，不重新导入。歧义、身份冲突、查询失败显示具体原因。
 - 历史行提供“检测并恢复”和断点“继续恢复”，显示 AUTH 检测、重新登录、凭据写回、调度恢复及失败原因；普通“重新登录”只更新 AUTH。
-- 自动恢复开关保存到 SQLite，开启立即扫描，此后每 60 秒在服务器运行，关闭页面后继续。仅检查 Sub2 异常账号；确认 401/失效/缺少本地凭据后直接 AUTH 登录，不走 RT 优先路径。缺少本地工作区时以 Sub2 身份核对新凭据。
+- 自动恢复开关保存到 SQLite，开启立即扫描，此后每 60 秒在服务器运行，关闭页面后继续。仍在 Sub2 池中且未人工暂停的账号，确认 401/失效/缺少本地凭据后直接 AUTH 登录，不走 RT 优先路径；Sub2 `status=error` 或 `schedulable=false` 不单独证明 401。缺少本地工作区时以 Sub2 身份核对新凭据。
 - 正常、禁用、删除、未知、正常但人工暂停的账号跳过。任务去重，自动恢复结束后冷却 30 分钟，同一凭据版本 24 小时内失败 3 次暂停自动重试。
 - 页面进行中每 5 秒刷新，自动开启且空闲时每 60 秒，关闭且空闲时每 5 分钟；显示上下次巡检与结果摘要。
 - HTTP 代理输入、代理测试和错误分类。
@@ -101,7 +112,7 @@ go vet ./cmd/server ./internal/store
 node --check cmd/server/client.js
 node cmd/server/client.test.cjs
 node cmd/server/account-checks.test.cjs
-./build-linux.sh /tmp/openai-login-web-20261005T035610Z-sub2-monitor-complete
+./build-linux.sh /tmp/openai-login-web-20261005T105500Z-sub2-status-ui
 git diff --check
 ```
 

@@ -24,14 +24,17 @@
 - 线上入口：`https://auth.kkrich.ltd`
 - Mac 通过 `./open-sys1.sh` 建立 SSH 隧道，浏览器访问 `http://127.0.0.1:18082`
 - sys1 本机服务只监听 `127.0.0.1:18082`
-- 当前 release：`20261005T035610Z-sub2-monitor-complete`
-- 回滚 release：`20261005T033000Z-sub2-monitor-link`
+- 当前 release：`20261005T105500Z-sub2-status-ui`
+- 当前 commit：`9a08749`
+- 当前二进制 SHA-256：`5bcd2aaa1c82efa35428172c95ded6a6f592e846d7639263403ed129bc5c6462`
+- 回滚 release：`20261005T035610Z-sub2-monitor-complete`
 - 数据库和密钥在 `/var/lib/openai-login/data/`，不放在 release 目录
-- 最近一次核验服务为 `active`、`NRestarts=0`，`/health` 返回 `status: ok`、`max_concurrent: 10`
+- 最近一次核验服务为 `active`、`NRestarts=0`，`/health` 返回 `status: ok`、`max_concurrent: 10`；有效入口 Unix socket 健康通过，公网未认证返回 HTTP 401，回滚 release 保留可用
 - AUTH → Sub2 导入已上线，线上 `/api/history` 已确认 `sub2_configured=true`；使用 Sub2 既有接口，Sub2 源码和线上版本未改。
-- 已补充外部账号关联、历史“检测并恢复”、后台立即及每 60 秒巡检；开关持久化并保留用户当前开启选择。仅对 Sub2 异常账号检测，确认凭据问题后直接 AUTH 登录、写回原账号并验证调度。
-- 本轮自动扫描与真实登录尝试已发生；上游返回停用/删除的账号保持暂停，页面显示具体失败，不能将尝试计为成功恢复。原截图三个新导入账号当前正常可调度。
-- 最终版本于 2026-10-05 04:02:18 UTC 发布，健康、真实结果、回滚与验证范围详见 [部署记录](SYS1_DEPLOYMENT.md)。
+- 已补充外部账号关联、历史“检测并恢复”、后台立即及每 60 秒巡检；开关持久化并保留用户当前开启选择。仍在 Sub2 池中且未人工暂停的账号，只有 AUTH 当前确认凭据问题后才直接登录、写回原账号并验证调度；Sub2 异常状态本身不单独触发恢复。
+- 候选验证时自动恢复关闭，生产 SQLite 开关保持开启；线上快照为 history 31、imports 27、statuses 31。
+- 账号 117/118/119 均观察到 AUTH HTTP 401 与 Sub2 未来限流窗口；页面同时保留两套状态，不将其计为成功恢复。
+- `20261005T105500Z-sub2-status-ui` 已上线批量导入终态展示、Sub2 状态字段/运行时窗口展示、历史页立即检测和账号检测 Tab 保留；健康、真实结果、回滚与验证范围详见 [部署记录](SYS1_DEPLOYMENT.md)。
 - AUTH 账号检测已上线；sys1 IPv4 直连与默认代理模型请求均成功，候选并发 2 的两个请求重叠约 3 秒；正式版正确区分正常与真实 429 额度不足。浏览器 OAuth 登录与模型检测的证据不可混用。
 - 历史浏览器 OAuth 验收：sys1 IPv4 直连授权请求在输入邮箱前返回 `403 + cf-mitigated: challenge`；此前 7275 认证代理真实账号验收连续 4 次成功并完成 token 交换；当前默认代理为 `45.39.200.204:7269`，最近代理检查可达
 
@@ -43,7 +46,7 @@
 - Sub2 状态同步读取并保留 `schedulable`、`effective_schedulable`，并展示限流、过载、临时暂停的时间窗口/原因。
 - 历史页新增“立即检测”快捷入口；“账号检测”Tab 继续保留批量检测、进度和单账号详情/恢复，作为完整检测页面。
 
-本节描述当前工作区行为；线上是否已切换由 `SYS1_DEPLOYMENT.md` 当前 release 和验收记录决定。
+本节描述当前线上行为；线上 release、健康与验收事实以 `SYS1_DEPLOYMENT.md` 为准。
 
 ## 文档优先级
 
