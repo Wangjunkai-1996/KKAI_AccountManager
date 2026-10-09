@@ -4,6 +4,14 @@
 
 > 这是 sys1 线上事实的唯一权威文档。新对话先读取 `DOCS_INDEX.md` 和 `NEW_CHAT_CONTEXT.md`，发生冲突时以本文的服务、端口、release、健康检查和验收结论为准。
 
+## 浏览器 challenge 自动重试发布（2026-10-10）
+
+- 切换时间 `2026-10-09T16:04:39Z`，release `20261009T155200Z-challenge-retry`，源码 `b6809f0dd2ac00893319f392e3395e2477a860f6`，Linux amd64 二进制 SHA-256：`ed2e4565641acc794c4a6057244e1832a98f2a599f098cfdc3e2c530f56b72b5`。
+- 初始导航、邮箱/密码表单和 OAuth 回调阶段遇到 Cloudflare challenge 时，当前浏览器最多等待 25 秒；未通过则按 `RetryCount`、有界退避和 3 分钟总超时重新创建浏览器。账号删除/停用、地区限制和普通 4xx 仍保持终止，HTTP 状态和 `retry_wait` 进度保留。
+- 候选隔离数据库 86 个账号，自动恢复关闭、Sub2 未配置；候选 health、静态 hash、数据库完整性、Node/driver 和回滚兼容通过。发布前备份 `/var/lib/openai-login/backups/accounts-before-20261009T155200Z-challenge-retry.db`（2,363,392 字节、0600、`integrity_check=ok`）。
+- 即时验收通过；延迟验收 `2026-10-09T16:06:16Z` 确认 active/running、`NRestarts=0`、自动恢复首轮扫描推进、有效路由为 `/run/tls/auth/login.sock`、公网未认证 HTTP 401，启动以来 panic/fatal/数据库锁/存储/监听/OAuth 401/403/5xx 聚合均为 0。回滚保留 `20261009T054200Z-recovery-final`。本轮未手动触发真实 OAuth。
+- 定向验证：`go test ./internal/login -count=1`、`go test -race ./internal/login -count=1`、`go test ./cmd/server -count=1`、`go vet ./internal/login ./cmd/server`、`git diff --check`；未运行仓库完整套件。
+
 ## 八项审查修复最终发布（2026-10-09 13:44:42 上海时间）
 
 - 最终切换时间 `2026-10-09T05:44:42Z`（上海时间 13:44:42），release `20261009T054200Z-recovery-final`。源码 `53bde86f241f9050dda95e5887872621f4882921`，Mac 干净工作区构建，已通过本地 Clash 代理推送 `origin/main`。二进制 SHA-256：`1f8cab2c57223d111797023e9f54074c8d7f9641f4eda6bf29e11cb9a315cbe7`。

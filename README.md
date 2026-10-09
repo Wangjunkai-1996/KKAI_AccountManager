@@ -4,6 +4,12 @@
 
 > 新对话请先读取 `DOCS_INDEX.md`、`NEW_CHAT_CONTEXT.md` 和 `SYS1_DEPLOYMENT.md`。当前 sys1 已部署 `openai-login.service`；服务健康不等于真实 OAuth 或账号恢复链路验收通过。
 
+## 浏览器 challenge 自动重试发布（2026-10-10）
+
+`20261009T155200Z-challenge-retry` 已上线，源码基线为 `b6809f0`，Linux amd64 二进制 SHA-256 为 `ed2e4565641acc794c4a6057244e1832a98f2a599f098cfdc3e2c530f56b72b5`。初始导航、邮箱/密码表单和 OAuth 回调阶段遇到 Cloudflare challenge 时，当前浏览器最多等待 25 秒；验证仍未通过则按 `RetryCount`、退避和 3 分钟总超时重新创建浏览器。账号删除/停用、地区限制和普通 4xx 仍立即停止。
+
+16:04:39 UTC 切换后即时健康、静态资源、Unix socket 和数据库完整性通过；16:06:16 UTC 延迟验收确认服务 `active/running`、`NRestarts=0`、自动恢复首轮巡检推进、启动后 panic/fatal/数据库锁/存储/监听/OAuth 401/403/5xx 聚合为 0。回滚保留 `20261009T054200Z-recovery-final`，发布前备份为 `/var/lib/openai-login/backups/accounts-before-20261009T155200Z-challenge-retry.db`。本轮未手动触发真实 OAuth。
+
 ## 八项审查修复（2026-10-09 13:44:42 上海时间）
 
 最终 release `20261009T054200Z-recovery-final`，来自已推送 `origin/main` 的 `53bde86`。修复恢复并发覆盖、临时登录失败重试、Sub2 字符串 401、重启暂停归属、交付熔断、失效分组纠正、重复开始和资料修复轮询。复现已保留为正式回归测试；远端身份标记、人工暂停、凭据版本与导入幂等保护保留。

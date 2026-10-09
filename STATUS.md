@@ -1,6 +1,12 @@
 # KKAI_AUTH 当前状态
 
-更新时间：2026-10-09（Asia/Shanghai）
+更新时间：2026-10-10（Asia/Shanghai）
+
+## 浏览器 challenge 自动重试发布（2026-10-10）
+
+已上线 `20261009T155200Z-challenge-retry`，源码 `b6809f0`，Linux amd64 二进制 SHA-256：`ed2e4565641acc794c4a6057244e1832a98f2a599f098cfdc3e2c530f56b72b5`。Cloudflare challenge 在当前浏览器内最多等待 25 秒，未通过时按 `RetryCount`、退避和总超时重新创建浏览器；账号删除/停用、地区限制和普通 4xx 仍保持终止。
+
+16:04:39 UTC 切换，16:06:16 UTC 延迟验收通过：服务 active/running、`NRestarts=0`、自动恢复首轮扫描推进、错误聚合为 0，路由/静态资源/socket/数据库备份和回滚均核对通过。回滚为 `20261009T054200Z-recovery-final`；本轮未手动触发真实 OAuth。
 
 ## 八项审查修复（2026-10-09 13:44:42 上海时间）
 
