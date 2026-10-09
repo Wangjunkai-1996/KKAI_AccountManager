@@ -94,8 +94,12 @@ func TestAuthChallengeStatusBrowser(t *testing.T) {
 			}
 			started := time.Now()
 			err = waitForAuthSelector(context.Background(), page, selector, time.Minute, challenges, statuses)
-			if elapsed := time.Since(started); elapsed > 2*time.Second {
-				t.Fatalf("auth rejection took %s instead of returning promptly", elapsed)
+			if elapsed := time.Since(started); stage == "email" {
+				if elapsed < 20*time.Second || elapsed > 30*time.Second {
+					t.Fatalf("initial challenge recovery took %s, want bounded 25s wait", elapsed)
+				}
+			} else if elapsed > 2*time.Second {
+				t.Fatalf("form challenge rejection took %s instead of returning promptly", elapsed)
 			}
 			status, ok := AuthHTTPStatus(err)
 			if !ok || status != http.StatusForbidden || !errors.Is(err, ErrCloudflareChallenge) || !strings.Contains(err.Error(), "Cloudflare challenge") {

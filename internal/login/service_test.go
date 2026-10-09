@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -127,6 +129,18 @@ func TestBrowserCompatibilityOptions(t *testing.T) {
 	}
 }
 
+func TestNewServiceRetryCountCanBeExplicitlyDisabled(t *testing.T) {
+	if got := NewService(Config{}).config.RetryCount; got != 2 {
+		t.Fatalf("default retry count = %d, want 2", got)
+	}
+	if got := NewService(Config{RetryCountSet: true}).config.RetryCount; got != 0 {
+		t.Fatalf("explicit zero retry count = %d, want 0", got)
+	}
+	if got := NewService(Config{RetryCount: -1, RetryCountSet: true}).config.RetryCount; got != 0 {
+		t.Fatalf("negative retry count = %d, want clamped zero", got)
+	}
+}
+
 func TestDetectAccessBlockUsesCloudflareResponseSignal(t *testing.T) {
 	challenge := make(chan struct{}, 1)
 	challenge <- struct{}{}
@@ -202,6 +216,107 @@ func TestLoginWithRetriesRetriesCloudflareChallenge(t *testing.T) {
 	}
 }
 
+func TestLoginWithRetriesRetriesTemporaryHTTPFailures(t *testing.T) {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusBadGateway} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			attempts := 0
+			result, err := loginWithRetries(context.Background(), 1, func(context.Context) (*LoginResult, error) {
+				attempts++
+				if attempts == 1 {
+					return nil, &authHTTPStatusError{Status: status, RetryAfter: time.Millisecond}
+				}
+				return &LoginResult{Email: "fixture@example.com"}, nil
+			})
+			if err != nil || result == nil || attempts != 2 {
+				t.Fatalf("loginWithRetries() = %#v, %v; attempts=%d, want retry then success", result, err, attempts)
+			}
+		})
+	}
+}
+
+func TestLoginWithRetriesRetriesClientTimeoutBeforeRequestDeadline(t *testing.T) {
+	attempts := 0
+	result, err := loginWithRetries(context.Background(), 1, func(context.Context) (*LoginResult, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, &url.Error{Op: "Post", URL: oauthToken, Err: context.DeadlineExceeded}
+		}
+		return &LoginResult{Email: "fixture@example.com"}, nil
+	})
+	if err != nil || result == nil || attempts != 2 {
+		t.Fatalf("loginWithRetries() = %#v, %v; attempts=%d, want timeout retry then success", result, err, attempts)
+	}
+}
+
+func TestLoginWithRetriesSharesProxyFallbackBudget(t *testing.T) {
+	budget := &loginRetryBudget{remaining: 2}
+	ctx := context.WithValue(context.Background(), loginRetryBudgetKey{}, budget)
+	attempts := 0
+	_, err := loginWithRetries(ctx, 5, func(context.Context) (*LoginResult, error) {
+		attempts++
+		return nil, &authHTTPStatusError{Status: http.StatusBadGateway, RetryAfter: time.Millisecond}
+	})
+	if err == nil || attempts != 2 || budget.remaining != 0 {
+		t.Fatalf("attempts=%d remaining=%d error=%v, want two total attempts", attempts, budget.remaining, err)
+	}
+}
+
+func TestLoginWithRetriesReturnsDeadlineExceededWhenRetryBudgetIsInsufficient(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	attempts := 0
+	_, err := loginWithRetries(ctx, 1, func(context.Context) (*LoginResult, error) {
+		attempts++
+		return nil, &authHTTPStatusError{Status: http.StatusServiceUnavailable, RetryAfter: 2 * time.Second}
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("loginWithRetries() error = %v, want deadline exceeded", err)
+	}
+	var statusErr *authHTTPStatusError
+	if !errors.As(err, &statusErr) || statusErr.Status != http.StatusServiceUnavailable || statusErr.RetryAfter != 2*time.Second {
+		t.Fatalf("loginWithRetries() lost upstream retry metadata: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
+func TestLoginWithRetriesPreservesFailureWhenCanceledDuringBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first := &authHTTPStatusError{Status: http.StatusServiceUnavailable, RetryAfter: time.Second}
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+	_, err := loginWithRetries(ctx, 1, func(context.Context) (*LoginResult, error) {
+		return nil, first
+	})
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, first) {
+		t.Fatalf("loginWithRetries() error = %v, want cancellation and upstream failure", err)
+	}
+}
+
+func TestLoginWithRetriesHonorsConsumedRetryAfterImmediately(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	attempts := 0
+	started := time.Now()
+	result, err := loginWithRetries(ctx, 1, func(context.Context) (*LoginResult, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, &authHTTPStatusError{Status: http.StatusServiceUnavailable, RetryAfterConsumed: true}
+		}
+		return &LoginResult{Email: "fixture@example.com"}, nil
+	})
+	if err != nil || result == nil || attempts != 2 {
+		t.Fatalf("loginWithRetries() = %#v, %v; attempts=%d, want immediate retry", result, err, attempts)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("consumed Retry-After caused %s delay", elapsed)
+	}
+}
+
 func TestLoginWithRetriesKeepsTerminalFailuresTerminal(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -210,6 +325,31 @@ func TestLoginWithRetriesKeepsTerminalFailuresTerminal(t *testing.T) {
 		{name: "unsupported region", err: ErrUnsupportedRegion},
 		{name: "ordinary forbidden", err: &authHTTPStatusError{Status: http.StatusForbidden}},
 		{name: "deleted account", err: &authHTTPStatusError{Status: http.StatusInternalServerError, UpstreamCode: "account_deleted"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			attempts := 0
+			_, err := loginWithRetries(context.Background(), 2, func(context.Context) (*LoginResult, error) {
+				attempts++
+				return nil, tt.err
+			})
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("error = %v, want %v", err, tt.err)
+			}
+			if attempts != 1 {
+				t.Fatalf("attempts = %d, want 1", attempts)
+			}
+		})
+	}
+}
+
+func TestLoginWithRetriesDoesNotReplayDeterministicFailures(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{name: "oauth rejection", err: &authRejectionError{Code: "invalid_grant", Message: "authorization rejected"}},
+		{name: "identity parse", err: errors.New("JWT payload 解析失败")},
+		{name: "ordinary http 400", err: &authHTTPStatusError{Status: http.StatusBadRequest}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			attempts := 0

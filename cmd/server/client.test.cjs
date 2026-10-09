@@ -924,6 +924,62 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     await click('startBtn');
     assert.equal(requests.filter(item => item.url === '/api/login/stream').length, startRequestsBefore + 2, 'canceling delivery options leaves Start usable');
     assert.equal(run('accounts[0].status'), 'success');
+    // A stalled connection settles without replaying the POST; an established
+    // SSE stream keeps the server's configured login deadline.
+    const savedFetch = context.fetch, savedSetTimeout = context.setTimeout, savedClearTimeout = context.clearTimeout;
+    const connectionTimers = new Map();
+    let connectionTimerID = 0, connectionRequests = 0;
+    context.setTimeout = (callback, delay) => {
+        const id = ++connectionTimerID;
+        connectionTimers.set(id, { callback, delay });
+        return id;
+    };
+    context.clearTimeout = id => connectionTimers.delete(id);
+    run('platformPauseUntil = 0');
+    try {
+        context.fetch = async (_url, options) => {
+            connectionRequests++;
+            return new Promise((_resolve, reject) => {
+                options.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+            });
+        };
+        const stalled = run('loginAccount({email:"timeout@example.test"}, "direct")');
+        assert.equal(connectionTimers.size, 1);
+        const connectionTimer = [...connectionTimers.values()][0];
+        assert.equal(connectionTimer.delay, 15000);
+        connectionTimer.callback();
+        await assert.rejects(stalled, /登录连接超时.*刷新历史/);
+        assert.equal(connectionRequests, 1, 'timeout must not automatically replay an uncertain login POST');
+        assert.equal(connectionTimers.size, 0, 'timeout cleanup releases its timer');
+
+        let streamController, streamSignal;
+        context.fetch = async (_url, options) => {
+            connectionRequests++;
+            streamSignal = options.signal;
+            return { ok: true, headers: new Map([['content-type', 'text/event-stream']]),
+                body: new ReadableStream({ start(controller) { streamController = controller; } }) };
+        };
+        const streaming = run('loginAccount({email:"stream@example.test"}, "direct")');
+        await flush();
+        assert.equal(connectionTimers.size, 0, 'receiving SSE headers clears the connection deadline while login is still pending');
+        assert.equal(streamSignal.aborted, false);
+        streamController.enqueue(new TextEncoder().encode('data: {"type":"result","success":true}\n\n'));
+        streamController.close();
+        assert.equal((await streaming).success, true);
+        assert.equal(connectionRequests, 2);
+
+        context.fetch = async () => {
+            connectionRequests++;
+            throw new TypeError('fixture connection reset');
+        };
+        await assert.rejects(run('loginAccount({email:"reset@example.test"}, "direct")'), /fixture connection reset/);
+        assert.equal(connectionRequests, 3, 'network failure must not automatically replay a login POST');
+        assert.equal(connectionTimers.size, 0, 'network failure releases the connection timer');
+    } finally {
+        context.fetch = savedFetch;
+        context.setTimeout = savedSetTimeout;
+        context.clearTimeout = savedClearTimeout;
+    }
     console.log('History checks passed: Sub2 status/settings, ordinary/cross-page select, cancellation, delete locking/409/404/timeouts/refresh failures, partial/chunked import, relogin retention.');
     console.log('Tab checks passed: selection isolation, navigation, keyboard, focus, hash/back navigation, panel scrolling.');
     console.log('Confirmation checks passed: plain text, cancellation/acceptance for all batch actions, modal focus/Tab/Escape/restore, repeat opens, navigation cancellation, stale-state guards.');
@@ -932,4 +988,5 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     console.log('Delivery parameter and correction checks passed: shared form/default save/failure, unavailable groups, frozen batch settings/retries, empty-secret preservation/explicit clears, delayed recheck notices.');
     console.log('Account prefix checks passed: Unicode/control validation, late defaults, safe summary, default save, automatic batch/retry freezing, login-only independence and manual-import override.');
     console.log('Regression checks passed: double Start during settings load, preparation failure/cancel release, and active/waiting/completed credential repair polling.');
+    console.log('Login connection checks passed: bounded setup, uncertain POST is not replayed, active SSE respects the server deadline, and timers are released.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

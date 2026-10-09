@@ -163,6 +163,7 @@ func main() {
 		Proxy:                *proxy,
 		UpstreamProxy:        *upstreamProxy,
 		RetryCount:           2,
+		RetryCountSet:        true,
 		Timeout:              60 * time.Second,
 		TotalTimeout:         *loginTimeout,
 		BrowserCompatibility: *browserCompat,
@@ -386,11 +387,11 @@ func loginHTTPStatus(err error) int {
 	if errors.Is(err, store.ErrAccountNotFound) {
 		return http.StatusNotFound
 	}
-	if upstreamStatus, ok := login.AuthHTTPStatus(err); ok {
-		return upstreamStatus
-	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return http.StatusGatewayTimeout
+	}
+	if upstreamStatus, ok := login.AuthHTTPStatus(err); ok {
+		return upstreamStatus
 	}
 	if errors.Is(err, context.Canceled) {
 		return http.StatusRequestTimeout

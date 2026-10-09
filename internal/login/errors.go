@@ -91,6 +91,9 @@ func DescribeError(err error) LoginErrorInfo {
 	if errors.Is(err, ErrCloudflareChallenge) {
 		info.Retryable = true
 	}
+	if retryableLoginError(err) {
+		info.Retryable = true
+	}
 	var rejection *authRejectionError
 	if errors.As(err, &rejection) {
 		if code := normalizeAuthCode(rejection.Code); code != "" {

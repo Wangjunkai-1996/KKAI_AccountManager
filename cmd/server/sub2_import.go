@@ -683,8 +683,8 @@ func (s *sub2ImportService) apiJSON(ctx context.Context, method, path string, qu
 	return err
 }
 
-// apiJSONStatus is apiJSON with the HTTP status retained for read-only
-// account snapshots, where 404 (deleted) differs from an unavailable API.
+// apiJSONStatus is apiJSON with the HTTP status retained, where 404 (deleted)
+// differs from an unavailable API.
 func (s *sub2ImportService) apiJSONStatus(ctx context.Context, method, path string, query url.Values, out any) (int, error) {
 	u := s.baseURL + path
 	if len(query) > 0 {
@@ -723,10 +723,65 @@ func (s *sub2ImportService) apiJSONStatus(ctx context.Context, method, path stri
 		}
 		return response.StatusCode, errors.New(message)
 	}
+	if out == nil {
+		return response.StatusCode, nil
+	}
 	if err := json.Unmarshal(envelope.Data, out); err != nil {
 		return response.StatusCode, err
 	}
 	return response.StatusCode, nil
+}
+
+// deleteDeletedAccount removes the verified Sub2 binding when AUTH has
+// explicitly confirmed that the upstream account was deleted. A missing
+// remote account is already in the desired state and is therefore successful.
+func (s *sub2ImportService) deleteDeletedAccount(ctx context.Context, accountID int64) error {
+	if s == nil || !s.configured() || accountID <= 0 {
+		return nil
+	}
+	task, err := s.store.GetSub2Import(ctx, s.destinationKey, accountID)
+	if errors.Is(err, store.ErrSub2ImportNotFound) {
+		return nil
+	}
+	if err != nil || task.State != "imported" || task.Sub2AccountID <= 0 {
+		return err
+	}
+	account, err := s.store.GetAccountByID(ctx, accountID)
+	if errors.Is(err, store.ErrAccountNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var detail map[string]any
+	status, err := s.apiJSONStatus(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(task.Sub2AccountID, 10), nil, &detail)
+	if status == http.StatusNotFound {
+		return s.store.DeleteSub2ImportBinding(ctx, s.destinationKey, accountID, task.Sub2AccountID)
+	}
+	if err != nil {
+		return err
+	}
+	if err := verifySub2RecoveryIdentity(detail, task.Sub2AccountID, accountID, account, task); err != nil {
+		return err
+	}
+	// The remote GET and DELETE are separate calls. Re-read the local
+	// association before the destructive call so a concurrent relink/requeue
+	// cannot make this stale deletion target a newly assigned account.
+	latest, err := s.store.GetSub2Import(ctx, s.destinationKey, accountID)
+	if err != nil {
+		return err
+	}
+	if latest.ID != task.ID || latest.State != "imported" || latest.Sub2AccountID != task.Sub2AccountID || latest.OperationID != task.OperationID {
+		return errors.New("Sub2 绑定在删除前发生变化")
+	}
+	status, err = s.apiJSONStatus(ctx, http.MethodDelete, "/admin/accounts/"+strconv.FormatInt(task.Sub2AccountID, 10), nil, nil)
+	if status == http.StatusNotFound {
+		return s.store.DeleteSub2ImportBinding(ctx, s.destinationKey, accountID, task.Sub2AccountID)
+	}
+	if err != nil {
+		return err
+	}
+	return s.store.DeleteSub2ImportBinding(ctx, s.destinationKey, accountID, task.Sub2AccountID)
 }
 
 func (s *sub2ImportService) reconcile(ctx context.Context, id int64) error {

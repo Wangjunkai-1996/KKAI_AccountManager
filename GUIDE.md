@@ -47,7 +47,7 @@ email2@example.com----password2----TOTP_SECRET_2
 | `-output` | sub2api-accounts.json | 输出文件路径 |
 | `-headless` | true | 是否使用无头模式 |
 | `-proxy` | "" | 代理地址（可选） |
-| `-retry` | 2 | 失败重试次数 |
+| `-retry` | 2 | 失败重试次数；`0` 关闭自动重试 |
 | `-delay-min` | 5 | 最小延时（秒） |
 | `-delay-max` | 10 | 最大延时（秒） |
 | `-timeout` | 60 | 超时时间（秒） |

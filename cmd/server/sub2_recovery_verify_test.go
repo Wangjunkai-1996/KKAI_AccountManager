@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/login"
 	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/store"
 )
 
@@ -180,6 +181,45 @@ func TestRecoveryRetryBackoff(t *testing.T) {
 	failure.Code, failure.RetryAfterSeconds = "rate_limited", 7200
 	if recoveryRetryDelay(failure, 0) != 2*time.Hour {
 		t.Fatal("Retry-After was ignored")
+	}
+}
+
+func TestRecoveryLoginHTTP4xxRequiresAction(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, 499} {
+		failure := classifyRecoveryLoginInfo(login.LoginErrorInfo{Code: login.LoginErrorAuthHTTPStatus, HTTPStatus: status}, 0)
+		if failure.Code != "login_required" || !failure.RequiresAction || failure.HTTPStatus != status {
+			t.Fatalf("HTTP %d classified as %+v, want manual login_required", status, failure)
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		status int
+		code   string
+	}{
+		{name: "rate limited", status: http.StatusTooManyRequests, code: "rate_limited"},
+		{name: "server error", status: http.StatusBadGateway, code: "upstream_error"},
+		{name: "challenge", status: http.StatusForbidden, code: "challenge"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := login.LoginErrorInfo{Code: login.LoginErrorAuthHTTPStatus, HTTPStatus: tc.status}
+			if tc.code == "challenge" {
+				info.Code = login.LoginErrorCloudflareChallenge
+			}
+			failure := classifyRecoveryLoginInfo(info, 0)
+			if failure.Code != tc.code || failure.RequiresAction {
+				t.Fatalf("HTTP %d (%s) classified as %+v", tc.status, tc.name, failure)
+			}
+		})
+	}
+	for _, code := range []string{"invalid_grant", "access_denied", login.LoginErrorOAuth, login.LoginErrorTokenExchange, login.LoginErrorUnexpectedPage} {
+		failure := classifyRecoveryLoginInfo(login.LoginErrorInfo{Code: code}, 0)
+		if failure.Code != "login_required" || !failure.RequiresAction {
+			t.Fatalf("deterministic login code %q classified as %+v, want manual handling", code, failure)
+		}
+	}
+	challenge := classifyRecoveryLoginInfo(login.LoginErrorInfo{Code: login.LoginErrorCloudflareChallenge, HTTPStatus: http.StatusForbidden}, 37)
+	if challenge.Code != "challenge" || challenge.RetryAfterSeconds != 37 || challenge.RequiresAction {
+		t.Fatalf("challenge Retry-After lost: %+v", challenge)
 	}
 }
 

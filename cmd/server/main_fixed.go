@@ -94,10 +94,11 @@ func main() {
 
 	// 创建登录服务
 	service := login.NewService(login.Config{
-		Headless:   *headless,
-		Proxy:      *proxy,
-		RetryCount: 2,
-		Timeout:    60 * time.Second,
+		Headless:      *headless,
+		Proxy:         *proxy,
+		RetryCount:    2,
+		RetryCountSet: true,
+		Timeout:       60 * time.Second,
 	})
 
 	// 设置路由

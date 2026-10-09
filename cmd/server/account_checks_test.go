@@ -272,3 +272,99 @@ func TestAccountCheckWorkerFinalRequestEvidence(t *testing.T) {
 		t.Fatal("local precheck falsely reported an upstream request")
 	}
 }
+
+func TestAccountCheckDeletedRemovesSub2Account(t *testing.T) {
+	history, ids := accountCheckFixture(t, 1)
+	var deleted atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case http.MethodGet + " /api/v1/admin/accounts/101":
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
+				"id": 101, "platform": "openai", "type": "oauth",
+				"credentials": map[string]any{"email": "fixture-0@example.test", "chatgpt_account_id": "fixture-0"},
+				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": ids[0]}},
+			}})
+		case http.MethodDelete + " /api/v1/admin/accounts/101":
+			deleted.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"message": "deleted"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	oldImporter := sub2Importer
+	sub2Importer = &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "fixture", client: server.Client()}
+	defer func() { sub2Importer = oldImporter }()
+
+	checker := newAccountCheckService(history, "", "")
+	checker.runProbe = func(context.Context, string, string, string) probe.Result {
+		return probe.Result{Outcome: "account_deleted", HTTPStatus: http.StatusForbidden, RequestAttempted: true}
+	}
+	batch, _, err := history.CreateAccountCheckBatch(context.Background(), store.AccountCheckInput{RequestKey: "deleted-sub2", AccountIDs: ids, Concurrency: 1, ProxyMode: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checker.Start()
+	defer checker.Stop()
+	_, items := waitCheckBatch(t, history, batch.ID)
+	if len(items) != 1 || items[0].Outcome != "account_deleted" {
+		t.Fatalf("check result = %+v", items)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for deleted.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if deleted.Load() != 1 {
+		t.Fatalf("delete requests = %d, want 1", deleted.Load())
+	}
+}
+
+func TestAccountCheckCanceledLateDeletedDoesNotRemoveSub2Account(t *testing.T) {
+	history, ids := accountCheckFixture(t, 1)
+	var deleted atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleted.Add(1)
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	oldImporter, oldRecovery := sub2Importer, accountRecoveryService
+	sub2Importer = &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "fixture", client: server.Client()}
+	accountRecoveryService = nil
+	defer func() {
+		sub2Importer = oldImporter
+		accountRecoveryService = oldRecovery
+	}()
+
+	batch, _, err := history.CreateAccountCheckBatch(context.Background(), store.AccountCheckInput{
+		RequestKey: "deleted-cancel-race", AccountIDs: ids, Concurrency: 1, ProxyMode: "direct",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	work, err := history.ClaimAccountCheck(context.Background())
+	if err != nil || work == nil {
+		t.Fatalf("claim check = %#v, %v", work, err)
+	}
+	if _, err := history.CancelAccountCheckBatch(context.Background(), batch.ID); err != nil {
+		t.Fatal(err)
+	}
+	checker := newAccountCheckService(history, "", "")
+	status := http.StatusForbidden
+	attempted := true
+	checker.finish(work.Check.ID, ids[0], store.AccountCheckResult{
+		Outcome: "account_deleted", HTTPStatus: &status, RequestAttempted: &attempted,
+	})
+	if deleted.Load() != 0 {
+		t.Fatalf("late canceled result issued %d remote deletes", deleted.Load())
+	}
+	_, checks, err := history.GetAccountCheckBatch(context.Background(), batch.ID)
+	if err != nil || len(checks) != 1 {
+		t.Fatalf("read canceled check = %v, checks=%+v", err, checks)
+	}
+	if checks[0].State != "canceled" || checks[0].Outcome != "" {
+		t.Fatalf("late canceled result persisted as %+v", checks[0])
+	}
+}

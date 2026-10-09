@@ -84,7 +84,7 @@ go build -o bin/openai-login ./cmd/main.go
 | `-input` | accounts.txt | 输入文件 |
 | `-output` | sub2api-accounts.json | 输出文件 |
 | `-headless` | true | 无头模式（false=显示浏览器） |
-| `-retry` | 2 | 失败重试次数 |
+| `-retry` | 2 | 失败重试次数；`0` 关闭自动重试 |
 | `-delay-min` | 5 | 最小延时（秒） |
 | `-delay-max` | 10 | 最大延时（秒） |
 | `-timeout` | 60 | 超时时间（秒） |

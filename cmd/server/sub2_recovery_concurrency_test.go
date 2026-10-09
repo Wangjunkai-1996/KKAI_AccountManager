@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"sync/atomic"
 	"testing"
@@ -17,7 +16,7 @@ func TestSub2RecoveryActiveTransientFailureRetainsPause(t *testing.T) {
 	f.service.autoRecovery.Store(true)
 	loginOK := f.service.loginWithProxies
 	f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
-		return nil, errors.New("temporary network failure")
+		return nil, &recoveryOperationError{Code: "network_error"}
 	}
 	f.service.process(f.task)
 	failed := f.state(t)
@@ -37,6 +36,40 @@ func TestSub2RecoveryActiveTransientFailureRetainsPause(t *testing.T) {
 	}
 }
 
+func TestSub2RecoveryValidationTransientFailureRetriesOnActiveScheduledAccount(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.service.autoRecovery.Store(true)
+	f.detailStatus = "active"
+	f.detailError = ""
+	f.service.recordRecoveryFailure(f.task, store.RecoveryValidating, &recoveryOperationError{Code: "upstream_error", HTTPStatus: http.StatusBadGateway})
+	failed := f.state(t)
+	if failed.RetryAction != "relogin" || failed.FailureStage != store.RecoveryValidating || failed.NextRetryAt == nil {
+		t.Fatalf("validation failure was not queued for retry: %+v", failed)
+	}
+	recoveryRetryDue(t, f)
+	f.service.retryDueRecoveries()
+	queued := f.state(t)
+	if queued.State != store.RecoveryQueued {
+		t.Fatalf("validation retry was not requeued: %+v", queued)
+	}
+	f.service.process(queued)
+	finished := f.state(t)
+	if finished.State != store.RecoveryCompleted || f.loginCalls != 1 || !f.schedule {
+		t.Fatalf("validation retry did not complete: %+v login=%d schedule=%v", finished, f.loginCalls, f.schedule)
+	}
+}
+
+func TestSub2RecoveryDeletedAccountDoesNotPauseGlobalWorker(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	if _, err := f.db.Exec(`DELETE FROM account_recovery_tasks WHERE id=?`, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.service.recordRecoveryFailure(f.task, store.RecoveryLoggingIn, &recoveryOperationError{Code: "account_unavailable", RequiresAction: true})
+	if f.service.paused.Load() {
+		t.Fatal("deleted account paused the global recovery worker")
+	}
+}
+
 type recoveryConcurrencyTransport func(*http.Request) (*http.Response, error)
 
 func (f recoveryConcurrencyTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
@@ -45,7 +78,7 @@ func TestSub2RecoveryStaleRetryDoesNotOverwriteNewLogin(t *testing.T) {
 	f := newRecoveryFixture(t, true)
 	f.service.autoRecovery.Store(true)
 	f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
-		return nil, errors.New("temporary network failure")
+		return nil, &recoveryOperationError{Code: "network_error"}
 	}
 	f.service.process(f.task)
 	recoveryRetryDue(t, f)
@@ -58,7 +91,7 @@ func TestSub2RecoveryStaleRetryDoesNotOverwriteNewLogin(t *testing.T) {
 		if r.Method == http.MethodGet && r.URL.Path == "/admin/accounts/901" && intercepted.CompareAndSwap(false, true) {
 			close(monitorBlocked)
 			<-releaseMonitor
-			return nil, errors.New("temporary network failure")
+			return nil, &recoveryOperationError{Code: "network_error"}
 		}
 		return base.RoundTrip(r)
 	})
@@ -153,7 +186,7 @@ func TestSub2RecoveryAppliedCheckpointRequiresMatchingMarker(t *testing.T) {
 func TestSub2RecoveryStaleFailureSameMillisecondDoesNotOverwriteNewRound(t *testing.T) {
 	f := newRecoveryFixture(t, true)
 	f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
-		return nil, errors.New("temporary network failure")
+		return nil, &recoveryOperationError{Code: "network_error"}
 	}
 	f.service.process(f.task)
 	old := f.state(t)

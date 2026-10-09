@@ -2,6 +2,7 @@ package login
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -56,5 +57,18 @@ func TestRetryDelayExceedsDeadline(t *testing.T) {
 	defer longCancel()
 	if retryDelayExceedsDeadline(longContext, time.Second) {
 		t.Fatal("retryDelayExceedsDeadline() = true for ample remaining deadline")
+	}
+}
+
+func TestSubtractElapsedRetryAfter(t *testing.T) {
+	err := &authHTTPStatusError{Status: http.StatusForbidden, RetryAfter: 30 * time.Second}
+	adjusted := subtractElapsedRetryAfter(err, 25*time.Second)
+	var statusErr *authHTTPStatusError
+	if !errors.As(adjusted, &statusErr) || statusErr.RetryAfter != 5*time.Second || statusErr.RetryAfterConsumed {
+		t.Fatalf("adjusted Retry-After = %v, want 5s", adjusted)
+	}
+	adjusted = subtractElapsedRetryAfter(err, 31*time.Second)
+	if !errors.As(adjusted, &statusErr) || statusErr.RetryAfter != 0 || !statusErr.RetryAfterConsumed {
+		t.Fatalf("expired Retry-After = %v, want 0", adjusted)
 	}
 }

@@ -2440,18 +2440,30 @@ async function loginAccount(account, proxy) {
             renderStatus();
             await new Promise(resolve => setTimeout(resolve, Math.min(1000, platformPauseUntil - Date.now())));
         }
-        response = await fetch('/api/login/stream', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                email: account.email,
-                password: account.password,
-                totp_secret: account.totp_secret,
-                proxy,
-                auto_deliver: account.autoDeliver === true,
-                ...(account.autoDeliver && account.deliveryOptions ? { delivery_options: account.deliveryOptions } : {})
-            })
-        });
+        // Bound connection setup only: the server may use a custom login
+        // deadline longer than the default while the SSE stream is active.
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+        try {
+            response = await fetch('/api/login/stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    email: account.email,
+                    password: account.password,
+                    totp_secret: account.totp_secret,
+                    proxy,
+                    auto_deliver: account.autoDeliver === true,
+                    ...(account.autoDeliver && account.deliveryOptions ? { delivery_options: account.deliveryOptions } : {})
+                }),
+                signal: controller.signal
+            });
+        } catch (error) {
+            if (controller.signal.aborted) throw new Error('登录连接超时，请刷新历史核对结果后再重试');
+            throw error;
+        } finally {
+            clearTimeout(timeout);
+        }
         const contentType = response.headers.get('content-type') || '';
         if (response.ok && contentType.includes('text/event-stream')) break;
         const data = contentType.includes('json') ? await response.json() : {};

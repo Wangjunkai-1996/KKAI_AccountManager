@@ -363,6 +363,13 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, auto
 		task, err := s.store.RetryAccountRecoveryTask(ctx, previous.ID, retryTask.RetryAction == "relogin")
 		if err == nil {
 			s.notify()
+		} else if errors.Is(err, store.ErrAccountRecoveryNotResumable) {
+			// Another enqueue may have won the same failed/unknown task between
+			// validation and the CAS update. Reuse its active task instead of
+			// turning an expected loser into an HTTP 500.
+			if active, found, readErr := s.store.GetActiveAccountRecoveryTask(ctx, accountID); readErr == nil && found {
+				return active, false, nil
+			}
 		}
 		return task, false, err
 	}
@@ -657,14 +664,18 @@ func (s *sub2RecoveryService) loginAgain(ctx context.Context, taskID int64, acco
 	if loginErr != nil {
 		info := describeLoginError(loginErr)
 		if err := lease.FinishAttempt(finishCtx, taskID, attempt.ID, false, nil, &store.Failure{Stage: info.Stage, Code: info.Code, HTTPStatus: info.HTTPStatus, Retryable: info.Retryable, Message: info.Message, AccountStatus: info.AccountStatus}); err != nil {
-			s.pauseRecovery(taskID)
+			if !recoveryTaskGone(err) {
+				s.pauseRecovery(taskID)
+			}
 			return out, errors.New("AUTH 登录结果保存失败")
 		}
 		return out, loginErr
 	}
 	if result == nil || strings.TrimSpace(result.AccessToken) == "" || strings.TrimSpace(result.RefreshToken) == "" {
 		if err := lease.FinishAttempt(finishCtx, taskID, attempt.ID, false, nil, &store.Failure{Stage: login.LoginStageUnknown, Code: login.LoginErrorUnknown, Message: "登录未返回完整凭据"}); err != nil {
-			s.pauseRecovery(taskID)
+			if !recoveryTaskGone(err) {
+				s.pauseRecovery(taskID)
+			}
 			return out, errors.New("AUTH 登录结果保存失败")
 		}
 		return out, errors.New("login returned incomplete credentials")
@@ -672,14 +683,18 @@ func (s *sub2RecoveryService) loginAgain(ctx context.Context, taskID int64, acco
 	out = recoveryOAuthCredentials{AccessToken: result.AccessToken, RefreshToken: result.RefreshToken, ClientID: recoveryClientID, Email: result.Email, ChatGPTAccountID: result.ChatGPTAccountID, OrganizationID: result.OrganizationID, PlanType: result.PlanType, ExpiresAt: result.ExpiresAt, ExpiresIn: result.ExpiresIn}
 	if err := verifyOAuthIdentity(out, account); err != nil {
 		if err := lease.FinishAttempt(finishCtx, taskID, attempt.ID, false, nil, &store.Failure{Stage: login.LoginStageToken, Code: "identity_mismatch", Message: "新登录账号身份与原账号不一致"}); err != nil {
-			s.pauseRecovery(taskID)
+			if !recoveryTaskGone(err) {
+				s.pauseRecovery(taskID)
+			}
 			return out, errors.New("AUTH 登录结果保存失败")
 		}
 		return recoveryOAuthCredentials{}, &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
 	}
 	stored := &store.Result{AccessToken: out.AccessToken, RefreshToken: out.RefreshToken, ChatGPTAccountID: out.ChatGPTAccountID, OrganizationID: out.OrganizationID, PlanType: out.PlanType, ExpiresAt: out.ExpiresAt, ExpiresIn: out.ExpiresIn}
 	if err := lease.FinishAttempt(finishCtx, taskID, attempt.ID, true, stored, nil); err != nil {
-		s.pauseRecovery(taskID)
+		if !recoveryTaskGone(err) {
+			s.pauseRecovery(taskID)
+		}
 		return recoveryOAuthCredentials{}, errors.New("AUTH 登录结果保存失败")
 	}
 	return out, nil
@@ -798,16 +813,27 @@ func classifyRecoveryLoginError(err error) *recoveryOperationError {
 		return classified
 	}
 	info := describeLoginError(err)
+	retryAfter := 0
+	var retry interface{ RetryAfterDuration() time.Duration }
+	if errors.As(err, &retry) {
+		retryAfter = int(retry.RetryAfterDuration().Seconds())
+	}
+	return classifyRecoveryLoginInfo(info, retryAfter)
+}
+
+func classifyRecoveryLoginInfo(info login.LoginErrorInfo, retryAfter int) *recoveryOperationError {
 	if info.AccountStatus != "" {
 		return &recoveryOperationError{Code: "account_unavailable", HTTPStatus: info.HTTPStatus, RequiresAction: true}
 	}
-	if info.HTTPStatus == http.StatusTooManyRequests || info.HTTPStatus >= 500 {
-		retryAfter := 0
-		var retry interface{ RetryAfterDuration() time.Duration }
-		if errors.As(err, &retry) {
-			retryAfter = int(retry.RetryAfterDuration().Seconds())
-		}
+	isChallenge := info.Code == login.LoginErrorCloudflareChallenge
+	if info.HTTPStatus == http.StatusRequestTimeout {
+		return &recoveryOperationError{Code: "timeout", HTTPStatus: info.HTTPStatus, RetryAfterSeconds: retryAfter}
+	}
+	if !isChallenge && (info.HTTPStatus == http.StatusTooManyRequests || info.HTTPStatus >= 500) {
 		return recoveryHTTPError(info.HTTPStatus, retryAfter)
+	}
+	if !isChallenge && info.HTTPStatus >= 400 && info.HTTPStatus < 500 {
+		return &recoveryOperationError{Code: "login_required", HTTPStatus: info.HTTPStatus, RequiresAction: true}
 	}
 	switch info.Code {
 	case login.LoginErrorTimeout:
@@ -817,12 +843,25 @@ func classifyRecoveryLoginError(err error) *recoveryOperationError {
 	case login.LoginErrorConnectionReset:
 		return &recoveryOperationError{Code: "network_error"}
 	case login.LoginErrorCloudflareChallenge:
-		return &recoveryOperationError{Code: "challenge", HTTPStatus: info.HTTPStatus}
+		return &recoveryOperationError{Code: "challenge", HTTPStatus: info.HTTPStatus, RetryAfterSeconds: retryAfter}
 	case login.LoginErrorUnsupportedRegion, login.LoginErrorConfiguration, login.LoginErrorIdentity,
+		login.LoginErrorOAuth, login.LoginErrorTokenExchange, login.LoginErrorUnexpectedPage,
 		"invalid_password", "incorrect_password", "invalid_otp", "invalid_totp", "invalid_mfa", "mfa_required", "identity_mismatch", "invalid_credentials":
 		return &recoveryOperationError{Code: "login_required", HTTPStatus: info.HTTPStatus, RequiresAction: true}
 	}
+	if info.Stage == "oauth" && info.HTTPStatus == 0 {
+		return &recoveryOperationError{Code: "login_required", RequiresAction: true}
+	}
+	if !info.Retryable {
+		// Login already exhausted its local retry policy. Do not turn a
+		// deterministic OAuth/page/token failure into an endless durable retry.
+		return &recoveryOperationError{Code: "login_required", HTTPStatus: info.HTTPStatus, RequiresAction: true}
+	}
 	return &recoveryOperationError{Code: "login_failed", HTTPStatus: info.HTTPStatus}
+}
+
+func recoveryTaskGone(err error) bool {
+	return errors.Is(err, store.ErrAccountRecoveryNotFound) || errors.Is(err, store.ErrAccountNotFound)
 }
 
 func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTask, stage string, err error) {
@@ -830,7 +869,9 @@ func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTa
 	defer cancel()
 	current, readErr := s.store.GetAccountRecoveryTaskByID(ctx, task.ID)
 	if readErr != nil {
-		s.pauseRecovery(task.ID)
+		if !recoveryTaskGone(readErr) {
+			s.pauseRecovery(task.ID)
+		}
 		return
 	}
 	// A retry worker may have spent time in a remote request while an operator
@@ -920,6 +961,14 @@ func (s *sub2RecoveryService) verifyRecoveryRetry(ctx context.Context, task stor
 		task.FailureStage == store.RecoveryLoggingIn || task.FailureStage == store.RecoveryLoginSucceeded ||
 		task.FailureStage == store.RecoveryIdentityVerified || task.FailureStage == store.RecoveryApplyingCredentials
 	if beforeApply && originalMarker && strings.EqualFold(status, "error") {
+		return nil
+	}
+	// Validation and the first attempt to disable scheduling have no durable
+	// remote write yet. If the account is still active and scheduled, a
+	// transient failure can be retried idempotently; the later login/apply
+	// stages still require the worker-owned pause proof below.
+	if beforeApply && originalMarker && scheduled && strings.EqualFold(status, "active") &&
+		(task.FailureStage == store.RecoveryValidating || task.FailureStage == store.RecoveryDisablingSchedule) {
 		return nil
 	}
 	// Delivery begins with saved fresh credentials on a healthy account. A

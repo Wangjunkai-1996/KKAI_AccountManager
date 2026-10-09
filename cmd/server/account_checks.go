@@ -231,6 +231,30 @@ func (s *accountCheckService) finish(id, accountID int64, result store.AccountCh
 	if batch.State == "stopping" {
 		s.cancelBatch(batch.ID)
 	}
+	// FinishAccountCheck downgrades a late result to canceled when the batch
+	// was stopped while the probe was running. Re-read the committed check
+	// before performing the destructive remote cleanup so that cancellation
+	// cannot turn a stale account_deleted result into a DELETE request.
+	deleteConfirmed := false
+	if !result.Canceled && result.Outcome == "account_deleted" && accountID > 0 && sub2Importer != nil && batch.State != "stopping" && batch.State != "stopped" {
+		if committedBatch, checks, readErr := s.store.GetAccountCheckBatch(ctx, batch.ID); readErr == nil && committedBatch.State != "stopping" && committedBatch.State != "stopped" {
+			for _, check := range checks {
+				if check.ID == id && check.State == "finished" && check.Outcome == "account_deleted" && check.Freshness == "current" {
+					deleteConfirmed = true
+					break
+				}
+			}
+		}
+	}
+	if deleteConfirmed {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := sub2Importer.deleteDeletedAccount(cleanupCtx, accountID); err != nil {
+			// The detection result is durable; a temporary Sub2 failure can be
+			// retried by a later explicit detection without changing its outcome.
+			log.Print("检测确认账号已删除，但清理 Sub2 账号失败")
+		}
+		cleanupCancel()
+	}
 	if !result.Canceled && batch.State != "stopping" && batch.State != "stopped" && accountID > 0 && accountRecoveryService != nil && recoveryCheckCandidate(result) {
 		explicit, err := s.store.ExplicitRecoveryCheck(ctx, batch.ID)
 		if err == nil && explicit {

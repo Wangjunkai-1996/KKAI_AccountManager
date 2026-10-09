@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -140,6 +142,87 @@ func TestListSub2AccountStatusesMarksTransportFailuresUnknown(t *testing.T) {
 	got := statuses[accountID]
 	if got.Exists || !got.Unknown || !got.Stale || got.Error == "" {
 		t.Fatalf("transport status = %+v", got)
+	}
+}
+
+func TestDeleteDeletedAccountVerifiesAndDeletesRemoteBinding(t *testing.T) {
+	history, accountID := testOAuthStore(t)
+	ctx := context.Background()
+	task, _, err := history.CreateOrGetSub2Import(ctx, "test", accountID, "operation", "idempotency", []byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.UpdateSub2Import(ctx, task.ID, "imported", true, 42, ""); err != nil {
+		t.Fatal(err)
+	}
+	var deleted atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case http.MethodGet + " /api/v1/admin/accounts/42":
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
+				"id": 42, "platform": "openai", "type": "oauth",
+				"credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": "chatgpt-1"},
+				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID}},
+			}})
+		case http.MethodDelete + " /api/v1/admin/accounts/42":
+			deleted.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"message": "deleted"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
+	if err := service.deleteDeletedAccount(ctx, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if deleted.Load() != 1 {
+		t.Fatalf("delete requests = %d, want 1", deleted.Load())
+	}
+	if _, err := history.GetSub2Import(ctx, "test", accountID); !errors.Is(err, store.ErrSub2ImportNotFound) {
+		t.Fatalf("deleted remote binding retained: %v", err)
+	}
+}
+
+func TestDeleteDeletedAccountSkipsChangedBinding(t *testing.T) {
+	history, accountID := testOAuthStore(t)
+	ctx := context.Background()
+	task, _, err := history.CreateOrGetSub2Import(ctx, "test", accountID, "operation", "idempotency", []byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.UpdateSub2Import(ctx, task.ID, "imported", true, 42, ""); err != nil {
+		t.Fatal(err)
+	}
+	var deleted atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case http.MethodGet + " /api/v1/admin/accounts/42":
+			if err := history.UpdateSub2Import(ctx, task.ID, "unknown", true, 0, "changed during verification"); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
+				"id": 42, "platform": "openai", "type": "oauth",
+				"credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": "chatgpt-1"},
+				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID}},
+			}})
+		case http.MethodDelete + " /api/v1/admin/accounts/42":
+			deleted.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"message": "deleted"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
+	if err := service.deleteDeletedAccount(ctx, accountID); err == nil {
+		t.Fatal("changed binding deletion unexpectedly succeeded")
+	}
+	if deleted.Load() != 0 {
+		t.Fatalf("delete requests = %d, want 0", deleted.Load())
 	}
 }
 

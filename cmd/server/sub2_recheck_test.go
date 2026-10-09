@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -191,7 +190,7 @@ func TestSub2RecheckRecoveryRetainsConfirmedPauseOnRetry(t *testing.T) {
 	child, _ := f.store.GetLatestAccountRecoveryTask(context.Background(), f.account.ID)
 	loginOK := f.service.loginWithProxies
 	f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
-		return nil, errors.New("temporary transport failure")
+		return nil, &recoveryOperationError{Code: "network_error"}
 	}
 	f.service.process(child)
 	failed, _ := f.store.GetAccountRecoveryTaskByID(context.Background(), child.ID)

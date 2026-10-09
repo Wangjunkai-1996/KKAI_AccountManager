@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -8,6 +9,12 @@ import (
 	"testing"
 	"time"
 )
+
+func TestLoginHTTPStatusDeadline(t *testing.T) {
+	if got := loginHTTPStatus(context.DeadlineExceeded); got != http.StatusGatewayTimeout {
+		t.Fatalf("loginHTTPStatus(deadline) = %d, want %d", got, http.StatusGatewayTimeout)
+	}
+}
 
 func TestConcurrentLoginLimitAndRelease(t *testing.T) {
 	slots := make(chan struct{}, 1)

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mxschmitt/playwright-go"
@@ -46,6 +47,10 @@ type authHTTPStatusError struct {
 	Message      string
 	Cause        error
 	RetryAfter   time.Duration
+	// RetryAfterConsumed distinguishes an explicit Retry-After that was
+	// consumed while waiting on a browser challenge from an absent header.
+	// A consumed delay permits the next retry immediately.
+	RetryAfterConsumed bool
 }
 
 func (e *authHTTPStatusError) Unwrap() error                     { return e.Cause }
@@ -79,7 +84,7 @@ func (e *authHTTPStatusError) retryable() bool {
 	if errors.Is(e, ErrCloudflareChallenge) {
 		return true
 	}
-	return e.Status == http.StatusTooManyRequests || e.Status >= http.StatusInternalServerError
+	return e.Status == http.StatusRequestTimeout || e.Status == http.StatusTooManyRequests || e.Status >= http.StatusInternalServerError
 }
 
 const (
@@ -98,6 +103,9 @@ type Config struct {
 	Proxy         string
 	UpstreamProxy string
 	RetryCount    int
+	// RetryCountSet makes zero an explicit choice. When false, a zero value
+	// keeps the service default for callers that construct Config literals.
+	RetryCountSet bool
 	Timeout       time.Duration
 	TotalTimeout  time.Duration
 	// BrowserCompatibility matches the known-good Mac helper profile for the
@@ -110,6 +118,9 @@ type Config struct {
 type Service struct {
 	config Config
 }
+
+type loginRetryBudget struct{ remaining int }
+type loginRetryBudgetKey struct{}
 
 // LoginResult contains the result of a successful login
 type LoginResult struct {
@@ -133,9 +144,13 @@ func NewService(config Config) *Service {
 	if config.TotalTimeout <= 0 {
 		config.TotalTimeout = 3 * time.Minute
 	}
-	if config.RetryCount == 0 {
+	if !config.RetryCountSet && config.RetryCount == 0 {
 		config.RetryCount = 2
 	}
+	if config.RetryCount < 0 {
+		config.RetryCount = 0
+	}
+	config.RetryCountSet = true
 	return &Service{config: config}
 }
 
@@ -199,7 +214,7 @@ func (s *Service) login(ctx context.Context, email, password, totpSecret string)
 	}
 
 	result, err := s.loginWithRetries(ctx, email, password, totpSecret)
-	if ctx.Err() != nil || !shouldTryLocalClash(s.config.Proxy, err) || !localProxyAvailable(ctx) {
+	if ctx.Err() != nil || !shouldTryLocalClash(s.config.Proxy, err) || !loginRetryBudgetAvailable(ctx) || !localProxyAvailable(ctx) {
 		return result, err
 	}
 
@@ -233,36 +248,60 @@ func loginWithRetries(ctx context.Context, retryCount int, attemptFunc func(cont
 	if retryCount < 0 {
 		retryCount = 0
 	}
+	maxAttempts := retryCount
+	if maxAttempts < int(^uint(0)>>1) {
+		maxAttempts++
+	}
+	if budget, ok := ctx.Value(loginRetryBudgetKey{}).(*loginRetryBudget); ok {
+		if budget.remaining < maxAttempts {
+			maxAttempts = budget.remaining
+		}
+	}
+	if maxAttempts < 1 {
+		return nil, context.DeadlineExceeded
+	}
+	effectiveRetryCount := maxAttempts - 1
 	var lastErr error
 
-	for attempt := 0; attempt <= retryCount; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		if attempt > 0 {
-			log.Printf("   🔄 重试 %d/%d", attempt, retryCount)
+			log.Printf("   🔄 重试 %d/%d", attempt, effectiveRetryCount)
 			var retryAfter time.Duration
+			retryAfterConsumed := false
 			var statusErr *authHTTPStatusError
 			if errors.As(lastErr, &statusErr) {
 				retryAfter = statusErr.RetryAfter
+				retryAfterConsumed = statusErr.RetryAfterConsumed
 			}
 			delay := retryDelay(attempt, retryAfter)
-			if retryDelayExceedsDeadline(ctx, delay) {
-				return nil, lastErr
+			if retryAfterConsumed {
+				delay = 0
 			}
-			message := fmt.Sprintf("正在等待第 %d 次重试", attempt)
+			if retryDelayExceedsDeadline(ctx, delay) {
+				return nil, errors.Join(context.DeadlineExceeded, lastErr)
+			}
+			message := fmt.Sprintf("正在等待第 %d/%d 次重试", attempt, effectiveRetryCount)
 			if errors.Is(lastErr, ErrCloudflareChallenge) {
-				message = fmt.Sprintf("浏览器验证未通过，正在等待第 %d 次自动重试", attempt)
+				message = fmt.Sprintf("浏览器验证未通过，正在等待第 %d/%d 次自动重试", attempt, effectiveRetryCount)
 			}
 			emitProgress(ctx, "retry_wait", message)
 			if err := waitContext(ctx, delay); err != nil {
-				return nil, err
+				return nil, errors.Join(err, lastErr)
 			}
 		}
 
+		if budget, ok := ctx.Value(loginRetryBudgetKey{}).(*loginRetryBudget); ok {
+			budget.remaining--
+		}
 		result, err := attemptFunc(ctx)
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if err != nil {
+				return nil, errors.Join(ctxErr, err)
+			}
+			return nil, ctxErr
 		}
 		if err == nil {
 			return result, nil
@@ -271,25 +310,49 @@ func loginWithRetries(ctx context.Context, retryCount int, attemptFunc func(cont
 		lastErr = err
 		failure := DescribeError(err)
 		log.Printf("   ⚠️  登录失败: stage=%s code=%s http_status=%d message=%s", failure.Stage, failure.Code, failure.HTTPStatus, failure.Message)
-		if failure.AccountStatus != "" {
-			return nil, err
-		}
-		var statusErr *authHTTPStatusError
-		if errors.As(err, &statusErr) && !statusErr.retryable() {
-			return nil, err
-		}
-		if errors.Is(err, ErrUnsupportedRegion) ||
-			errors.Is(err, ErrUnexpectedAuthPage) || errors.Is(err, ErrAuthConnectionReset) {
+		if failure.AccountStatus != "" || !retryableLoginError(err) {
 			return nil, err
 		}
 	}
 
-	return nil, fmt.Errorf("登录失败（已重试 %d 次）: %w", retryCount, lastErr)
+	return nil, fmt.Errorf("登录失败（已重试 %d 次）: %w", effectiveRetryCount, lastErr)
+}
+
+func loginRetryBudgetAvailable(ctx context.Context) bool {
+	budget, ok := ctx.Value(loginRetryBudgetKey{}).(*loginRetryBudget)
+	return !ok || budget.remaining > 0
+}
+
+// retryableLoginError is deliberately allowlisted. A browser flow can return
+// many deterministic errors (invalid credentials, OAuth rejection, malformed
+// tokens, and page/configuration errors); replaying those only creates more
+// upstream traffic and obscures the useful failure. Temporary HTTP failures,
+// Cloudflare challenges, and transient transport errors are safe to retry.
+func retryableLoginError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var statusErr *authHTTPStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.retryable()
+	}
+	if errors.Is(err, ErrCloudflareChallenge) {
+		return true
+	}
+	if errors.Is(err, playwright.ErrTimeout) || errors.Is(err, playwright.ErrTargetClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary()) {
+		return true
+	}
+	return false
 }
 
 const (
-	retryBaseDelay = 2 * time.Second
-	retryMaxDelay  = 30 * time.Second
+	retryBaseDelay          = 2 * time.Second
+	retryMaxDelay           = 30 * time.Second
+	challengeProbeTimeoutMS = 500
 )
 
 // retryDelay returns a delay for a retry. A valid Retry-After header takes
@@ -766,10 +829,14 @@ func waitChallengeRecovery(ctx context.Context, page playwright.Page, challenges
 		if err := drainChallengeSignals(challenges, statuses); err != nil {
 			return authFailureWithPage(page, err)
 		}
-		return terminal
+		// A challenge signal can arrive after the browser has already
+		// completed verification. Continue with the recovered page instead of
+		// discarding it and replaying the whole login attempt.
+		return nil
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
+	waitStarted := time.Now()
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -799,7 +866,7 @@ func waitChallengeRecovery(ctx context.Context, page playwright.Page, challenges
 			}
 		case <-waitCtx.Done():
 			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
-				return terminal
+				return subtractElapsedRetryAfter(terminal, time.Since(waitStarted))
 			}
 			return waitCtx.Err()
 		case <-ticker.C:
@@ -886,13 +953,25 @@ func (s *Service) LoginWithProxiesContext(ctx context.Context, email, password, 
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, config.TotalTimeout)
+	service := NewService(config)
+	ctx, cancel := context.WithTimeout(ctx, service.config.TotalTimeout)
 	defer cancel()
+	attemptBudget := service.config.RetryCount
+	if attemptBudget < int(^uint(0)>>1) {
+		attemptBudget++
+	}
+	if attemptBudget < 1 {
+		attemptBudget = 1
+	}
+	ctx = context.WithValue(ctx, loginRetryBudgetKey{}, &loginRetryBudget{remaining: attemptBudget})
 	ctx = startProgress(ctx)
 	defer finishProgress(ctx)
-	result, err := NewService(config).login(ctx, email, password, totpSecret)
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	result, err := service.login(ctx, email, password, totpSecret)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if err != nil {
+			return nil, errors.Join(ctxErr, err)
+		}
+		return nil, ctxErr
 	}
 	if err == nil {
 		emitProgress(ctx, "complete", "登录完成")
@@ -1085,6 +1164,7 @@ func waitInitialChallenge(ctx context.Context, page playwright.Page, challenges 
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
+	waitStarted := time.Now()
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -1096,7 +1176,7 @@ func waitInitialChallenge(ctx context.Context, page playwright.Page, challenges 
 				if parentErr := ctx.Err(); parentErr != nil {
 					return parentErr
 				}
-				return terminal
+				return subtractElapsedRetryAfter(terminal, time.Since(waitStarted))
 			}
 			return err
 		}
@@ -1138,6 +1218,25 @@ func waitInitialChallenge(ctx context.Context, page playwright.Page, challenges 
 		case <-ticker.C:
 		}
 	}
+}
+
+// subtractElapsedRetryAfter avoids waiting twice for a server-provided delay:
+// the browser challenge window already consumed part of Retry-After.
+func subtractElapsedRetryAfter(err error, elapsed time.Duration) error {
+	if elapsed <= 0 {
+		return err
+	}
+	var statusErr *authHTTPStatusError
+	if !errors.As(err, &statusErr) || statusErr.RetryAfter <= 0 {
+		return err
+	}
+	adjusted := *statusErr
+	adjusted.RetryAfter -= elapsed
+	if adjusted.RetryAfter < 0 {
+		adjusted.RetryAfter = 0
+	}
+	adjusted.RetryAfterConsumed = adjusted.RetryAfter == 0
+	return &adjusted
 }
 
 func drainChallengeSignals(challenges <-chan struct{}, statuses <-chan error) error {
@@ -1305,8 +1404,10 @@ func randomString(size int) (string, error) {
 }
 
 func isCloudflareChallenge(page playwright.Page) bool {
-	title, _ := page.Title()
-	text, _ := page.Locator("body").InnerText()
+	titleLocator := page.Locator("title")
+	timeout := playwright.Float(challengeProbeTimeoutMS)
+	title, _ := titleLocator.TextContent(playwright.LocatorTextContentOptions{Timeout: timeout})
+	text, _ := page.Locator("body").InnerText(playwright.LocatorInnerTextOptions{Timeout: timeout})
 	return hasCloudflareChallengeSignals(page.URL(), title, text)
 }
 
@@ -1592,7 +1693,7 @@ func takeSignal(ch <-chan struct{}) bool {
 }
 
 func isUnsupportedRegion(page playwright.Page) bool {
-	content, _ := page.Content()
+	content, _ := page.Locator("body").InnerText(playwright.LocatorInnerTextOptions{Timeout: playwright.Float(challengeProbeTimeoutMS)})
 	content = strings.ToLower(content)
 	return strings.Contains(content, "unsupported_country_region_territory") ||
 		strings.Contains(content, "country, region, or territory not supported")

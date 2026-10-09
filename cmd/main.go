@@ -56,10 +56,11 @@ func main() {
 
 	// 创建登录服务
 	service := login.NewService(login.Config{
-		Headless:   *headless,
-		Proxy:      *proxy,
-		RetryCount: *retryCount,
-		Timeout:    time.Duration(*timeout) * time.Second,
+		Headless:      *headless,
+		Proxy:         *proxy,
+		RetryCount:    *retryCount,
+		RetryCountSet: true,
+		Timeout:       time.Duration(*timeout) * time.Second,
 	})
 
 	// 批量处理账号
