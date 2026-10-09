@@ -833,6 +833,14 @@ func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTa
 		s.pauseRecovery(task.ID)
 		return
 	}
+	// A retry worker may have spent time in a remote request while an operator
+	// manually requeued the same task. Never let that old response classify the
+	// new round. Active workers are allowed to advance through states locally,
+	// so only failed/unknown snapshots get this early stale check.
+	if (task.State == store.RecoveryFailed || task.State == store.RecoveryUnknown) &&
+		(current.State != task.State || current.UpdatedAt.UnixMilli() != task.UpdatedAt.UnixMilli()) {
+		return
+	}
 	failure := classifyRecoveryError(err)
 	record := store.RecoveryFailure{State: store.RecoveryUnknown, Stage: stage, Code: failure.Code, Message: failure.Error()}
 	if failure.RequiresAction {
@@ -851,8 +859,15 @@ func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTa
 	if failure.Code == "manual_pause" {
 		record.State = store.RecoveryCanceled
 	}
+	record.ExpectedState = current.State
+	record.ExpectedUpdatedAt = current.UpdatedAt.UnixMilli()
 	if _, err := s.store.RecordAccountRecoveryFailure(ctx, task.ID, record); err != nil {
-		s.pauseRecovery(task.ID)
+		// A late result losing the CAS is expected during a manual requeue or
+		// completion. It is not a storage failure and must not globally pause
+		// recovery dispatch.
+		if !errors.Is(err, store.ErrAccountRecoveryStale) && !errors.Is(err, store.ErrAccountRecoveryNotResumable) {
+			s.pauseRecovery(task.ID)
+		}
 	}
 }
 
@@ -916,7 +931,23 @@ func (s *sub2RecoveryService) verifyRecoveryRetry(ctx context.Context, task stor
 			return nil
 		}
 	}
+	// logging_in is written only after this worker successfully disabled the
+	// schedule. It is therefore the durable proof that an unscheduled active
+	// account is our pause after a transient login failure. A queued claim is
+	// validating and deliberately does not provide this proof.
+	workerPauseConfirmed := task.FailureStage == store.RecoveryLoggingIn ||
+		task.FailureStage == store.RecoveryLoginSucceeded ||
+		task.FailureStage == store.RecoveryIdentityVerified ||
+		task.FailureStage == store.RecoveryApplyingCredentials ||
+		task.FailureStage == store.RecoveryCredentialsApplied ||
+		task.FailureStage == store.RecoveryEnablingSchedule
 	if !scheduled && strings.EqualFold(status, "active") {
+		// A saved checkpoint must still prove the same remote identity. If a
+		// marker was present and no longer matches, treat it as ownership loss;
+		// the worker's old pause does not authorize retrying another account.
+		if workerPauseConfirmed && originalMarker {
+			return nil
+		}
 		return &recoveryOperationError{Code: "manual_pause", RequiresAction: true}
 	}
 	return &recoveryOperationError{Code: "checkpoint_unconfirmed", RequiresAction: true}

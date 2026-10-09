@@ -60,7 +60,10 @@ func (s *accountDeliveryService) runOnce() {
 		return
 	}
 	for _, task := range tasks {
-		if s.ctx.Err() != nil {
+		// update() opens the recovery circuit on a durable storage failure. Stop
+		// this batch immediately so a later task cannot create a remote account
+		// after the circuit has already tripped.
+		if s.ctx.Err() != nil || s.recovery.paused.Load() {
 			return
 		}
 		ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)

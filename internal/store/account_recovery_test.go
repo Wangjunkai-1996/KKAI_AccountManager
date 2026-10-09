@@ -28,7 +28,7 @@ func TestAccountRecoveryTaskLifecycle(t *testing.T) {
 	}
 
 	claimed, err := s.ClaimAccountRecoveryTask(ctx, task.ID)
-	if err != nil || claimed.State != RecoveryLoggingIn {
+	if err != nil || claimed.State != RecoveryValidating {
 		t.Fatalf("claim = %+v,%v", claimed, err)
 	}
 	if _, err = s.ClaimAccountRecoveryTask(ctx, task.ID); !errors.Is(err, ErrAccountRecoveryNotQueued) {
@@ -81,7 +81,7 @@ func TestAccountRecoveryTaskRecoveryOnRestart(t *testing.T) {
 	}
 	defer reopened.Close()
 	recovered, err := reopened.GetAccountRecoveryTaskByID(ctx, task.ID)
-	if err != nil || recovered.State != RecoveryUnknown || recovered.LastError == "" || recovered.FailureStage != RecoveryLoggingIn || recovered.ErrorCode != "process_interrupted" || recovered.RetryAction != "relogin" || recovered.NextRetryAt == nil || recovered.RetryCount != 1 {
+	if err != nil || recovered.State != RecoveryUnknown || recovered.LastError == "" || recovered.FailureStage != RecoveryValidating || recovered.ErrorCode != "process_interrupted" || recovered.RetryAction != "relogin" || recovered.NextRetryAt == nil || recovered.RetryCount != 1 {
 		t.Fatalf("recovered task = %+v,%v", recovered, err)
 	}
 }
@@ -235,6 +235,9 @@ func TestRecoveryCheckpointResumeAndCredentialVersionGuard(t *testing.T) {
 	if _, err := s.ClaimAccountRecoveryTask(ctx, task.ID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.UpdateAccountRecoveryTask(ctx, task.ID, RecoveryLoggingIn, "test pause confirmed"); err != nil {
+		t.Fatal(err)
+	}
 	lease, err := s.AcquireAccountRecovery(ctx, id)
 	if err != nil {
 		t.Fatal(err)
@@ -293,6 +296,9 @@ func TestRecoveryCredentialCheckpointIsAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.ClaimAccountRecoveryTask(ctx, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateAccountRecoveryTask(ctx, task.ID, RecoveryLoggingIn, "test pause confirmed"); err != nil {
 		t.Fatal(err)
 	}
 	lease, err := s.AcquireAccountRecovery(ctx, id)
@@ -377,6 +383,9 @@ func TestRecoveryCheckpointSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.ClaimAccountRecoveryTask(ctx, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateAccountRecoveryTask(ctx, task.ID, RecoveryLoggingIn, "test pause confirmed"); err != nil {
 		t.Fatal(err)
 	}
 	lease, err := s.AcquireAccountRecovery(ctx, id)

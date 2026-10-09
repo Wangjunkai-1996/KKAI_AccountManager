@@ -131,8 +131,44 @@ func (s *Store) QueueAccountDelivery(ctx context.Context, accountID int64, desti
 		return AccountDelivery{}, err
 	}
 	now := time.Now().UnixMilli()
-	_, err = s.db.ExecContext(ctx, `INSERT INTO account_deliveries(account_id,credential_version,destination_key,state,created_at,updated_at,options_json) VALUES(?,?,?,'queued',?,?,?) ON CONFLICT(destination_key,account_id,credential_version) DO NOTHING`, accountID, version, destination, now, now, string(raw))
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return AccountDelivery{}, err
+	}
+	defer tx.Rollback()
+	existing, lookupErr := scanAccountDelivery(tx.QueryRowContext(ctx, accountDeliverySelect+` WHERE destination_key=? AND account_id=? AND credential_version=?`, destination, accountID, version))
+	if lookupErr == nil {
+		if existing.State == "requires_action" && existing.RecoveryTaskID == 0 {
+			// A requires_action delivery can be corrected in place only while no
+			// import intent exists. Once an import row exists, its payload and
+			// idempotency key may already have been sent to Sub2; replacing the
+			// delivery options could make a retry claim a different remote intent.
+			var importCount int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sub2_imports WHERE destination_key=? AND account_id=?`, destination, accountID).Scan(&importCount); err != nil {
+				return AccountDelivery{}, err
+			}
+			if importCount > 0 {
+				return existing, ErrAccountDeliveryRequiresAction
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE account_deliveries SET options_json=?,state='queued',last_error='',next_retry_at=NULL,manual_action='',retry_count=0,updated_at=? WHERE id=? AND state='requires_action' AND recovery_task_id=0`, string(raw), now, existing.ID); err != nil {
+				return AccountDelivery{}, err
+			}
+			if err := tx.Commit(); err != nil {
+				return AccountDelivery{}, err
+			}
+			return s.GetAccountDelivery(ctx, existing.ID)
+		}
+		return existing, nil
+	}
+	if !errors.Is(lookupErr, ErrAccountDeliveryNotFound) {
+		return AccountDelivery{}, lookupErr
+	}
+	// Keep the unique-key race idempotent: another request may have inserted
+	// the same intent after our lookup but before this insert.
+	if _, err = tx.ExecContext(ctx, `INSERT INTO account_deliveries(account_id,credential_version,destination_key,state,created_at,updated_at,options_json) VALUES(?,?,?,'queued',?,?,?) ON CONFLICT(destination_key,account_id,credential_version) DO NOTHING`, accountID, version, destination, now, now, string(raw)); err != nil {
+		return AccountDelivery{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return AccountDelivery{}, err
 	}
 	return scanAccountDelivery(s.db.QueryRowContext(ctx, accountDeliverySelect+` WHERE destination_key=? AND account_id=? AND credential_version=?`, destination, accountID, version))

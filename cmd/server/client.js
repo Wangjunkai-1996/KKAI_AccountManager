@@ -197,6 +197,7 @@ let accounts = [];
 let results = [];
 let historyAccounts = [];
 let processing = false;
+let startBatchInFlight = false;
 let proxyChecking = false;
 let historyLoading = false;
 let historyBusyID = '';
@@ -587,36 +588,44 @@ loadRecoverySettings();
 scheduleHistoryRefresh();
 
 startBtn.addEventListener('click', async () => {
-    if (processing || historyBatchRunning) return;
-    const report = renderAccountPreflight();
-    if (report.accounts.length === 0) {
-        alert('请输入账号信息');
-        return;
-    }
-    if (report.errors.length || report.duplicates.length) {
-        alert(`输入检查未通过：${report.errors.length} 行格式错误，${report.duplicates.length} 行重复。请修正后再开始。`);
-        return;
-    }
-    const autoDeliver = autoDeliveryConfigured === true && Boolean(autoDeliverToggle?.checked);
-    if (autoDeliver && !await prepareDeliveryBatch()) return;
-    if (!validateAccountNamePrefix()) return;
-    const namePrefix = normalizeNamePrefix(accountNamePrefix.value);
+    if (processing || historyBatchRunning || startBatchInFlight) return;
+    startBatchInFlight = true;
+    startBtn.disabled = true;
+    try {
+        const report = renderAccountPreflight();
+        if (report.accounts.length === 0) {
+            alert('请输入账号信息');
+            return;
+        }
+        if (report.errors.length || report.duplicates.length) {
+            alert(`输入检查未通过：${report.errors.length} 行格式错误，${report.duplicates.length} 行重复。请修正后再开始。`);
+            return;
+        }
+        const autoDeliver = autoDeliveryConfigured === true && Boolean(autoDeliverToggle?.checked);
+        if (autoDeliver && !await prepareDeliveryBatch()) return;
+        if (processing || historyBatchRunning) return;
+        if (!validateAccountNamePrefix()) return;
+        const namePrefix = normalizeNamePrefix(accountNamePrefix.value);
 
-    accounts = report.accounts.map((account, index) => ({
-        id: index,
-        email: account.email,
-        password: account.password,
-        totp_secret: account.totp_secret,
-        status: 'pending',
-        message: '等待处理',
-        result: null,
-        autoDeliver,
-        namePrefix,
-        deliveryOptions: autoDeliver ? copyDeliveryOptions({ ...deliveryBatchOptions, name_prefix: namePrefix }) : null
-    }));
+        accounts = report.accounts.map((account, index) => ({
+            id: index,
+            email: account.email,
+            password: account.password,
+            totp_secret: account.totp_secret,
+            status: 'pending',
+            message: '等待处理',
+            result: null,
+            autoDeliver,
+            namePrefix,
+            deliveryOptions: autoDeliver ? copyDeliveryOptions({ ...deliveryBatchOptions, name_prefix: namePrefix }) : null
+        }));
 
-    results = [];
-    await runAccounts(accounts);
+        results = [];
+        await runAccounts(accounts);
+    } finally {
+        startBatchInFlight = false;
+        if (!processing && !historyBatchRunning) startBtn.disabled = false;
+    }
 });
 
 retryFailedBtn.addEventListener('click', () => {
@@ -707,8 +716,9 @@ function historyRefreshDelay() {
     const checking = [...historyChecks.values()].some(item => ['queued', 'running'].includes(item.latest_task?.state));
     const recovering = [...historyRecoveries.values()].some(item => historyRecoveryActive(item));
     const delivering = [...historyDeliveries.values()].some(item => ['queued', 'checking', 'importing', 'verifying', 'working'].includes(item.state));
+    const repairing = [...historyRepairs.values()].some(item => ['queued', 'checking', 'retry_wait'].includes(item.state));
     const waiting = [...historyRecoveries.values(), ...historyDeliveries.values()].some(item => item.next_retry_at && !item.requires_action && !['completed', 'success', 'canceled'].includes(item.state));
-    return checking || recovering || delivering || historyRecoveryRequests.size || recoverySettings.scanning ? 5000
+    return checking || recovering || delivering || repairing || historyRecoveryRequests.size || recoverySettings.scanning ? 5000
         : recoverySettings.autoRecoveryEnabled || waiting ? 60000 : 5 * 60000;
 }
 

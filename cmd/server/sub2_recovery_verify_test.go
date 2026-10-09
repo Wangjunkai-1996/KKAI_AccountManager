@@ -107,6 +107,7 @@ func TestRecoveryVerifyErrorClassification(t *testing.T) {
 		{"revoked", `{"type":"error","error":{"code":"token_revoked","status":401,"message":"at-secret"}}`, "credential_invalid", true, false},
 		{"upstream_401", `{"type":"error","status":401}`, "credential_invalid", true, false},
 		{"disabled", `{"type":"error","error":{"code":"account_deactivated","status":401}}`, "account_unavailable", false, true},
+		{"wrapped_upstream_401", `{"type":"error","error":"API returned 401: {\"error\":{\"code\":\"token_revoked\"}}"}`, "credential_invalid", true, false},
 		{"limited", `{"type":"error","status":429}`, "rate_limited", false, false},
 		{"server_error", `{"type":"error","status":503}`, "upstream_error", false, false},
 		{"opaque_error", `{"type":"error","error":"token_revoked at-secret"}`, "probe_failed", false, false},

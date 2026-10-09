@@ -10,8 +10,9 @@ import (
 )
 
 var (
-	ErrAccountDeliveryNotFound = errors.New("account delivery not found")
-	ErrAccountDeliverySettled  = errors.New("account delivery is already settled")
+	ErrAccountDeliveryNotFound       = errors.New("account delivery not found")
+	ErrAccountDeliverySettled        = errors.New("account delivery is already settled")
+	ErrAccountDeliveryRequiresAction = errors.New("account delivery requires manual action")
 )
 
 // AccountDelivery tracks a login's handoff without exposing its credentials or

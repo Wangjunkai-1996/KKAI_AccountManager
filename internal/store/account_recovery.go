@@ -15,6 +15,7 @@ var (
 	ErrAccountRecoveryNotQueued      = errors.New("account recovery task is not queued")
 	ErrAccountRecoveryVersionChanged = errors.New("account credentials changed since recovery started")
 	ErrAccountRecoveryNotResumable   = errors.New("account recovery has no reusable credential checkpoint")
+	ErrAccountRecoveryStale          = errors.New("account recovery failure result is stale")
 )
 
 const (
@@ -71,6 +72,10 @@ type RecoveryFailure struct {
 	RetryAction  string
 	NextRetryAt  *time.Time
 	ManualAction string
+	// ExpectedState and ExpectedUpdatedAt optionally fence a late worker result
+	// to the task snapshot it observed before making a remote request.
+	ExpectedState     string
+	ExpectedUpdatedAt int64
 }
 
 func (s *Store) migrateAccountRecoveryTasks() error {
@@ -313,12 +318,15 @@ func (s *Store) GetLatestAccountRecoveryTask(ctx context.Context, accountID int6
 	return scanAccountRecoveryTask(s.db.QueryRowContext(ctx, accountRecoverySelect+` WHERE t.account_id=? ORDER BY t.id DESC LIMIT 1`, accountID))
 }
 
-// ClaimAccountRecoveryTask atomically moves a queued task to logging_in.
+// ClaimAccountRecoveryTask atomically claims a queued task for validation.
+// The worker records logging_in only after it has durably disabled the remote
+// schedule; this prevents a restart immediately after claim from pretending
+// that it owns an operator's pause.
 func (s *Store) ClaimAccountRecoveryTask(ctx context.Context, id int64) (AccountRecoveryTask, error) {
 	if id <= 0 {
 		return AccountRecoveryTask{}, ErrAccountRecoveryNotFound
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE account_recovery_tasks SET state='logging_in',updated_at=? WHERE id=? AND state='queued'`, time.Now().UnixMilli(), id)
+	result, err := s.db.ExecContext(ctx, `UPDATE account_recovery_tasks SET state='validating',updated_at=? WHERE id=? AND state='queued'`, time.Now().UnixMilli(), id)
 	if err != nil {
 		return AccountRecoveryTask{}, err
 	}
@@ -390,7 +398,17 @@ func (s *Store) RecordAccountRecoveryFailure(ctx context.Context, id int64, fail
 		}
 		next = failure.NextRetryAt.UnixMilli()
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE account_recovery_tasks SET state=?,last_error=?,failure_stage=?,error_code=?,retry_action=?,next_retry_at=?,retry_count=retry_count+1,manual_action=?,updated_at=? WHERE id=? AND state NOT IN ('completed','canceled')`, failure.State, strings.TrimSpace(failure.Message), strings.TrimSpace(failure.Stage), strings.TrimSpace(failure.Code), failure.RetryAction, next, strings.TrimSpace(failure.ManualAction), time.Now().UnixMilli(), id)
+	query := `UPDATE account_recovery_tasks SET state=?,last_error=?,failure_stage=?,error_code=?,retry_action=?,next_retry_at=?,retry_count=retry_count+1,manual_action=?,updated_at=? WHERE id=? AND state NOT IN ('completed','canceled')`
+	args := []any{failure.State, strings.TrimSpace(failure.Message), strings.TrimSpace(failure.Stage), strings.TrimSpace(failure.Code), failure.RetryAction, next, strings.TrimSpace(failure.ManualAction), time.Now().UnixMilli(), id}
+	if strings.TrimSpace(failure.ExpectedState) != "" {
+		query += ` AND state=?`
+		args = append(args, strings.TrimSpace(failure.ExpectedState))
+	}
+	if failure.ExpectedUpdatedAt > 0 {
+		query += ` AND updated_at=?`
+		args = append(args, failure.ExpectedUpdatedAt)
+	}
+	result, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return AccountRecoveryTask{}, err
 	}
@@ -400,6 +418,9 @@ func (s *Store) RecordAccountRecoveryFailure(ctx context.Context, id int64, fail
 		task, err := s.GetAccountRecoveryTaskByID(ctx, id)
 		if err != nil {
 			return task, err
+		}
+		if failure.ExpectedState != "" || failure.ExpectedUpdatedAt > 0 {
+			return task, ErrAccountRecoveryStale
 		}
 		return task, ErrAccountRecoveryNotResumable
 	}

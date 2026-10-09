@@ -74,6 +74,9 @@ func TestRecoveryRetryCheckpointNeverAdoptsNewerLogin(t *testing.T) {
 	if _, err := s.ClaimAccountRecoveryTask(ctx, task.ID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.UpdateAccountRecoveryTask(ctx, task.ID, RecoveryLoggingIn, "test pause confirmed"); err != nil {
+		t.Fatal(err)
+	}
 	lease, err := s.AcquireAccountRecovery(ctx, id)
 	if err != nil {
 		t.Fatal(err)
