@@ -73,7 +73,10 @@ func (e *authHTTPStatusError) Error() string {
 }
 
 func (e *authHTTPStatusError) retryable() bool {
-	if errors.Is(e, ErrCloudflareChallenge) || accountStatusForAuthError(e.UpstreamCode, e.Message) != "" {
+	if errors.Is(e, ErrCloudflareChallenge) {
+		return true
+	}
+	if accountStatusForAuthError(e.UpstreamCode, e.Message) != "" {
 		return false
 	}
 	return e.Status == http.StatusTooManyRequests || e.Status >= http.StatusInternalServerError
@@ -221,14 +224,23 @@ func (s *Service) loginThroughUpstream(ctx context.Context, email, password, tot
 }
 
 func (s *Service) loginWithRetries(ctx context.Context, email, password, totpSecret string) (*LoginResult, error) {
+	return loginWithRetries(ctx, s.config.RetryCount, func(ctx context.Context) (*LoginResult, error) {
+		return s.loginAttempt(ctx, email, password, totpSecret)
+	})
+}
+
+func loginWithRetries(ctx context.Context, retryCount int, attemptFunc func(context.Context) (*LoginResult, error)) (*LoginResult, error) {
+	if retryCount < 0 {
+		retryCount = 0
+	}
 	var lastErr error
 
-	for attempt := 0; attempt <= s.config.RetryCount; attempt++ {
+	for attempt := 0; attempt <= retryCount; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		if attempt > 0 {
-			log.Printf("   🔄 重试 %d/%d", attempt, s.config.RetryCount)
+			log.Printf("   🔄 重试 %d/%d", attempt, retryCount)
 			var retryAfter time.Duration
 			var statusErr *authHTTPStatusError
 			if errors.As(lastErr, &statusErr) {
@@ -238,13 +250,17 @@ func (s *Service) loginWithRetries(ctx context.Context, email, password, totpSec
 			if retryDelayExceedsDeadline(ctx, delay) {
 				return nil, lastErr
 			}
-			emitProgress(ctx, "retry_wait", fmt.Sprintf("正在等待第 %d 次重试", attempt))
+			message := fmt.Sprintf("正在等待第 %d 次重试", attempt)
+			if errors.Is(lastErr, ErrCloudflareChallenge) {
+				message = fmt.Sprintf("浏览器验证未通过，正在等待第 %d 次自动重试", attempt)
+			}
+			emitProgress(ctx, "retry_wait", message)
 			if err := waitContext(ctx, delay); err != nil {
 				return nil, err
 			}
 		}
 
-		result, err := s.loginAttempt(ctx, email, password, totpSecret)
+		result, err := attemptFunc(ctx)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -262,13 +278,13 @@ func (s *Service) loginWithRetries(ctx context.Context, email, password, totpSec
 		if errors.As(err, &statusErr) && !statusErr.retryable() {
 			return nil, err
 		}
-		if errors.Is(err, ErrCloudflareChallenge) || errors.Is(err, ErrUnsupportedRegion) ||
+		if errors.Is(err, ErrUnsupportedRegion) ||
 			errors.Is(err, ErrUnexpectedAuthPage) || errors.Is(err, ErrAuthConnectionReset) {
 			return nil, err
 		}
 	}
 
-	return nil, fmt.Errorf("登录失败（已重试 %d 次）: %w", s.config.RetryCount, lastErr)
+	return nil, fmt.Errorf("登录失败（已重试 %d 次）: %w", retryCount, lastErr)
 }
 
 const (
@@ -652,8 +668,18 @@ func waitOAuthCallbackContext(ctx context.Context, page playwright.Page, callbac
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		if err := takeAuthFailure(challenges, authStatusCh); err != nil {
-			return "", authFailureWithPage(page, err)
+		if err := takeAuthFailure(nil, authStatusCh); err != nil {
+			if !errors.Is(err, ErrCloudflareChallenge) {
+				return "", authFailureWithPage(page, err)
+			}
+			if recoveryErr := waitChallengeRecovery(ctx, page, challenges, authStatusCh, err); recoveryErr != nil {
+				return "", recoveryErr
+			}
+		}
+		if takeSignal(challenges) {
+			if recoveryErr := waitChallengeRecovery(ctx, page, challenges, authStatusCh, cloudflareError()); recoveryErr != nil {
+				return "", recoveryErr
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -661,12 +687,17 @@ func waitOAuthCallbackContext(ctx context.Context, page playwright.Page, callbac
 		case callback := <-callbacks:
 			return callback, nil
 		case <-challenges:
-			if err := takeAuthFailure(nil, authStatusCh); err != nil {
+			if err := waitChallengeRecovery(ctx, page, challenges, authStatusCh, cloudflareError()); err != nil {
 				return "", err
 			}
-			return "", cloudflareError()
 		case err := <-authStatusCh:
 			if err != nil {
+				if errors.Is(err, ErrCloudflareChallenge) {
+					if recoveryErr := waitChallengeRecovery(ctx, page, challenges, authStatusCh, err); recoveryErr != nil {
+						return "", recoveryErr
+					}
+					continue
+				}
 				return "", authFailureWithPage(page, err)
 			}
 		case <-deadline.C:
@@ -717,6 +748,61 @@ func waitOAuthCallbackContext(ctx context.Context, page playwright.Page, callbac
 				return "", err
 			}
 			consentSubmitted = true
+		}
+	}
+}
+
+// waitChallengeRecovery gives the current browser a bounded chance to finish
+// a verification. If it remains blocked, the outer login retry creates a fresh
+// browser attempt instead of replaying credentials in the challenged page.
+func waitChallengeRecovery(ctx context.Context, page playwright.Page, challenges <-chan struct{}, statuses <-chan error, terminal error) error {
+	if terminal == nil {
+		terminal = cloudflareError()
+	}
+	if page == nil {
+		return terminal
+	}
+	if !isCloudflareChallenge(page) {
+		if err := drainChallengeSignals(challenges, statuses); err != nil {
+			return authFailureWithPage(page, err)
+		}
+		return terminal
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !isCloudflareChallenge(page) {
+			if err := drainChallengeSignals(challenges, statuses); err != nil {
+				return authFailureWithPage(page, err)
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err, ok := <-statuses:
+			if !ok {
+				statuses = nil
+				continue
+			}
+			if err != nil && !errors.Is(err, ErrCloudflareChallenge) {
+				return authFailureWithPage(page, err)
+			}
+		case _, ok := <-challenges:
+			if !ok {
+				challenges = nil
+			}
+		case <-waitCtx.Done():
+			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+				return terminal
+			}
+			return waitCtx.Err()
+		case <-ticker.C:
 		}
 	}
 }
@@ -961,7 +1047,7 @@ func navigateAuthorize(ctx context.Context, page playwright.Page, authorizeURL s
 					StatusText: response.StatusText(),
 					Path:       path,
 					Stage:      LoginStageChallenge,
-					Message:    "Cloudflare challenge：页面要求完成浏览器验证，自动登录流程已停止",
+					Message:    "Cloudflare challenge：浏览器验证未通过，当前尝试结束并自动重试",
 					Cause:      ErrCloudflareChallenge,
 					RetryAfter: parseRetryAfter(retryAfter, time.Now()),
 				})
@@ -1273,7 +1359,7 @@ func observeAuthResponses(page playwright.Page, challenges chan<- struct{}, stat
 			if isChallenge {
 				err.Cause = ErrCloudflareChallenge
 				err.Stage = LoginStageChallenge
-				err.Message = "Cloudflare challenge：页面要求完成浏览器验证，自动登录流程已停止"
+				err.Message = "Cloudflare challenge：浏览器验证未通过，当前尝试结束并自动重试"
 			} else if strings.Contains(strings.ToLower(contentType), "json") {
 				// Body() needs the Playwright event loop to advance, so let this
 				// response callback return before waiting for it.
@@ -1475,7 +1561,7 @@ func authPageSummary(page playwright.Page, email string) string {
 }
 
 func cloudflareError() error {
-	return fmt.Errorf("%w：页面要求完成浏览器验证，自动登录流程已停止", ErrCloudflareChallenge)
+	return fmt.Errorf("%w：浏览器验证未通过，当前尝试结束并自动重试", ErrCloudflareChallenge)
 }
 
 func takeSignal(ch <-chan struct{}) bool {

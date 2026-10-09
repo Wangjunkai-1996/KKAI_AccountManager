@@ -164,6 +164,77 @@ func TestAuthHTTPStatusErrorClassification(t *testing.T) {
 	}
 }
 
+func TestLoginWithRetriesRetriesCloudflareChallenge(t *testing.T) {
+	var progress []Progress
+	ctx := startProgress(WithProgress(context.Background(), func(update Progress) {
+		progress = append(progress, update)
+	}))
+	defer finishProgress(ctx)
+
+	attempts := 0
+	result, err := loginWithRetries(ctx, 1, func(context.Context) (*LoginResult, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, &authHTTPStatusError{
+				Status:     http.StatusForbidden,
+				Cause:      ErrCloudflareChallenge,
+				RetryAfter: time.Millisecond,
+				Message:    "challenge",
+			}
+		}
+		return &LoginResult{Email: "fixture@example.com"}, nil
+	})
+	if err != nil || result == nil || result.Email != "fixture@example.com" {
+		t.Fatalf("loginWithRetries() = %#v, %v; want successful second attempt", result, err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	foundRetryProgress := false
+	for _, update := range progress {
+		if update.Stage == "retry_wait" && strings.Contains(update.Message, "浏览器验证") {
+			foundRetryProgress = true
+			break
+		}
+	}
+	if !foundRetryProgress {
+		t.Fatalf("progress = %#v, want browser challenge retry_wait", progress)
+	}
+}
+
+func TestLoginWithRetriesKeepsTerminalFailuresTerminal(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{name: "unsupported region", err: ErrUnsupportedRegion},
+		{name: "ordinary forbidden", err: &authHTTPStatusError{Status: http.StatusForbidden}},
+		{name: "deleted account", err: &authHTTPStatusError{Status: http.StatusInternalServerError, UpstreamCode: "account_deleted"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			attempts := 0
+			_, err := loginWithRetries(context.Background(), 2, func(context.Context) (*LoginResult, error) {
+				attempts++
+				return nil, tt.err
+			})
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("error = %v, want %v", err, tt.err)
+			}
+			if attempts != 1 {
+				t.Fatalf("attempts = %d, want 1", attempts)
+			}
+		})
+	}
+}
+
+func TestDescribeErrorMarksCloudflareChallengeRetryable(t *testing.T) {
+	err := &authHTTPStatusError{Status: http.StatusForbidden, Cause: ErrCloudflareChallenge}
+	info := DescribeError(err)
+	if !info.Retryable || info.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("DescribeError() = %#v, want retryable challenge with HTTP 403", info)
+	}
+}
+
 func TestAuthHTTPStatus(t *testing.T) {
 	if status, ok := AuthHTTPStatus(&authHTTPStatusError{Status: http.StatusForbidden}); !ok || status != http.StatusForbidden {
 		t.Fatalf("AuthHTTPStatus() = %d, %v; want 403, true", status, ok)

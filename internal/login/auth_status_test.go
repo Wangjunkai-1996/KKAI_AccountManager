@@ -102,8 +102,8 @@ func TestAuthChallengeStatusBrowser(t *testing.T) {
 				t.Fatalf("lost HTTP status or challenge detail: %v", err)
 			}
 			var statusErr *authHTTPStatusError
-			if !errors.As(err, &statusErr) || statusErr.retryable() {
-				t.Fatalf("retry policy allowed terminal 403: %v", err)
+			if !errors.As(err, &statusErr) || !statusErr.retryable() {
+				t.Fatalf("retry policy did not allow challenge retry: %v", err)
 			}
 			if submissions.Load() != 1 {
 				t.Fatalf("auth submitted %d times, want once", submissions.Load())

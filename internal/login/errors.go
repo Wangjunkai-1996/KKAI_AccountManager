@@ -86,6 +86,9 @@ func DescribeError(err error) LoginErrorInfo {
 			info.Stage = statusErr.Stage
 		}
 	}
+	if errors.Is(err, ErrCloudflareChallenge) {
+		info.Retryable = true
+	}
 	var rejection *authRejectionError
 	if errors.As(err, &rejection) {
 		if code := normalizeAuthCode(rejection.Code); code != "" {
@@ -206,13 +209,16 @@ func safeLoginMessage(err error) string {
 	}
 	var statusErr *authHTTPStatusError
 	if errors.As(err, &statusErr) {
+		if errors.Is(err, ErrCloudflareChallenge) {
+			return "浏览器验证未通过，已纳入自动重试"
+		}
 		if message := sanitizeLoginText(statusErr.Message); message != "" {
 			return message
 		}
 		return fmt.Sprintf("OpenAI 认证服务返回 HTTP %d", statusErr.Status)
 	}
 	if errors.Is(err, ErrCloudflareChallenge) {
-		return "页面要求完成浏览器验证，自动登录流程已停止"
+		return "浏览器验证未通过，已纳入自动重试"
 	}
 	if errors.Is(err, ErrUnsupportedRegion) {
 		return ErrUnsupportedRegion.Error()

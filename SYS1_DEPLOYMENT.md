@@ -411,6 +411,6 @@ ssh sys1 'curl -fsS http://127.0.0.1:18082/health'
 
 ## 浏览器 OAuth 的历史限制
 
-sys1 IPv4 `51.81.109.154` 访问 `auth.openai.com/oauth/authorize` 仍可能收到 Cloudflare `403` 和 `cf-mitigated: challenge`；此前 release 已在 sys1 本机用原生 Chrome、无头 Playwright 两条路径复现，且在初始授权文档和表单提交请求中都观察到过。顶层文档 challenge 会等待 25 秒观察浏览器验证；表单的 fetch/XHR challenge 不重放提交，直接保留真实 403 并准确分类。此前使用 `45.39.200.210:7275` 代理时，真实账号已连续完成 4 次 MFA、授权和 token 交换；当前默认代理为 `45.39.200.204:7269`，历史代理检查可达并返回认证站 HTTP 403。页面显示 challenge 时不要把它解释为密码错误或账号已删除。本次 Tab UI 发布未重做真实 OAuth 验收。
+sys1 IPv4 `51.81.109.154` 访问 `auth.openai.com/oauth/authorize` 仍可能收到 Cloudflare `403` 和 `cf-mitigated: challenge`；此前 release 已在 sys1 本机用原生 Chrome、无头 Playwright 两条路径复现，且在初始授权文档和表单提交请求中都观察到过。当前版本对初始导航和表单阶段的 challenge 都先等待当前浏览器最多 25 秒；未通过时按 `RetryCount` 和总超时重新创建浏览器，保留真实 HTTP 状态并准确分类。此前使用 `45.39.200.210:7275` 代理时，真实账号已连续完成 4 次 MFA、授权和 token 交换；当前默认代理为 `45.39.200.204:7269`，历史代理检查可达并返回认证站 HTTP 403。页面显示 challenge 时不要把它解释为密码错误或账号已删除。本次 Tab UI 发布未重做真实 OAuth 验收。
 
 需要继续排查时，先记录授权请求的 HTTP 状态、`cf-mitigated`、出口和浏览器启动参数，再决定是否更换出口或调整浏览器验证流程。
