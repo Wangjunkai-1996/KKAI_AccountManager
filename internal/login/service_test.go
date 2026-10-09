@@ -233,6 +233,11 @@ func TestDescribeErrorMarksCloudflareChallengeRetryable(t *testing.T) {
 	if !info.Retryable || info.HTTPStatus != http.StatusForbidden {
 		t.Fatalf("DescribeError() = %#v, want retryable challenge with HTTP 403", info)
 	}
+	deleted := &authHTTPStatusError{Status: http.StatusForbidden, Cause: ErrCloudflareChallenge, UpstreamCode: "account_deleted"}
+	info = DescribeError(deleted)
+	if info.Retryable || info.AccountStatus != "deleted" {
+		t.Fatalf("DescribeError() = %#v, want terminal deleted account despite challenge cause", info)
+	}
 }
 
 func TestAuthHTTPStatus(t *testing.T) {

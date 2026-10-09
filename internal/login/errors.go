@@ -73,10 +73,12 @@ func DescribeError(err error) LoginErrorInfo {
 		Code:    classifyLoginCode(err),
 		Message: safeLoginMessage(err),
 	}
+	statusAccountStatus := ""
 	var statusErr *authHTTPStatusError
 	if errors.As(err, &statusErr) {
 		info.HTTPStatus = statusErr.Status
 		info.Retryable = statusErr.retryable()
+		statusAccountStatus = accountStatusForAuthError(statusErr.UpstreamCode, statusErr.Message)
 		if statusErr.UpstreamCode != "" && !errors.Is(err, ErrCloudflareChallenge) {
 			if code := normalizeAuthCode(statusErr.UpstreamCode); code != "" {
 				info.Code = code
@@ -101,7 +103,11 @@ func DescribeError(err error) LoginErrorInfo {
 			info.Message = message
 		}
 	}
-	info.AccountStatus = accountStatusForAuthError(info.Code, info.Message)
+	if statusAccountStatus != "" {
+		info.AccountStatus = statusAccountStatus
+	} else {
+		info.AccountStatus = accountStatusForAuthError(info.Code, info.Message)
+	}
 	if info.AccountStatus != "" {
 		info.Retryable = false
 	}

@@ -73,11 +73,11 @@ func (e *authHTTPStatusError) Error() string {
 }
 
 func (e *authHTTPStatusError) retryable() bool {
-	if errors.Is(e, ErrCloudflareChallenge) {
-		return true
-	}
 	if accountStatusForAuthError(e.UpstreamCode, e.Message) != "" {
 		return false
+	}
+	if errors.Is(e, ErrCloudflareChallenge) {
+		return true
 	}
 	return e.Status == http.StatusTooManyRequests || e.Status >= http.StatusInternalServerError
 }
@@ -1427,8 +1427,20 @@ func waitForAuthSelector(ctx context.Context, page playwright.Page, selector str
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := takeAuthFailure(challenges, statuses); err != nil {
-			return authFailureWithPage(page, err)
+		if err := takeAuthFailure(nil, statuses); err != nil {
+			if !errors.Is(err, ErrCloudflareChallenge) {
+				return authFailureWithPage(page, err)
+			}
+			if recoveryErr := waitChallengeRecovery(ctx, page, challenges, statuses, err); recoveryErr != nil {
+				return recoveryErr
+			}
+			continue
+		}
+		if takeSignal(challenges) {
+			if recoveryErr := waitChallengeRecovery(ctx, page, challenges, statuses, cloudflareError()); recoveryErr != nil {
+				return recoveryErr
+			}
+			continue
 		}
 		if rejection := accountRejectionOnPage(page); rejection != nil {
 			return rejection
@@ -1445,13 +1457,19 @@ func waitForAuthSelector(ctx context.Context, page playwright.Page, selector str
 			return ctx.Err()
 		case err := <-statuses:
 			if err != nil {
+				if errors.Is(err, ErrCloudflareChallenge) {
+					if recoveryErr := waitChallengeRecovery(ctx, page, challenges, statuses, err); recoveryErr != nil {
+						return recoveryErr
+					}
+					continue
+				}
 				return authFailureWithPage(page, err)
 			}
 		case <-challenges:
-			if err := takeAuthFailure(nil, statuses); err != nil {
-				return err
+			if recoveryErr := waitChallengeRecovery(ctx, page, challenges, statuses, cloudflareError()); recoveryErr != nil {
+				return recoveryErr
 			}
-			return cloudflareError()
+			continue
 		case <-deadline.C:
 			if err := detectAccessBlock(page, challenges, statuses); err != nil {
 				return err
