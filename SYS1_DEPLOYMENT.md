@@ -4,6 +4,34 @@
 
 > 这是 sys1 线上事实的唯一权威文档。新对话先读取 `DOCS_INDEX.md` 和 `NEW_CHAT_CONTEXT.md`，发生冲突时以本文的服务、端口、release、健康检查和验收结论为准。
 
+## 401 自动恢复冷却修复（2026-10-09 12:25 上海时间）
+
+- 04:25:35 UTC（北京时间 12:25:35）上线 `20261009T042256Z-401-recovery`，来自 Mac 上干净代码提交 `e96d8b7effb0dab2a9c5ce44a2faf94af72b4583`。用户授权全部工作区提交推送，51 个文件已提交并通过本地 Clash HTTP 代理推送 `origin/main`；发布后另行提交本文等记录。二进制 SHA-256：`dfe80de83925b1db32262190d99fe9685cb55b938905267b941031a6817adf21`。
+- 根因是 `automaticRecoveryAllowed` 将成功交付/恢复也按 30 分钟冷却处理，拦住后续巡检和当前 401 回调。现在仅非成功任务保留该冷却；持久失败退避、人工处理、人工暂停、身份/凭据版本和去重门禁保留。五个新增回归场景先失败复现，修复后与相关定向 race 测试全部通过。
+- 只发布 AUTH。Mac 构建产物直接上传 sys1，保留现有 Node/driver。隔离候选使用 71 账号的一致性数据库副本，自动恢复关闭、Sub2 未配置、显式交付/资料任务清空；候选健康、静态资源、数据库完整性、运行时 hash 和旧二进制兼容全部通过。两次在途守卫（停服前/后）均为 0。
+- 发布前备份 `/var/lib/openai-login/backups/accounts-before-20261009T042256Z-401-recovery.db`，1,597,440 字节、0600、integrity_check=ok。回滚 `20261008T182221Z-compact-login`，SHA-256 `666dd45943cf05c3becf859c7144a6043742fd0e466888cb54c1df08ef853534`；不回退覆盖业务数据库。
+- 04:29:34 UTC 延迟复核 active/running、NRestarts=0、实际二进制 PID 3999576、二进制及静态 hash 一致。自动恢复 enabled/running，上次扫描推进到 04:28:35，错误/阻塞为空。AUTH 对应 Nginx server block 有效路由为 `/run/tls/auth/login.sock`，本机/socket health 正常，公网未认证 HTTP401；默认代理环境保持为空。
+- 从服务启动 04:25:35 UTC 起审查日志，panic/fatal/数据库锁/存储故障/监听失败/OAuth拒绝/OAuth 5xx 聚合均为 0。生产数据库及备份完整性、回滚二进制/Node/driver 全部核验通过。快照：accounts 71、recovery tasks 86、deliveries 16、rechecks 26、repairs 0。
+- 完整测试套件未运行；本轮未人为触发真实 OAuth、新建带分组账号或生产故障。账号 322/323 在本次发布前已经通过用户手动恢复，不作为本次自动恢复修复的线上业务验收证据；本次新的 401 立即入队行为由定向回归验证。未重跑前端视觉验收（静态资源与上一线上版本一致）。
+- 远端 release 证据：`DEPLOYMENT.json`、`CANDIDATE_ACCEPTANCE.json`、`ACCEPTANCE.json`、`DELAYED_ACCEPTANCE.json`。正式/回滚版本及备份保留；临时候选和上传产物按下列清理命令移除。
+
+验证命令如下：第一条在修复前复现预期失败，其覆盖范围随后包含在通过的 race 命令中；其余检查全部通过。远端临时脚本在清理后不再保留，下列命令为执行记录。
+
+```bash
+go test ./cmd/server -run '^TestSub2MonitorAfterCompleted' -count=1 -timeout=60s
+go test -race ./cmd/server -run 'TestSub2(Monitor|AutomaticCheck|RecoveryDoesNotReopenActiveManualPause|Recheck)' -count=1 -timeout=90s
+go test -race ./cmd/server ./internal/store -run '^Test(DeliveryOptions|DeliveryRecovery|Sub2ManualImport|Sub2Import|AccountDelivery|AccountRecovery|AccountCredential|AutoRecovery|RunWithHistory|CredentialRepair|History|DirectProxy|Recovery|Sub2Recovery(ValidateCandidate|AutoSettings|LogsIn|Preserves|Rejects|Cannot|Invalid|DoesNotUse|Changes|AllowsDifferent|AllowsMissing|Resume|Automatic|Retry|Temporary|Delivery|Storage|Checkpoint|Adopts|Rechecks))' -count=1 -timeout=90s
+go test -race ./internal/login -run '^Test(DirectIPv4|ProxyRelay|CheckProxyURL|ValidateHTTPProxy|DeadlineCanceledLogin|DeadlineCancelsToken|ParseJWT|ParseOAuthIdentity)' -count=1 -timeout=90s
+node cmd/server/client.test.cjs
+node cmd/server/account-checks.test.cjs
+./build-linux.sh /tmp/openai-login-20261009T042256Z-401-recovery
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-stage-401-recovery.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-deploy-401-recovery.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-verify-401-recovery.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-cleanup-401-recovery.py'
+git diff --check
+```
+
 ## 批量登录紧凑布局（2026-10-09 02:25 上海时间）
 
 - 2026-10-08 18:25:11 UTC 切换 `20261008T182221Z-compact-login`，SHA-256 `666dd45943cf05c3becf859c7144a6043742fd0e466888cb54c1df08ef853534`。本地 `main` HEAD `4efcdff` 加未提交改动，Mac 构建、直接上传 sys1；无代码托管同步。本轮仅变更 AUTH 前端布局和提示。
@@ -80,9 +108,9 @@ git diff --check
 
 ## 默认 IPv4 直连（当前配置）
 
-2026-10-08 08:30 UTC（北京时间 16:30）按用户要求移除 sys1 的默认代理：`/etc/openai-login/proxy.env` 中 `OPENAI_LOGIN_PROXY` 为空。当前 `20261008T182221Z-compact-login` 的登录代理框留空即走服务器 IPv4；Chrome 与 token 交换使用同一 tcp4 出口，检测页面也默认选择 IPv4，自动检测无代理时自行选择直连。账号自己保存或本次明确填写的代理仍优先。
+2026-10-08 08:30 UTC（北京时间 16:30）按用户要求移除 sys1 的默认代理：`/etc/openai-login/proxy.env` 中 `OPENAI_LOGIN_PROXY` 为空。当前 `20261009T042256Z-401-recovery` 的登录代理框留空即走服务器 IPv4；Chrome 与 token 交换使用同一 tcp4 出口，检测页面也默认选择 IPv4，自动检测无代理时自行选择直连。账号自己保存或本次明确填写的代理仍优先。
 
-旧配置仅以 0600 权限保存在 `/var/lib/openai-login/backups/proxy.env-before-20261008T082500Z-ipv4-default`，未继续注入运行进程。当前回滚版本为 `20261008T180135Z-account-prefix`。空代理网络检查返回 `mode=direct,reachable=true`；HTTP 客户端仍收到认证站 403，这不等同于浏览器 OAuth 失败，也不证明完整登录成功。2026-10-08 08:46 UTC 已按用户授权使用历史账号 279 实测默认 IPv4：完整 OAuth 成功，耗时 7,224ms，AT/RT 已加密保存，attempt 290 为 success；日志确认无外部代理回退、无 challenge。先测的账号 278 两次在 MFA 返回 incorrect_code，具体资料/验证方式原因待确认。完整记录见 [IPv4 实测](SYS1_IPV4_OAUTH_DIAGNOSIS.md)。单次成功不代表长期成功率。
+旧配置仅以 0600 权限保存在 `/var/lib/openai-login/backups/proxy.env-before-20261008T082500Z-ipv4-default`，未继续注入运行进程。当前回滚版本为 `20261008T182221Z-compact-login`。空代理网络检查返回 `mode=direct,reachable=true`；HTTP 客户端仍收到认证站 403，这不等同于浏览器 OAuth 失败，也不证明完整登录成功。2026-10-08 08:46 UTC 已按用户授权使用历史账号 279 实测默认 IPv4：完整 OAuth 成功，耗时 7,224ms，AT/RT 已加密保存，attempt 290 为 success；日志确认无外部代理回退、无 challenge。先测的账号 278 两次在 MFA 返回 incorrect_code，具体资料/验证方式原因待确认。完整记录见 [IPv4 实测](SYS1_IPV4_OAUTH_DIAGNOSIS.md)。单次成功不代表长期成功率。
 
 ## 默认 IPv4 切换验收（2026-10-08）
 
@@ -139,11 +167,11 @@ git diff --check
 
 当前部署基线（2026-10-09 上海时间发布后确认）：
 
-- 当前 release：`20261008T182221Z-compact-login`
-- 构建来源：本地 `main` HEAD `4efcdff3722b3457831ac9db2e36473aa36f8597` 加未提交工作区改动；未执行代码托管同步
-- 当前二进制 SHA-256：`666dd45943cf05c3becf859c7144a6043742fd0e466888cb54c1df08ef853534`
-- 回滚 release：`20261008T180135Z-account-prefix`
-- 回滚二进制 SHA-256：`7023dc1060ed8b901b5772e61a5a3a914f574282dbbddd4f38258391ac3192cb`
+- 当前 release：`20261009T042256Z-401-recovery`
+- 构建来源：本地 `main` 代码提交 `e96d8b7effb0dab2a9c5ce44a2faf94af72b4583`，已推送 `origin/main`；构建时工作区干净，随后提交发布记录
+- 当前二进制 SHA-256：`dfe80de83925b1db32262190d99fe9685cb55b938905267b941031a6817adf21`
+- 回滚 release：`20261008T182221Z-compact-login`
+- 回滚二进制 SHA-256：`666dd45943cf05c3becf859c7144a6043742fd0e466888cb54c1df08ef853534`
 - 当前服务应保持 `active (running)`，且 `NRestarts=0`
 - 当前服务端并发硬上限：10；页面选择的并发数由前端 worker 控制，实际不超过该上限。
 - 页面代理留空时默认走 sys1 IPv4 直连；`/etc/openai-login/proxy.env` 的 `OPENAI_LOGIN_PROXY` 已清空，旧代理仅保留为服务器上的 0600 配置备份。
