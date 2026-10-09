@@ -4,6 +4,12 @@
 
 > 新对话请先读取 `DOCS_INDEX.md`、`NEW_CHAT_CONTEXT.md` 和 `SYS1_DEPLOYMENT.md`。当前 sys1 已部署 `openai-login.service`；服务健康不等于真实 OAuth 或账号恢复链路验收通过。
 
+## 八项审查修复（2026-10-09 13:44:42 上海时间）
+
+最终 release `20261009T054200Z-recovery-final`，来自已推送 `origin/main` 的 `53bde86`。修复恢复并发覆盖、临时登录失败重试、Sub2 字符串 401、重启暂停归属、交付熔断、失效分组纠正、重复开始和资料修复轮询。复现已保留为正式回归测试；远端身份标记、人工暂停、凭据版本与导入幂等保护保留。
+
+13:46:24 延迟验收通过：active/running、NRestarts=0、巡检推进、路由与静态 hash 一致，启动以来错误聚合为零。数据库备份及回滚 `20261009T053050Z-recovery-delivery-races` 就绪。受影响测试、race、Node 和 vet 通过；未运行仓库完整套件，未手动触发真实 OAuth 或生产故障。精确命令、验收窗口与限制见 [部署记录](SYS1_DEPLOYMENT.md)。
+
 ## 账号交付参数与自动续跑
 
 - 批量登录采用紧凑双栏布局，桌面端开始按钮固定在卡片底部，表单与结果独立滚动；手机端自然单列。账号前缀与登录并发并排，HTTP 代理和处理模式位于“网络与处理方式”折叠区。
@@ -106,7 +112,7 @@ AUTH 默认只监听 `127.0.0.1`。如果通过反向代理或 `-bind` 暴露到
 
 公网入口为 `https://auth.kkrich.ltd`，使用平台入口用户名和密码进入。当前默认使用 sys1 IPv4，历史账号已实测完整 OAuth 成功；历史上也遇到过 Cloudflare `403 cf-mitigated: challenge`，不承诺所有账号永久免验证。需要指定节点时，展开“网络与处理方式”，在 HTTP 代理输入框填写节点地址。开始处理前会按邮箱自动去重，重复账号只执行第一条。线上服务、release、回滚和验收记录见 `SYS1_DEPLOYMENT.md`。
 
-当前线上 release 为 `20261008T182221Z-compact-login`，二进制 SHA-256 `666dd45943cf05c3becf859c7144a6043742fd0e466888cb54c1df08ef853534`，回滚为 `20261008T180135Z-account-prefix`。发布前备份为 `/var/lib/openai-login/backups/accounts-before-20261008T182221Z-compact-login.db`。完整线上验收以 `SYS1_DEPLOYMENT.md` 为准。
+当前线上 release 为 `20261009T054200Z-recovery-final`，代码 `53bde86`；二进制 SHA-256 `1f8cab2c57223d111797023e9f54074c8d7f9641f4eda6bf29e11cb9a315cbe7`，回滚为 `20261009T053050Z-recovery-delivery-races`。发布前备份为 `/var/lib/openai-login/backups/accounts-before-20261009T054200Z-recovery-final.db`。完整验收见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。
 
 sys1 的部署方式是独立运行本工具、Google Chrome 和 Xvfb。Xvfb 提供虚拟显示环境，让服务器运行有头 Chrome；无需打开公开管理端口，也无需安装桌面环境。该工具独立于 Sub2API 服务。
 

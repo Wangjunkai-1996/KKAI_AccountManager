@@ -4,6 +4,12 @@
 
 这是新对话的入口文件。新对话不要先依赖旧聊天记录，按下面顺序读取当前文档。
 
+## 八项审查修复（2026-10-09 13:44:42 上海时间）
+
+最终 release `20261009T054200Z-recovery-final`，来自已推送 `origin/main` 的 `53bde86`。修复恢复并发覆盖、临时登录失败重试、Sub2 字符串 401、重启暂停归属、交付熔断、失效分组纠正、重复开始和资料修复轮询。复现已保留为正式回归测试；远端身份标记、人工暂停、凭据版本与导入幂等保护保留。
+
+13:46:24 延迟验收通过：active/running、NRestarts=0、巡检推进、路由与静态 hash 一致，启动以来错误聚合为零。数据库备份及回滚 `20261009T053050Z-recovery-delivery-races` 就绪。受影响测试、race、Node 和 vet 通过；未运行仓库完整套件，未手动触发真实 OAuth 或生产故障。精确命令、验收窗口与限制见 [部署记录](SYS1_DEPLOYMENT.md)。
+
 ## 401 自动恢复冷却修复（2026-10-09 12:25 上海时间）
 
 北京时间 12:25:35 已上线 `20261009T042256Z-401-recovery`，代码来源为已推送 `origin/main` 的 `e96d8b7`。此前本地工作区全部 51 个文件已提交；成功交付/恢复不再进入 30 分钟失败冷却，新的凭据失效可以正常送检和恢复。失败退避、人工暂停、凭据版本与任务去重保护保留。
@@ -30,9 +36,9 @@
 
 ## 默认 IPv4 直连（当前配置）
 
-2026-10-08 08:30 UTC（北京时间 16:30）按用户要求移除 sys1 的默认代理：`/etc/openai-login/proxy.env` 中 `OPENAI_LOGIN_PROXY` 为空。当前 `20261009T042256Z-401-recovery` 的登录代理框留空即走服务器 IPv4；Chrome 与 token 交换使用同一 tcp4 出口，检测页面也默认选择 IPv4，自动检测无代理时自行选择直连。账号自己保存或本次明确填写的代理仍优先。
+2026-10-08 08:30 UTC（北京时间 16:30）按用户要求移除 sys1 的默认代理：`/etc/openai-login/proxy.env` 中 `OPENAI_LOGIN_PROXY` 为空。当前 `20261009T054200Z-recovery-final` 的登录代理框留空即走服务器 IPv4；Chrome 与 token 交换使用同一 tcp4 出口，检测页面也默认选择 IPv4，自动检测无代理时自行选择直连。账号自己保存或本次明确填写的代理仍优先。
 
-旧配置仅以 0600 权限保存在 `/var/lib/openai-login/backups/proxy.env-before-20261008T082500Z-ipv4-default`，未继续注入运行进程。当前回滚版本为 `20261008T182221Z-compact-login`。空代理网络检查返回 `mode=direct,reachable=true`；HTTP 客户端仍收到认证站 403，这不等同于浏览器 OAuth 失败，也不证明完整登录成功。2026-10-08 08:46 UTC 已按用户授权使用历史账号 279 实测默认 IPv4：完整 OAuth 成功，耗时 7,224ms，AT/RT 已加密保存，attempt 290 为 success；日志确认无外部代理回退、无 challenge。先测的账号 278 两次在 MFA 返回 incorrect_code，具体资料/验证方式原因待确认。完整记录见 [IPv4 实测](SYS1_IPV4_OAUTH_DIAGNOSIS.md)。单次成功不代表长期成功率。
+旧配置仅以 0600 权限保存在 `/var/lib/openai-login/backups/proxy.env-before-20261008T082500Z-ipv4-default`，未继续注入运行进程。当前回滚版本为 `20261009T053050Z-recovery-delivery-races`。空代理网络检查返回 `mode=direct,reachable=true`；HTTP 客户端仍收到认证站 403，这不等同于浏览器 OAuth 失败，也不证明完整登录成功。2026-10-08 08:46 UTC 已按用户授权使用历史账号 279 实测默认 IPv4：完整 OAuth 成功，耗时 7,224ms，AT/RT 已加密保存，attempt 290 为 success；日志确认无外部代理回退、无 challenge。先测的账号 278 两次在 MFA 返回 incorrect_code，具体资料/验证方式原因待确认。完整记录见 [IPv4 实测](SYS1_IPV4_OAUTH_DIAGNOSIS.md)。单次成功不代表长期成功率。
 
 ## 2026-10-08 账号流程最新发布
 
@@ -64,16 +70,16 @@
 - 线上入口：`https://auth.kkrich.ltd`
 - Mac 通过 `./open-sys1.sh` 建立 SSH 隧道，浏览器访问 `http://127.0.0.1:18082`
 - sys1 本机服务只监听 `127.0.0.1:18082`
-- 当前 release：`20261009T042256Z-401-recovery`
-- 当前来源：本地 `main` 的代码提交 `e96d8b7`，已推送 `origin/main`；随后提交发布记录
-- 当前二进制 SHA-256：`dfe80de83925b1db32262190d99fe9685cb55b938905267b941031a6817adf21`
-- 回滚 release：`20261008T182221Z-compact-login`
-- 数据库备份（当前 release 发布前）：`/var/lib/openai-login/backups/accounts-before-20261009T042256Z-401-recovery.db`
+- 当前 release：`20261009T054200Z-recovery-final`
+- 当前来源：本地 `main` 的代码提交 `53bde86`，已推送 `origin/main`；随后提交发布记录
+- 当前二进制 SHA-256：`1f8cab2c57223d111797023e9f54074c8d7f9641f4eda6bf29e11cb9a315cbe7`
+- 回滚 release：`20261009T053050Z-recovery-delivery-races`
+- 数据库备份（当前 release 发布前）：`/var/lib/openai-login/backups/accounts-before-20261009T054200Z-recovery-final.db`
 - 数据库和密钥在 `/var/lib/openai-login/data/`，不放在 release 目录
 - 最近一次核验服务为 `active`、`NRestarts=0`，`/health` 返回 `status: ok`；宿主入口 socket `/srv/kkai/secrets/tls/kkrich-ltd/auth/login.sock` 返回 HTTP 200，公网未认证返回 HTTP 401，回滚 release 保留可用
 - AUTH → Sub2 导入已上线，线上 `/api/history` 已确认 `sub2_configured=true`；使用 Sub2 既有接口，Sub2 源码和线上版本未改。
 - 已补充外部账号关联、历史“检测并恢复”、后台立即及每 60 秒巡检；开关持久化并保留用户当前开启选择。仍在 Sub2 池中且未人工暂停的账号，只有 AUTH 当前确认凭据问题后才直接登录、写回原账号并验证调度；Sub2 异常状态本身不单独触发恢复。
-- 生产自动恢复 `enabled/running=true`；2026-10-09 04:29 UTC 快照为 accounts 71、recovery tasks 86、deliveries 16、rechecks 26、repairs 0，巡检持续。
+- 生产自动恢复 `enabled/running=true`；2026-10-09 13:46:24 上海时间快照：accounts 71、recovery tasks 86、deliveries 16、rechecks 26、repairs 0，巡检持续，错误聚合 0。
 - 当前 release 允许账号 203 在 workspace 和 JWT 用户 ID 变化后恢复，仍核对邮箱、完整凭据和 Sub2 原账号绑定；复活记录浮窗支持 Tab/Shift+Tab。账号 203 的版本 234 曾通过独立 AUTH 检测 719（历史证据，非当前可用证明）；健康、回滚和时间线详见 [部署记录](SYS1_DEPLOYMENT.md)。
 - AUTH 账号检测已上线；sys1 IPv4 直连与默认代理模型请求均成功，候选并发 2 的两个请求重叠约 3 秒；正式版正确区分正常与真实 429 额度不足。浏览器 OAuth 登录与模型检测的证据不可混用。
 - 历史浏览器 OAuth 验收：sys1 IPv4 直连授权请求在输入邮箱前返回 `403 + cf-mitigated: challenge`；此前 7275 认证代理真实账号验收连续 4 次成功并完成 token 交换；当时默认代理为 `45.39.200.204:7269`，现已按用户要求移除

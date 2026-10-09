@@ -4,6 +4,35 @@
 
 > 这是 sys1 线上事实的唯一权威文档。新对话先读取 `DOCS_INDEX.md` 和 `NEW_CHAT_CONTEXT.md`，发生冲突时以本文的服务、端口、release、健康检查和验收结论为准。
 
+## 八项审查修复最终发布（2026-10-09 13:44:42 上海时间）
+
+- 最终切换时间 `2026-10-09T05:44:42Z`（上海时间 13:44:42），release `20261009T054200Z-recovery-final`。源码 `53bde86f241f9050dda95e5887872621f4882921`，Mac 干净工作区构建，已通过本地 Clash 代理推送 `origin/main`。二进制 SHA-256：`1f8cab2c57223d111797023e9f54074c8d7f9641f4eda6bf29e11cb9a315cbe7`。
+- 修复 8 项：旧重试响应覆盖新登录；普通 active 账号临时登录失败后取消重试；Sub2 包装字符串 401 未触发重登；领取任务后重启误认暂停归属；交付批次存储熔断后继续创建；纠正失效分组假报入队；重复开始覆盖运行批次；资料修复未快速轮询。新增正式 Go/Node 回归，复现不再只存在于临时文件。
+- 失败写入以状态、毫秒更新时间及已有 retry_count 限制轮次；领取状态改为 validating，只有完成暂停后进入 logging_in。写回后的恢复必须匹配远端 checkpoint。Sub2 包装状态严格解析并保留原精确错误码兼容，非 JSON 正文不丢失上游 401；错误仅返回脱敏固定码。
+- 未发送且未移交的交付可纠正配置并重新排队；已有导入意图、需人工处理的移交任务及已取消任务不会假报接受配置变更。资料修复 queued/checking 每 5 秒刷新，等待重试每 60 秒，空闲关闭自动恢复时 5 分钟。
+- 初版 `dcb2b5c` 于 13:35:51 发布为 `20261009T053050Z-recovery-delivery-races`，13:37:49 延迟验收通过。最终版补齐错误码兼容、归属标记、同毫秒轮次及正式回归。当前保留该初版为回滚点，同时保留更早 `20261009T042256Z-401-recovery`；不回退覆盖业务数据库。
+- 隔离候选复制 71 个账号；关闭自动恢复、不配置 Sub2、清空候选显式交付/资料任务。候选 health、静态 hash、数据库完整性、Node/driver hash 和回滚二进制兼容通过。停服前/后各类在途任务均为 0。
+- 发布前备份 `/var/lib/openai-login/backups/accounts-before-20261009T054200Z-recovery-final.db`，1,597,440 字节、0600、integrity_check=ok。回滚 `20261009T053050Z-recovery-delivery-races`，SHA-256 `5a0d9aee1b0faaf026cac97f3601a5e14a9f87f3513a1b06477d3b7c39a5ec02`，二进制及 Node/driver 已核验。
+- 延迟验收 `2026-10-09T05:46:24Z`（上海时间 13:46:24）：active/running、NRestarts=0、实际新二进制 PID 61529；自动恢复 enabled/running，扫描推进至 `2026-10-09T05:45:42.70610977Z`，错误和阻塞为空。有效 AUTH 路由 `/run/tls/auth/login.sock`，本机/socket 正常、公网未认证 HTTP401；默认代理环境为空。
+- 从服务启动 `Fri 2026-10-09 05:44:42 UTC` 起，panic/fatal/数据库锁/存储故障/监听失败/OAuth拒绝/OAuth 5xx 聚合均为零。快照：accounts 71、recovery tasks 86、deliveries 16、rechecks 26、repairs 0。
+- 本轮未手动触发真实 OAuth、新建分组交付或生产故障；无法据此保证长期上游成功率。仓库完整测试套件未运行。最终行为由相关定向 race/Go/Node 验证，生产只读验收不等同于新的真实恢复业务验收。
+- 远端证据位于该 release 的 `DEPLOYMENT.json`、`CANDIDATE_ACCEPTANCE.json`、`ACCEPTANCE.json`、`DELAYED_ACCEPTANCE.json`。候选及上传临时文件按清理步骤删除，正式/回滚版本、备份和验收证据保留。
+
+精确验证命令与结果：以下最终版本相关检查全部通过。初版受影响两包 `go test ./cmd/server ./internal/store -count=1 -timeout=120s` 也通过；最终增补后只重跑受影响范围。Node 正式用例涵盖两项前端新回归。远端临时脚本已清理，下列远端命令为执行记录。
+
+```bash
+go test -race ./cmd/server ./internal/store -run 'Test(Sub2Monitor|Sub2AutomaticCheck|Sub2Recovery|Sub2Recheck|AccountRecovery|AccountDelivery|DeliveryOptions|QueueAccountDelivery|Recovery|CredentialRepair)' -count=1 -timeout=120s
+go vet ./cmd/server ./internal/store
+node --check cmd/server/client.js
+node cmd/server/client.test.cjs
+./build-linux.sh /tmp/openai-login-20261009T054200Z-recovery-final
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-stage-recovery-final.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-deploy-recovery-final.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-verify-recovery-final.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-cleanup-recovery-final.py'
+git diff --check
+```
+
 ## 401 自动恢复冷却修复（2026-10-09 12:25 上海时间）
 
 - 04:25:35 UTC（北京时间 12:25:35）上线 `20261009T042256Z-401-recovery`，来自 Mac 上干净代码提交 `e96d8b7effb0dab2a9c5ce44a2faf94af72b4583`。用户授权全部工作区提交推送，51 个文件已提交并通过本地 Clash HTTP 代理推送 `origin/main`；发布后另行提交本文等记录。二进制 SHA-256：`dfe80de83925b1db32262190d99fe9685cb55b938905267b941031a6817adf21`。
@@ -108,9 +137,9 @@ git diff --check
 
 ## 默认 IPv4 直连（当前配置）
 
-2026-10-08 08:30 UTC（北京时间 16:30）按用户要求移除 sys1 的默认代理：`/etc/openai-login/proxy.env` 中 `OPENAI_LOGIN_PROXY` 为空。当前 `20261009T042256Z-401-recovery` 的登录代理框留空即走服务器 IPv4；Chrome 与 token 交换使用同一 tcp4 出口，检测页面也默认选择 IPv4，自动检测无代理时自行选择直连。账号自己保存或本次明确填写的代理仍优先。
+2026-10-08 08:30 UTC（北京时间 16:30）按用户要求移除 sys1 的默认代理：`/etc/openai-login/proxy.env` 中 `OPENAI_LOGIN_PROXY` 为空。当前 `20261009T054200Z-recovery-final` 的登录代理框留空即走服务器 IPv4；Chrome 与 token 交换使用同一 tcp4 出口，检测页面也默认选择 IPv4，自动检测无代理时自行选择直连。账号自己保存或本次明确填写的代理仍优先。
 
-旧配置仅以 0600 权限保存在 `/var/lib/openai-login/backups/proxy.env-before-20261008T082500Z-ipv4-default`，未继续注入运行进程。当前回滚版本为 `20261008T182221Z-compact-login`。空代理网络检查返回 `mode=direct,reachable=true`；HTTP 客户端仍收到认证站 403，这不等同于浏览器 OAuth 失败，也不证明完整登录成功。2026-10-08 08:46 UTC 已按用户授权使用历史账号 279 实测默认 IPv4：完整 OAuth 成功，耗时 7,224ms，AT/RT 已加密保存，attempt 290 为 success；日志确认无外部代理回退、无 challenge。先测的账号 278 两次在 MFA 返回 incorrect_code，具体资料/验证方式原因待确认。完整记录见 [IPv4 实测](SYS1_IPV4_OAUTH_DIAGNOSIS.md)。单次成功不代表长期成功率。
+旧配置仅以 0600 权限保存在 `/var/lib/openai-login/backups/proxy.env-before-20261008T082500Z-ipv4-default`，未继续注入运行进程。当前回滚版本为 `20261009T053050Z-recovery-delivery-races`。空代理网络检查返回 `mode=direct,reachable=true`；HTTP 客户端仍收到认证站 403，这不等同于浏览器 OAuth 失败，也不证明完整登录成功。2026-10-08 08:46 UTC 已按用户授权使用历史账号 279 实测默认 IPv4：完整 OAuth 成功，耗时 7,224ms，AT/RT 已加密保存，attempt 290 为 success；日志确认无外部代理回退、无 challenge。先测的账号 278 两次在 MFA 返回 incorrect_code，具体资料/验证方式原因待确认。完整记录见 [IPv4 实测](SYS1_IPV4_OAUTH_DIAGNOSIS.md)。单次成功不代表长期成功率。
 
 ## 默认 IPv4 切换验收（2026-10-08）
 
@@ -167,11 +196,11 @@ git diff --check
 
 当前部署基线（2026-10-09 上海时间发布后确认）：
 
-- 当前 release：`20261009T042256Z-401-recovery`
-- 构建来源：本地 `main` 代码提交 `e96d8b7effb0dab2a9c5ce44a2faf94af72b4583`，已推送 `origin/main`；构建时工作区干净，随后提交发布记录
-- 当前二进制 SHA-256：`dfe80de83925b1db32262190d99fe9685cb55b938905267b941031a6817adf21`
-- 回滚 release：`20261008T182221Z-compact-login`
-- 回滚二进制 SHA-256：`666dd45943cf05c3becf859c7144a6043742fd0e466888cb54c1df08ef853534`
+- 当前 release：`20261009T054200Z-recovery-final`
+- 构建来源：本地 `main` 代码提交 `53bde86f241f9050dda95e5887872621f4882921`，已推送 `origin/main`；构建时工作区干净，随后提交发布记录
+- 当前二进制 SHA-256：`1f8cab2c57223d111797023e9f54074c8d7f9641f4eda6bf29e11cb9a315cbe7`
+- 回滚 release：`20261009T053050Z-recovery-delivery-races`
+- 回滚二进制 SHA-256：`5a0d9aee1b0faaf026cac97f3601a5e14a9f87f3513a1b06477d3b7c39a5ec02`
 - 当前服务应保持 `active (running)`，且 `NRestarts=0`
 - 当前服务端并发硬上限：10；页面选择的并发数由前端 worker 控制，实际不超过该上限。
 - 页面代理留空时默认走 sys1 IPv4 直连；`/etc/openai-login/proxy.env` 的 `OPENAI_LOGIN_PROXY` 已清空，旧代理仅保留为服务器上的 0600 配置备份。

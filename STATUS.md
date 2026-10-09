@@ -2,6 +2,12 @@
 
 更新时间：2026-10-09（Asia/Shanghai）
 
+## 八项审查修复（2026-10-09 13:44:42 上海时间）
+
+最终 release `20261009T054200Z-recovery-final`，来自已推送 `origin/main` 的 `53bde86`。修复恢复并发覆盖、临时登录失败重试、Sub2 字符串 401、重启暂停归属、交付熔断、失效分组纠正、重复开始和资料修复轮询。复现已保留为正式回归测试；远端身份标记、人工暂停、凭据版本与导入幂等保护保留。
+
+13:46:24 延迟验收通过：active/running、NRestarts=0、巡检推进、路由与静态 hash 一致，启动以来错误聚合为零。数据库备份及回滚 `20261009T053050Z-recovery-delivery-races` 就绪。受影响测试、race、Node 和 vet 通过；未运行仓库完整套件，未手动触发真实 OAuth 或生产故障。精确命令、验收窗口与限制见 [部署记录](SYS1_DEPLOYMENT.md)。
+
 ## 401 自动恢复冷却修复（2026-10-09 12:25 上海时间）
 
 北京时间 12:25:35 已上线 `20261009T042256Z-401-recovery`，代码来源为已推送 `origin/main` 的 `e96d8b7`。此前本地工作区全部 51 个文件已提交；成功交付/恢复不再进入 30 分钟失败冷却，新的凭据失效可以正常送检和恢复。失败退避、人工暂停、凭据版本与任务去重保护保留。
@@ -28,9 +34,9 @@
 
 ## 默认 IPv4 直连（当前配置）
 
-2026-10-08 08:30 UTC（北京时间 16:30）按用户要求移除 sys1 的默认代理：`/etc/openai-login/proxy.env` 中 `OPENAI_LOGIN_PROXY` 为空。当前 `20261009T042256Z-401-recovery` 的登录代理框留空即走服务器 IPv4；Chrome 与 token 交换使用同一 tcp4 出口，检测页面也默认选择 IPv4，自动检测无代理时自行选择直连。账号自己保存或本次明确填写的代理仍优先。
+2026-10-08 08:30 UTC（北京时间 16:30）按用户要求移除 sys1 的默认代理：`/etc/openai-login/proxy.env` 中 `OPENAI_LOGIN_PROXY` 为空。当前 `20261009T054200Z-recovery-final` 的登录代理框留空即走服务器 IPv4；Chrome 与 token 交换使用同一 tcp4 出口，检测页面也默认选择 IPv4，自动检测无代理时自行选择直连。账号自己保存或本次明确填写的代理仍优先。
 
-旧配置仅以 0600 权限保存在 `/var/lib/openai-login/backups/proxy.env-before-20261008T082500Z-ipv4-default`，未继续注入运行进程。当前回滚版本为 `20261008T182221Z-compact-login`。空代理网络检查返回 `mode=direct,reachable=true`；HTTP 客户端仍收到认证站 403，这不等同于浏览器 OAuth 失败，也不证明完整登录成功。2026-10-08 08:46 UTC 已按用户授权使用历史账号 279 实测默认 IPv4：完整 OAuth 成功，耗时 7,224ms，AT/RT 已加密保存，attempt 290 为 success；日志确认无外部代理回退、无 challenge。先测的账号 278 两次在 MFA 返回 incorrect_code，具体资料/验证方式原因待确认。完整记录见 [IPv4 实测](SYS1_IPV4_OAUTH_DIAGNOSIS.md)。单次成功不代表长期成功率。
+旧配置仅以 0600 权限保存在 `/var/lib/openai-login/backups/proxy.env-before-20261008T082500Z-ipv4-default`，未继续注入运行进程。当前回滚版本为 `20261009T053050Z-recovery-delivery-races`。空代理网络检查返回 `mode=direct,reachable=true`；HTTP 客户端仍收到认证站 403，这不等同于浏览器 OAuth 失败，也不证明完整登录成功。2026-10-08 08:46 UTC 已按用户授权使用历史账号 279 实测默认 IPv4：完整 OAuth 成功，耗时 7,224ms，AT/RT 已加密保存，attempt 290 为 success；日志确认无外部代理回退、无 challenge。先测的账号 278 两次在 MFA 返回 incorrect_code，具体资料/验证方式原因待确认。完整记录见 [IPv4 实测](SYS1_IPV4_OAUTH_DIAGNOSIS.md)。单次成功不代表长期成功率。
 
 ## 2026-10-08 账号流程最新发布
 
@@ -44,7 +50,7 @@
 
 ## 当前结论
 
-项目源码在 `/Users/tokk/Desktop/KKAI_AUTH`。账号交付参数、延迟复检、修改资料后自动续跑、导入核对和 IPv4 直连已部署到 sys1（当前 `20261009T042256Z-401-recovery`，来源为已推送 `origin/main` 的代码提交 `e96d8b7`）；回滚为 `20261008T182221Z-compact-login`。Sub2 源码和线上版本未改。完整发布证据见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。
+项目源码在 `/Users/tokk/Desktop/KKAI_AUTH`。账号交付参数、延迟复检、修改资料后自动续跑、导入核对和 IPv4 直连已部署到 sys1（当前 `20261009T054200Z-recovery-final`，来源为已推送 `origin/main` 的代码提交 `53bde86`）；回滚为 `20261009T053050Z-recovery-delivery-races`。Sub2 源码和线上版本未改。完整发布证据见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。
 
 恢复不再以旧 workspace ID 或旧、新 JWT `chatgpt_user_id` 相等阻断账号 203；仍核对邮箱、完整凭据、Sub2 原账号 ID/邮箱/绑定标记，并在写回后核验新 workspace、organization、plan、expires_at 和凭据状态。历史卡片增加成功复活次数、尝试次数、Sub2 池状态和可悬停/聚焦/点击的最近 100 条复活记录浮窗，键盘可用 Tab/Shift+Tab 进入和退出。
 
@@ -77,19 +83,19 @@
 | 服务 | `openai-login.service` |
 | sys1 本机监听 | `127.0.0.1:18082` |
 | Mac 隧道 | `./open-sys1.sh` |
-| 当前 release | `20261009T042256Z-401-recovery` |
-| 回滚 release | `20261008T182221Z-compact-login` |
-| 当前来源 | 代码提交 `e96d8b7`，已推送 `origin/main`；随后提交发布记录 |
+| 当前 release | `20261009T054200Z-recovery-final` |
+| 回滚 release | `20261009T053050Z-recovery-delivery-races` |
+| 当前来源 | 代码提交 `53bde86`，已推送 `origin/main`；随后提交发布记录 |
 | 数据库 | `/var/lib/openai-login/data/accounts.db` |
 | 密钥 | `/var/lib/openai-login/data/accounts.key` |
 | 最近健康检查 | 发布后复核：active/running，NRestarts=0，`/health` 返回 `status: ok`，入口 socket HTTP 200，回滚就绪 |
-| 数据库备份（当前 release 发布前） | `/var/lib/openai-login/backups/accounts-before-20261009T042256Z-401-recovery.db`，0600，integrity_check=ok |
-| 当前二进制 SHA-256 | `dfe80de83925b1db32262190d99fe9685cb55b938905267b941031a6817adf21` |
+| 数据库备份（当前 release 发布前） | `/var/lib/openai-login/backups/accounts-before-20261009T054200Z-recovery-final.db`，0600，integrity_check=ok |
+| 当前二进制 SHA-256 | `1f8cab2c57223d111797023e9f54074c8d7f9641f4eda6bf29e11cb9a315cbe7` |
 | 导入配置 | `sub2_configured=true`；使用 Sub2 既有接口，Sub2 源码和线上版本未改 |
 | 公网身份验证 | 有效入口 socket HTTP 200，公网未认证 HTTP 401；未验证认证后公网业务 |
-| 本轮功能验收 | 401 成功任务冷却修复已上线；定向 Go race/Node、候选和回滚兼容通过；未人为触发真实 OAuth 或 Sub2 写入测试 |
+| 本轮功能验收 | 八项审查修复已上线；正式回归/race/Node、候选及回滚兼容通过；未人为触发真实 OAuth 或生产故障 |
 | 自动恢复设置 | 生产自动恢复 `enabled` 并保存到 SQLite，立即及每 60 秒后台扫描，页面关闭后继续 |
-| 线上快照（2026-10-09 04:29 UTC） | accounts 71、recovery tasks 86、deliveries 16、rechecks 26、repairs 0；auto recovery enabled/running，巡检继续，错误聚合 0 |
+| 线上快照（2026-10-09 13:46:24 上海时间） | accounts 71、recovery tasks 86、deliveries 16、rechecks 26、repairs 0；auto recovery enabled/running，巡检继续，错误聚合 0 |
 | sys1 IPv4 模型检测（历史） | 此前真实 HTTP200 / 完整模型完成事件，1,982ms |
 | 默认代理模型检测（历史） | 此前单账号连续两次成功；候选两个账号并发2正常，重叠3,035ms |
 | 浏览器直连历史限制 | 授权流程曾收到 `403 + cf-mitigated: challenge`；不可将该浏览器结论套用到模型检测 |
@@ -130,7 +136,7 @@
 - 外部导入的 Sub2 账号按凭据邮箱和已知工作区自动关联；唯一匹配持久化，不重新导入。歧义、身份冲突、查询失败显示具体原因。
 - 历史行提供“检测并恢复”和断点“继续恢复”，显示 AUTH 检测、重新登录、凭据写回、调度恢复及失败原因；普通“重新登录”只更新 AUTH。
 - 自动恢复开关保存到 SQLite，开启立即扫描，此后每 60 秒在服务器运行，关闭页面后继续。仍在 Sub2 池中且未人工暂停的账号，确认 401/失效/缺少本地凭据后直接 AUTH 登录，不走 RT 优先路径；Sub2 `status=error` 或 `schedulable=false` 不单独证明 401。缺少本地工作区时以 Sub2 身份核对新凭据。
-- 正常、禁用、删除、未知、正常但人工暂停的账号跳过。任务去重，自动恢复结束后冷却 30 分钟，同一凭据版本 24 小时内失败 3 次暂停自动重试。
+- 正常、禁用、删除、未知及人工暂停账号跳过；任务去重。成功交付/恢复不进入失败冷却，临时失败按原因持久退避，不按固定失败次数停止；需人工处理的任务保留门禁。
 - 页面进行中每 5 秒刷新，自动开启且空闲时每 60 秒，关闭且空闲时每 5 分钟；显示上下次巡检与结果摘要。
 - HTTP 代理输入、代理测试和错误分类。
 - AUTH 本地凭据的手动模型检测；检测自身只读 AT、无 RT 刷新；明确区分本地过期、401、额度、权限与网络错误。历史页可立即提交检测，结果仍在保留的“账号检测”Tab 批量/详情页查看；符合条件的检测结果可触发已开启的自动恢复。
