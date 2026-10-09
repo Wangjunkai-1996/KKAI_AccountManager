@@ -143,15 +143,22 @@ func newOperationID() (string, error) {
 	return hex.EncodeToString(bytes[:]), nil
 }
 
-func (s *sub2ImportService) buildPayload(accountID int64) ([]byte, string, string, error) {
+func (s *sub2ImportService) buildPayload(accountID int64, options ...store.DeliveryOptions) ([]byte, string, string, error) {
 	operationID, err := newOperationID()
 	if err != nil {
 		return nil, "", "", err
 	}
-	return s.buildPayloadWithOperation(accountID, operationID)
+	return s.buildPayloadWithOperation(accountID, operationID, options...)
 }
 
-func (s *sub2ImportService) buildPayloadWithOperation(accountID int64, operationID string) ([]byte, string, string, error) {
+func (s *sub2ImportService) buildPayloadWithOperation(accountID int64, operationID string, options ...store.DeliveryOptions) ([]byte, string, string, error) {
+	opt := store.DefaultDeliveryOptions()
+	if len(options) > 0 {
+		opt = options[0]
+	}
+	if err := opt.Validate(); err != nil {
+		return nil, "", "", err
+	}
 	email, result, err := s.store.GetOAuthResultByID(context.Background(), accountID)
 	if err != nil {
 		return nil, "", "", err
@@ -160,7 +167,11 @@ func (s *sub2ImportService) buildPayloadWithOperation(accountID int64, operation
 	// `extra.kkai_auth_import` and is used for reconciliation/idempotency.
 	// The service runs in UTC on sys1, so format in the product's local zone.
 	localZone := time.FixedZone("Asia/Shanghai", 8*60*60)
-	name := "AUTH_" + time.Now().In(localZone).Format("01021504") + "_" + email
+	prefix := opt.NamePrefix
+	if prefix == "" {
+		prefix = "AUTH"
+	}
+	name := prefix + "_" + time.Now().In(localZone).Format("01021504") + "_" + email
 	if len([]rune(name)) > 100 {
 		name = string([]rune(name)[:100])
 	}
@@ -180,6 +191,7 @@ func (s *sub2ImportService) buildPayloadWithOperation(accountID int64, operation
 			"source_instance_id": strings.TrimSpace(os.Getenv("AUTH_INSTANCE_ID")),
 			"source_account_id":  accountID,
 			"operation_id":       operationID,
+			"target_group_ids":   opt.GroupIDs,
 		},
 	}
 	request := sub2DataImportRequest{
@@ -188,7 +200,7 @@ func (s *sub2ImportService) buildPayloadWithOperation(accountID int64, operation
 			Type: "sub2api-data", Version: 1, Proxies: []any{},
 			Accounts: []sub2DataAccount{{
 				Name: name, Platform: "openai", Type: "oauth", Credentials: credentials, Extra: extra,
-				Concurrency: 3, Priority: 1, RateMultiplier: 1, AutoPauseOnExpired: true,
+				Concurrency: opt.Concurrency, Priority: opt.Priority, RateMultiplier: 1, AutoPauseOnExpired: true,
 			}},
 		},
 	}
@@ -209,6 +221,11 @@ func (s *sub2ImportService) runOnce(ctx context.Context) {
 	if err != nil || len(tasks) == 0 {
 		return
 	}
+	lease, err := s.store.AcquireAccountRecovery(ctx, tasks[0].AccountID)
+	if err != nil {
+		return
+	}
+	defer lease.Release()
 	_ = s.processQueued(ctx, tasks[0])
 }
 
@@ -231,27 +248,18 @@ func (s *sub2ImportService) processQueued(ctx context.Context, task store.Sub2Im
 		return err
 	}
 	if response.Code != 0 {
-		message := response.Message
-		if message == "" {
-			message = "Sub2 导入接口返回失败"
-		}
-		_ = s.store.UpdateSub2Import(ctx, task.ID, "failed", false, 0, message)
-		return errors.New(message)
+		failure := &recoveryOperationError{Code: "request_rejected", RequiresAction: true}
+		_ = s.store.UpdateSub2Import(ctx, task.ID, "failed", false, 0, failure.Error())
+		return failure
 	}
 	var result sub2CreateDataResult
 	if len(response.Data) > 0 {
 		_ = json.Unmarshal(response.Data, &result)
 	}
 	if result.AccountFailed > 0 || result.AccountCreated < 1 {
-		message := response.Message
-		if len(result.Errors) > 0 && result.Errors[0].Message != "" {
-			message = result.Errors[0].Message
-		}
-		if message == "" {
-			message = "Sub2 未创建账号"
-		}
-		_ = s.store.UpdateSub2Import(ctx, task.ID, "failed", false, 0, message)
-		return errors.New(message)
+		failure := &recoveryOperationError{Code: "request_rejected", RequiresAction: true}
+		_ = s.store.UpdateSub2Import(ctx, task.ID, "failed", false, 0, failure.Error())
+		return failure
 	}
 	_ = s.store.UpdateSub2Import(ctx, task.ID, "confirming", true, 0, "")
 	return s.reconcile(ctx, task.ID)
@@ -271,6 +279,9 @@ func (s *sub2ImportService) postImport(ctx context.Context, task store.Sub2Impor
 		return 0, sub2ImportEnvelope{}, err
 	}
 	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return response.StatusCode, sub2ImportEnvelope{}, recoveryHTTPError(response.StatusCode, recoveryRetryAfter(response.Header.Get("Retry-After")))
+	}
 	body, readErr := io.ReadAll(io.LimitReader(response.Body, 2<<20))
 	if readErr != nil {
 		return response.StatusCode, sub2ImportEnvelope{}, readErr
@@ -278,13 +289,6 @@ func (s *sub2ImportService) postImport(ctx context.Context, task store.Sub2Impor
 	var envelope sub2ImportEnvelope
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return response.StatusCode, envelope, fmt.Errorf("Sub2 返回格式无效（HTTP %d）", response.StatusCode)
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		message := envelope.Message
-		if message == "" {
-			message = fmt.Sprintf("Sub2 导入失败（HTTP %d）", response.StatusCode)
-		}
-		return response.StatusCode, envelope, errors.New(message)
 	}
 	return response.StatusCode, envelope, nil
 }
@@ -497,7 +501,7 @@ func (s *sub2ImportService) linkExistingAccount(ctx context.Context, account sto
 		return store.Sub2Import{}, err
 	}
 	if err := verifySub2AccountIdentity(detail, id, account.ID, account); err != nil {
-		return store.Sub2Import{}, errors.New("Sub2 账号身份在关联前发生变化")
+		return store.Sub2Import{}, errSub2IdentityConflict
 	}
 	operationID, err := newOperationID()
 	if err != nil {
@@ -606,7 +610,8 @@ func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, che
 		return status
 	}
 	for _, account := range accounts {
-		if err := verifySub2AccountIdentity(detail, id, account.ID, account); err != nil {
+		binding, bindingErr := s.store.GetSub2Import(ctx, s.destinationKey, account.ID)
+		if bindingErr != nil || binding.Sub2AccountID != id || verifySub2RecoveryIdentity(detail, id, account.ID, account, binding) != nil {
 			status.Unknown, status.Stale = true, true
 			status.Error = "Sub2 账号身份与 AUTH 绑定不一致"
 			return status
@@ -701,7 +706,7 @@ func (s *sub2ImportService) apiJSONStatus(ctx context.Context, method, path stri
 		return response.StatusCode, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return response.StatusCode, fmt.Errorf("Sub2 查询失败（HTTP %d）", response.StatusCode)
+		return response.StatusCode, recoveryHTTPError(response.StatusCode, recoveryRetryAfter(response.Header.Get("Retry-After")))
 	}
 	var envelope struct {
 		Code    int             `json:"code"`
@@ -729,32 +734,19 @@ func (s *sub2ImportService) reconcile(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	var list sub2ListResponse
-	query := url.Values{}
-	query.Set("platform", "openai")
-	query.Set("type", "oauth")
-	query.Set("lite", "1")
-	query.Set("group", "ungrouped")
-	// The display name is intentionally human-readable and no longer embeds
-	// the opaque operation ID. Search by the account email, then verify the
-	// signed local marker below.
-	query.Set("search", task.AccountEmail)
-	query.Set("page_size", "1000")
-	for page := 1; page <= 20; page++ {
-		query.Set("page", strconv.Itoa(page))
-		var current sub2ListResponse
-		if err := s.apiJSON(ctx, http.MethodGet, "/admin/accounts", query, &current); err != nil {
-			_ = s.store.UpdateSub2Import(ctx, id, "unknown", task.CreateAcknowledged, 0, err.Error())
-			return err
-		}
-		list.Items = append(list.Items, current.Items...)
-		list.Pages = current.Pages
-		if current.Pages <= page || len(current.Items) == 0 {
-			break
-		}
+	if task.DestinationKey != s.destinationKey {
+		return &recoveryOperationError{Code: "configuration", RequiresAction: true}
 	}
-	candidates := make([]map[string]any, 0, len(list.Items))
-	for _, item := range list.Items {
+	if task.State == "imported" && task.Sub2AccountID > 0 {
+		return nil
+	}
+	items, err := s.listOAuthAccounts(ctx)
+	if err != nil {
+		_ = s.store.UpdateSub2Import(ctx, id, "unknown", task.CreateAcknowledged, 0, classifyRecoveryError(err).Error())
+		return err
+	}
+	candidates := make([]map[string]any, 0, len(items))
+	for _, item := range items {
 		if matchesImportMarker(item, task) {
 			candidates = append(candidates, item)
 		}
@@ -765,7 +757,10 @@ func (s *sub2ImportService) reconcile(ctx context.Context, id int64) error {
 			message = "Sub2 找到多个同来源账号，已暂停自动确认"
 		}
 		_ = s.store.UpdateSub2Import(ctx, id, "unknown", task.CreateAcknowledged, 0, message)
-		return errors.New(message)
+		if len(candidates) > 1 {
+			return errSub2AmbiguousMatch
+		}
+		return unconfirmedImportError(task)
 	}
 	candidate := candidates[0]
 	sub2ID := int64(toFloat(candidate["id"]))
@@ -780,15 +775,9 @@ func (s *sub2ImportService) reconcile(ctx context.Context, id int64) error {
 	if int64(toFloat(detail["id"])) != sub2ID || !matchesImportMarker(detail, task) {
 		message := "Sub2 账号身份核对不一致，已暂停自动确认"
 		_ = s.store.UpdateSub2Import(ctx, id, "unknown", task.CreateAcknowledged, 0, message)
-		return errors.New(message)
+		return errSub2IdentityConflict
 	}
-	if groups, ok := detail["group_ids"].([]any); ok && len(groups) != 0 {
-		message := "Sub2 账号已被分组，未满足未分组导入条件"
-		_ = s.store.UpdateSub2Import(ctx, id, "unknown", task.CreateAcknowledged, sub2ID, message)
-		return errors.New(message)
-	}
-	_ = s.store.UpdateSub2Import(ctx, id, "imported", true, sub2ID, "")
-	return nil
+	return s.store.UpdateSub2Import(ctx, id, "imported", true, sub2ID, "")
 }
 
 func matchesImportMarker(item map[string]any, task store.Sub2Import) bool {
@@ -819,7 +808,8 @@ func toFloat(value any) float64 {
 }
 
 type sub2ImportRequest struct {
-	AccountIDs []int64 `json:"account_ids"`
+	DeliveryOptions *store.DeliveryOptions `json:"delivery_options,omitempty"`
+	AccountIDs      []int64                `json:"account_ids"`
 }
 
 func (s *sub2ImportService) handleImport(w http.ResponseWriter, r *http.Request) {
@@ -842,6 +832,16 @@ func (s *sub2ImportService) handleImport(w http.ResponseWriter, r *http.Request)
 		respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: "请求只能包含一个 JSON 对象"})
 		return
 	}
+	options, err := s.loadOptions(r.Context(), request.DeliveryOptions)
+	if err != nil {
+		respondJSONStatus(w, 400, LoginResponse{Message: classifyRecoveryError(err).Error()})
+		return
+	}
+	if !s.workerMu.TryLock() {
+		respondJSONStatus(w, 409, LoginResponse{Message: "正在处理导入，请稍后重试"})
+		return
+	}
+	defer s.workerMu.Unlock()
 	created := make([]store.Sub2Import, 0, len(request.AccountIDs))
 	seen := make(map[int64]struct{}, len(request.AccountIDs))
 	for _, accountID := range request.AccountIDs {
@@ -859,30 +859,43 @@ func (s *sub2ImportService) handleImport(w http.ResponseWriter, r *http.Request)
 		if account.Status != "active" {
 			continue
 		}
-		task, err := s.ensureTask(r.Context(), accountID)
-		if err == nil {
-			created = append(created, task)
+		lease, err := s.store.AcquireAccountRecovery(r.Context(), accountID)
+		if err != nil {
+			continue
 		}
+		if _, active, checkErr := s.store.GetActiveAccountRecoveryTask(r.Context(), accountID); checkErr != nil || active {
+			lease.Release()
+			continue
+		}
+		// Commit the delivery intent first: process death cannot strand a newly queued import.
+		_, queueErr := s.store.QueueAccountDelivery(r.Context(), accountID, s.destinationKey, options)
+		err = queueErr
+		if err == nil {
+			task, taskErr := s.store.GetSub2Import(r.Context(), s.destinationKey, accountID)
+			if taskErr == nil {
+				created = append(created, task)
+			} else {
+				created = append(created, store.Sub2Import{AccountID: accountID, State: "queued"})
+			}
+		}
+		lease.Release()
 	}
 	if len(created) == 0 {
 		respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: "没有可导入的认证成功账号", Code: "no_importable_accounts"})
 		return
 	}
-	go s.runOnce(context.Background())
 	respondJSON(w, map[string]any{"success": true, "imports": created})
 }
 
-func (s *sub2ImportService) ensureTask(ctx context.Context, accountID int64) (store.Sub2Import, error) {
+func (s *sub2ImportService) ensureTask(ctx context.Context, accountID int64, options ...store.DeliveryOptions) (store.Sub2Import, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if existing, err := s.store.GetSub2Import(ctx, s.destinationKey, accountID); err == nil {
 		if existing.State == "failed" {
-			payload, _, _, buildErr := s.buildPayloadWithOperation(accountID, existing.OperationID)
-			if buildErr != nil {
-				return store.Sub2Import{}, buildErr
-			}
-			if refreshErr := s.store.RefreshSub2ImportPayload(ctx, existing.ID, payload); refreshErr != nil {
-				return store.Sub2Import{}, refreshErr
+			// Keep the exact original request for the idempotency key. Fresh credentials
+			// are applied by the delivery worker after remote creation is confirmed.
+			if err := s.store.RequeueSub2Import(ctx, existing.ID); err != nil {
+				return store.Sub2Import{}, err
 			}
 			return s.store.GetSub2Import(ctx, s.destinationKey, accountID)
 		}
@@ -901,7 +914,15 @@ func (s *sub2ImportService) ensureTask(ctx context.Context, accountID int64) (st
 	if linked, err := s.linkExistingAccount(ctx, account, candidates); err != nil || linked.ID != 0 {
 		return linked, err
 	}
-	payload, operationID, idempotencyKey, err := s.buildPayload(accountID)
+	selected := store.DefaultDeliveryOptions()
+	if len(options) > 0 {
+		selected = options[0]
+	}
+	checked, err := s.resolveOptions(ctx, &selected)
+	if err != nil {
+		return store.Sub2Import{}, err
+	}
+	payload, operationID, idempotencyKey, err := s.buildPayload(accountID, checked)
 	if err != nil {
 		return store.Sub2Import{}, err
 	}
@@ -929,6 +950,22 @@ func (s *sub2ImportService) handleAction(w http.ResponseWriter, r *http.Request)
 		respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: "导入任务 ID 无效"})
 		return
 	}
+	if !s.workerMu.TryLock() {
+		respondJSONStatus(w, 409, LoginResponse{Message: "正在处理导入，请稍后重试"})
+		return
+	}
+	defer s.workerMu.Unlock()
+	item, err := s.store.GetSub2ImportByID(r.Context(), id)
+	if err != nil || item.DestinationKey != s.destinationKey {
+		respondJSONStatus(w, 404, LoginResponse{Message: "导入任务不存在"})
+		return
+	}
+	lease, err := s.store.AcquireAccountRecovery(r.Context(), item.AccountID)
+	if err != nil {
+		respondJSONStatus(w, 409, LoginResponse{Message: "账号正在处理"})
+		return
+	}
+	defer lease.Release()
 	if err := s.reconcile(r.Context(), id); err != nil {
 		respondJSONStatus(w, http.StatusConflict, LoginResponse{Message: err.Error(), Code: "sub2_reconcile_pending"})
 		return
@@ -938,5 +975,10 @@ func (s *sub2ImportService) handleAction(w http.ResponseWriter, r *http.Request)
 		respondJSONStatus(w, http.StatusInternalServerError, LoginResponse{Message: "读取导入任务失败"})
 		return
 	}
+	_ = s.store.WakeAccountDelivery(r.Context(), task.AccountID)
 	respondJSON(w, map[string]any{"success": true, "import": task})
+}
+
+func unconfirmedImportError(task store.Sub2Import) *recoveryOperationError {
+	return &recoveryOperationError{Code: "import_unconfirmed", RequiresAction: time.Since(task.CreatedAt) >= 15*time.Minute}
 }

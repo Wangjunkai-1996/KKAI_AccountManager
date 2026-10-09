@@ -31,16 +31,29 @@ func (s *sub2RecoveryService) recoverySettings() any {
 	defer s.monitorMu.Unlock()
 	state := s.monitorState
 	enabled := s.autoRecovery.Load()
-	if !enabled {
+	blockedReason := ""
+	switch {
+	case s.paused.Load():
+		blockedReason = "恢复任务存储故障，已停止派发；修复存储后需重启服务"
+	case s.ctx.Err() != nil:
+		blockedReason = "恢复服务已停止"
+	case !s.configured():
+		blockedReason = "Sub2 恢复服务未配置"
+	}
+	running := enabled && blockedReason == ""
+	if !running {
 		state.NextScanAt = nil
+		state.Scanning = false
 	}
 	return struct {
-		Success             bool `json:"success"`
-		Enabled             bool `json:"enabled"`
-		AutoRecoveryEnabled bool `json:"auto_recovery_enabled"`
-		IntervalSeconds     int  `json:"interval_seconds"`
+		Success             bool   `json:"success"`
+		Enabled             bool   `json:"enabled"`
+		AutoRecoveryEnabled bool   `json:"auto_recovery_enabled"`
+		Running             bool   `json:"running"`
+		BlockedReason       string `json:"blocked_reason"`
+		IntervalSeconds     int    `json:"interval_seconds"`
 		sub2MonitorState
-	}{true, enabled, enabled, int(sub2MonitorInterval.Seconds()), state}
+	}{true, enabled, enabled, running, blockedReason, int(sub2MonitorInterval.Seconds()), state}
 }
 
 func (s *sub2RecoveryService) notifyMonitor() {
@@ -73,8 +86,11 @@ func (s *sub2RecoveryService) monitor() {
 		case <-timer.C:
 		case <-s.monitorWake:
 		}
-		if s.autoRecovery.Load() && !s.paused.Load() {
-			s.scanSub2Accounts()
+		if !s.paused.Load() {
+			s.retryDueRecoveries()
+			if s.autoRecovery.Load() {
+				s.scanSub2Accounts()
+			}
 		}
 		if !timer.Stop() {
 			select {
@@ -261,10 +277,87 @@ func (s *sub2RecoveryService) automaticRecoveryAllowed(ctx context.Context, id i
 	if err != nil {
 		return false, err
 	}
-	if time.Since(previous.UpdatedAt) < 30*time.Minute {
+	// Structured failures are owned by the durable retry path. A fresh scan
+	// must not bypass its deadline or restart a task that needs a person.
+	if previous.RetryAction != "" {
 		return false, nil
 	}
-	return s.store.AutomaticRecoveryRetryAllowed(ctx, id)
+	// Success is not a failed attempt: a newly revoked credential must be
+	// checked and recovered without waiting for the second delayed recheck.
+	if previous.State != store.RecoveryCompleted && time.Since(previous.UpdatedAt) < 30*time.Minute {
+		return false, nil
+	}
+	return true, nil
+}
+
+// Delivery is an explicit batch intent and continues after the automatic
+// recovery switch is turned off. Automatic recovery itself still obeys it.
+func (s *sub2RecoveryService) retryDueRecoveries() {
+	if !s.configured() || s.paused.Load() || s.ctx.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
+	defer cancel()
+	tasks, err := s.store.ListLatestAccountRecoveryTasks(ctx)
+	if err != nil {
+		s.pauseRecovery(0)
+		return
+	}
+	for _, task := range tasks {
+		if ctx.Err() != nil || s.paused.Load() {
+			return
+		}
+		if task.Purpose != "delivery" && !s.autoRecovery.Load() {
+			continue
+		}
+		if task.RetryAction == "" && (task.State == store.RecoveryFailed || task.State == store.RecoveryUnknown) {
+			s.classifyLegacyRecovery(ctx, task)
+			continue
+		}
+		if task.NextRetryAt == nil || task.NextRetryAt.After(time.Now()) || task.RequiresAction ||
+			(task.State != store.RecoveryFailed && task.State != store.RecoveryUnknown) ||
+			(task.RetryAction != "resume" && task.RetryAction != "relogin") {
+			continue
+		}
+		account, err := s.store.GetAccountByID(ctx, task.AccountID)
+		if err != nil {
+			if !errors.Is(err, store.ErrAccountNotFound) {
+				s.pauseRecovery(task.ID)
+				return
+			}
+			s.recordRecoveryFailure(task, task.FailureStage, &recoveryOperationError{Code: "account_missing", RequiresAction: true})
+			continue
+		}
+		binding, err := s.sub2.store.GetSub2Import(ctx, s.sub2.destinationKey, task.AccountID)
+		if err != nil && !errors.Is(err, store.ErrSub2ImportNotFound) {
+			s.pauseRecovery(task.ID)
+			return
+		}
+		if err != nil || binding.State != "imported" || binding.Sub2AccountID != task.Sub2AccountID {
+			s.recordRecoveryFailure(task, task.FailureStage, &recoveryOperationError{Code: "identity_changed", RequiresAction: true})
+			continue
+		}
+		detail, err := s.sub2Account(ctx, task.Sub2AccountID)
+		if err == nil {
+			err = s.verifyRecoveryRetry(ctx, task, detail, account, binding)
+		}
+		if err != nil {
+			s.recordRecoveryFailure(task, task.FailureStage, err)
+			continue
+		}
+		if _, err := s.store.RetryAccountRecoveryTask(ctx, task.ID, task.RetryAction == "relogin"); err != nil {
+			if errors.Is(err, store.ErrAccountBusy) || errors.Is(err, store.ErrAccountRecoveryNotResumable) {
+				continue
+			}
+			if errors.Is(err, store.ErrAccountRecoveryVersionChanged) {
+				s.recordRecoveryFailure(task, task.FailureStage, &recoveryOperationError{Code: "version_changed", RequiresAction: true})
+				continue
+			}
+			s.pauseRecovery(task.ID)
+			return
+		}
+		s.notify()
+	}
 }
 
 // Ordinary checks still trigger recovery while the switch is on, but always
@@ -377,4 +470,42 @@ func (s *sub2RecoveryService) handleRecoveryCheck(w http.ResponseWriter, r *http
 		return
 	}
 	respondJSONStatus(w, 202, map[string]any{"success": true, "batch_id": batch.ID})
+}
+
+// Older releases stored no retry policy. Only adopt a saved remote checkpoint
+// with matching ownership; login failures use structured local error codes.
+func (s *sub2RecoveryService) classifyLegacyRecovery(ctx context.Context, task store.AccountRecoveryTask) {
+	account, err := s.store.GetAccountByID(ctx, task.AccountID)
+	if err != nil {
+		return
+	}
+	if s.store.ValidateAccountRecoveryVersion(ctx, task.ID) != nil {
+		s.recordRecoveryFailure(task, store.RecoveryValidating, &recoveryOperationError{Code: "version_changed", RequiresAction: true})
+		return
+	}
+	if task.ResultCredentialAttemptID > 0 {
+		detail, err := s.sub2Account(ctx, task.Sub2AccountID)
+		if err != nil {
+			s.recordRecoveryFailure(task, store.RecoveryCredentialsApplied, err)
+			return
+		}
+		if !recoveryMarkerMatches(detail, task) {
+			s.recordRecoveryFailure(task, store.RecoveryCredentialsApplied, &recoveryOperationError{Code: "checkpoint_unconfirmed", RequiresAction: true})
+			return
+		}
+		s.recordRecoveryFailure(task, store.RecoveryCredentialsApplied, &recoveryOperationError{Code: "interrupted"})
+		return
+	}
+	failure := &recoveryOperationError{Code: "login_failed"}
+	switch account.LastErrorCode {
+	case "invalid_password", "incorrect_password", "invalid_totp", "invalid_mfa":
+		failure.Code, failure.RequiresAction = "login_required", true
+	}
+	// Legacy identity_mismatch also represented workspace/user-id changes that
+	// are now allowed. Retry once under current identity checks; a real email
+	// conflict is classified as requiring action by loginAgain.
+	if account.Status == "deactivated" || account.Status == "deleted" || account.Status == "deleted_or_deactivated" {
+		failure.Code, failure.RequiresAction = "account_unavailable", true
+	}
+	s.recordRecoveryFailure(task, store.RecoveryLoggingIn, failure)
 }

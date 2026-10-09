@@ -81,7 +81,7 @@ func TestAccountRecoveryTaskRecoveryOnRestart(t *testing.T) {
 	}
 	defer reopened.Close()
 	recovered, err := reopened.GetAccountRecoveryTaskByID(ctx, task.ID)
-	if err != nil || recovered.State != RecoveryUnknown || recovered.LastError == "" {
+	if err != nil || recovered.State != RecoveryUnknown || recovered.LastError == "" || recovered.FailureStage != RecoveryLoggingIn || recovered.ErrorCode != "process_interrupted" || recovered.RetryAction != "relogin" || recovered.NextRetryAt == nil || recovered.RetryCount != 1 {
 		t.Fatalf("recovered task = %+v,%v", recovered, err)
 	}
 }
@@ -428,7 +428,7 @@ func TestRecoveryMigrationAddsCheckpointColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 	task, _, err := reopened.CreateOrGetAccountRecoveryTask(ctx, account.ID, 0, 42, false)
-	if err != nil || task.SourceCredentialAttemptID != 0 || task.ResultCredentialAttemptID != 0 {
+	if err != nil || task.SourceCredentialAttemptID != 0 || task.ResultCredentialAttemptID != 0 || task.Purpose != "recovery" || task.DeliveryID != 0 || task.RetryCount != 0 || task.RequiresAction || task.NextRetryAt != nil {
 		t.Fatalf("migration task=%+v err=%v", task, err)
 	}
 }

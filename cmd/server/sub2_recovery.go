@@ -67,10 +67,11 @@ type recoveryOAuthCredentials struct {
 }
 
 type sub2APIError struct {
-	Status  int
-	Code    int
-	Reason  string
-	Message string
+	Status            int
+	Code              int
+	Reason            string
+	Message           string
+	RetryAfterSeconds int
 }
 
 func (e *sub2APIError) Error() string {
@@ -115,7 +116,7 @@ func (s *sub2RecoveryService) configured() bool {
 }
 
 func (s *sub2RecoveryService) Start() {
-	if !s.configured() {
+	if s == nil || s.store == nil || (!s.configured() && s.loginWithProxies == nil) {
 		return
 	}
 	s.wg.Add(2)
@@ -148,7 +149,11 @@ func (s *sub2RecoveryService) worker() {
 			return
 		}
 		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-		tasks, err := s.store.ListAccountRecoveryTasks(ctx, store.RecoveryQueued, 1)
+		var tasks []store.AccountRecoveryTask
+		var err error
+		if s.configured() {
+			tasks, err = s.store.ListAccountRecoveryTasks(ctx, store.RecoveryQueued, 1)
+		}
 		cancel()
 		if err != nil {
 			s.pauseRecovery(0)
@@ -166,6 +171,12 @@ func (s *sub2RecoveryService) worker() {
 				s.pauseRecovery(tasks[0].ID)
 				return
 			}
+		}
+		if s.processNextCredentialRepair() {
+			continue
+		}
+		if s.configured() && s.processNextRecheck() {
+			continue
 		}
 		select {
 		case <-s.ctx.Done():
@@ -334,6 +345,27 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, auto
 	if recoveryAccountDisabled(detail) {
 		return store.AccountRecoveryTask{}, false, errors.New("Sub2 账号已被禁用，请先在 Sub2 启用后恢复")
 	}
+	previous, previousErr := s.store.GetLatestAccountRecoveryTask(ctx, accountID)
+	if previousErr != nil && !errors.Is(previousErr, store.ErrAccountRecoveryNotFound) {
+		return previous, false, previousErr
+	}
+	if previousErr == nil && previous.Sub2AccountID == binding.Sub2AccountID &&
+		(previous.Resumable || previous.RetryAction == "relogin") && (previous.State == store.RecoveryFailed || previous.State == store.RecoveryUnknown) {
+		// Resume is independent of the original 401 and current Sub2 error flag:
+		// the successful apply may already have made the account active/paused.
+		retryTask := previous
+		if retryTask.RetryAction != "relogin" {
+			retryTask.RetryAction = "resume"
+		}
+		if err := s.verifyRecoveryRetry(ctx, retryTask, detail, account, binding); err != nil {
+			return previous, false, err
+		}
+		task, err := s.store.RetryAccountRecoveryTask(ctx, previous.ID, retryTask.RetryAction == "relogin")
+		if err == nil {
+			s.notify()
+		}
+		return task, false, err
+	}
 	if len(automatic) > 0 && automatic[0] {
 		status, _ := detail["status"].(string)
 		if !s.autoRecovery.Load() || !strings.EqualFold(status, "error") {
@@ -352,17 +384,6 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, auto
 		if status, _ := detail["status"].(string); strings.EqualFold(strings.TrimSpace(status), "error") {
 			original = true
 		}
-	}
-	previous, previousErr := s.store.GetLatestAccountRecoveryTask(ctx, accountID)
-	if previousErr != nil && !errors.Is(previousErr, store.ErrAccountRecoveryNotFound) {
-		return previous, false, previousErr
-	}
-	if previousErr == nil && previous.Sub2AccountID == binding.Sub2AccountID && previous.Resumable {
-		task, err := s.store.ResumeAccountRecoveryTask(ctx, previous.ID)
-		if err == nil {
-			s.notify()
-		}
-		return task, false, err
 	}
 	checkID, err := s.validateCandidate(ctx, accountID)
 	if err != nil {
@@ -384,31 +405,47 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, auto
 func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.timeout)
 	defer cancel()
+	fail := func(stage string, err error) { s.recordRecoveryFailure(task, stage, err) }
+	require := func(stage, code string) { fail(stage, &recoveryOperationError{Code: code, RequiresAction: true}) }
 	lease, err := s.store.AcquireAccountRecovery(ctx, task.AccountID)
 	if err != nil {
-		s.fail(task.ID, store.RecoveryFailed, "账号正在登录或已不可用，请完成登录并重新检测")
+		if errors.Is(err, store.ErrAccountNotFound) {
+			require(store.RecoveryValidating, "account_missing")
+		} else if errors.Is(err, store.ErrAccountBusy) {
+			fail(store.RecoveryValidating, &recoveryOperationError{Code: "account_busy"})
+		} else {
+			s.pauseRecovery(task.ID)
+		}
 		return
 	}
 	defer lease.Release()
 	account, err := s.store.GetAccountByID(ctx, task.AccountID)
 	if err != nil {
-		s.fail(task.ID, store.RecoveryFailed, "AUTH 账号不存在")
+		if errors.Is(err, store.ErrAccountNotFound) {
+			require(store.RecoveryValidating, "account_missing")
+		} else {
+			s.pauseRecovery(task.ID)
+		}
 		return
 	}
 	if err := s.store.ValidateAccountRecoveryVersion(ctx, task.ID); err != nil {
-		s.fail(task.ID, store.RecoveryFailed, "凭据版本已变化，请重新检测后恢复")
+		require(store.RecoveryValidating, "version_changed")
 		return
 	}
-	if task.ResultCredentialAttemptID == 0 {
+	if task.ResultCredentialAttemptID == 0 && task.RetryAction != "relogin" {
 		checkID, err := s.validateCandidate(ctx, task.AccountID)
 		if err != nil || checkID != task.CheckID {
-			s.fail(task.ID, store.RecoveryFailed, "检测结果已变化，请重新检测后恢复")
+			require(store.RecoveryValidating, "version_changed")
 			return
 		}
 	}
 	binding, err := s.sub2.store.GetSub2Import(ctx, s.sub2.destinationKey, task.AccountID)
+	if err != nil && !errors.Is(err, store.ErrSub2ImportNotFound) {
+		s.pauseRecovery(task.ID)
+		return
+	}
 	if err != nil || binding.State != "imported" || binding.Sub2AccountID != task.Sub2AccountID {
-		s.fail(task.ID, store.RecoveryFailed, "Sub2 绑定已变化，请人工核对")
+		require(store.RecoveryValidating, "identity_changed")
 		return
 	}
 	if !s.setState(task.ID, store.RecoveryValidating, "正在核对账号绑定和调度状态") {
@@ -416,40 +453,34 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 	}
 	detail, err := s.sub2Account(ctx, task.Sub2AccountID)
 	if err != nil {
-		s.fail(task.ID, store.RecoveryUnknown, "Sub2 账号状态无法核对，已暂停自动恢复")
+		fail(store.RecoveryValidating, err)
 		return
 	}
-	if err := verifySub2RecoveryIdentity(detail, task.Sub2AccountID, task.AccountID, account, binding); err != nil {
-		s.fail(task.ID, store.RecoveryFailed, "Sub2 账号身份与 AUTH 绑定不一致")
+	if verifySub2RecoveryIdentity(detail, task.Sub2AccountID, task.AccountID, account, binding) != nil {
+		require(store.RecoveryValidating, "identity_changed")
 		return
-	}
-	if account.ChatGPTAccountID == "" {
-		credentials, _ := detail["credentials"].(map[string]any)
-		workspace, _ := credentials["chatgpt_account_id"].(string)
-		if strings.TrimSpace(workspace) == "" {
-			s.fail(task.ID, store.RecoveryFailed, "Sub2 缺少账号工作区身份，无法核对重新登录结果")
-			return
-		}
-		// An account that has never logged in locally still has an identity in
-		// Sub2. Pin it before login; a different returned workspace must never
-		// overwrite that existing remote account.
-		account.ChatGPTAccountID = workspace
 	}
 	if recoveryAccountDisabled(detail) {
-		s.fail(task.ID, store.RecoveryFailed, "Sub2 账号已被禁用，停止恢复")
+		require(store.RecoveryValidating, "account_unavailable")
 		return
 	}
 	scheduled, ok := boolField(detail, "schedulable")
-	if status, _ := detail["status"].(string); strings.EqualFold(strings.TrimSpace(status), "active") && !scheduled && task.OriginalSchedulable && task.ResultCredentialAttemptID == 0 {
-		s.fail(task.ID, store.RecoveryCanceled, "Sub2 已转为人工暂停，停止重新登录")
+	if !ok {
+		require(store.RecoveryValidating, "checkpoint_unconfirmed")
 		return
 	}
-	// A Sub2 account in error is commonly auto-paused before AUTH starts the
-	// recovery task. In that case the desired post-recovery state is true even
-	// though the current state is false. A manually paused active account keeps
-	// the desired false state and a surprising re-enable is still rejected.
-	if !ok || (task.ResultCredentialAttemptID == 0 && !task.OriginalSchedulable && scheduled) {
-		s.fail(task.ID, store.RecoveryUnknown, "Sub2 调度状态在恢复期间发生变化，请人工核对")
+	if task.RetryAction != "" {
+		if err := s.verifyRecoveryRetry(ctx, task, detail, account, binding); err != nil {
+			fail(task.FailureStage, err)
+			return
+		}
+	} else if status, _ := detail["status"].(string); strings.EqualFold(status, "active") && !scheduled && task.OriginalSchedulable &&
+		(task.ResultCredentialAttemptID == 0 || task.Purpose == "delivery") {
+		require(store.RecoveryValidating, "manual_pause")
+		return
+	}
+	if task.ResultCredentialAttemptID == 0 && !task.OriginalSchedulable && scheduled {
+		require(store.RecoveryValidating, "manual_pause")
 		return
 	}
 	if scheduled {
@@ -457,7 +488,7 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 			return
 		}
 		if err := s.setSchedulable(ctx, task.Sub2AccountID, false); err != nil {
-			s.fail(task.ID, store.RecoveryUnknown, "Sub2 调度未能安全关闭")
+			fail(store.RecoveryDisablingSchedule, err)
 			return
 		}
 	}
@@ -465,7 +496,7 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 	if task.ResultCredentialAttemptID > 0 {
 		_, saved, readErr := s.store.GetOAuthResultByID(ctx, task.AccountID)
 		if readErr != nil {
-			s.fail(task.ID, store.RecoveryUnknown, "已保存的新凭据无法读取")
+			fail(store.RecoveryLoginSucceeded, readErr)
 			return
 		}
 		oauth = recoveryOAuthCredentials{AccessToken: saved.AccessToken, RefreshToken: saved.RefreshToken,
@@ -477,61 +508,85 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		}
 		oauth, err = s.loginAgain(ctx, task.ID, account, lease)
 		if err != nil {
-			if s.paused.Load() {
-				return
+			if !s.paused.Load() {
+				fail(store.RecoveryLoggingIn, classifyRecoveryLoginError(err))
 			}
-			s.fail(task.ID, store.RecoveryUnknown, recoveryStageMessage(err))
 			return
 		}
 	}
-	if err := verifyOAuthIdentity(oauth, account); err != nil {
-		s.fail(task.ID, store.RecoveryFailed, "新凭据身份核对失败，Sub2 保持停止调度")
+	if verifyOAuthIdentity(oauth, account) != nil {
+		require(store.RecoveryIdentityVerified, "identity_changed")
 		return
 	}
+	account.ChatGPTAccountID = oauth.ChatGPTAccountID
+	account.OrganizationID, account.PlanType, account.ExpiresAt = oauth.OrganizationID, oauth.PlanType, oauth.ExpiresAt
 	savedTask, err := s.store.GetAccountRecoveryTaskByID(ctx, task.ID)
 	if err != nil {
 		s.pauseRecovery(task.ID)
 		return
 	}
 	task = savedTask
-	if err := s.store.ValidateAccountRecoveryVersion(ctx, task.ID); err != nil {
-		s.fail(task.ID, store.RecoveryUnknown, "凭据版本无法确认，Sub2 保持停止调度")
+	if s.store.ValidateAccountRecoveryVersion(ctx, task.ID) != nil {
+		require(store.RecoveryIdentityVerified, "version_changed")
 		return
 	}
 	if !s.setState(task.ID, store.RecoveryIdentityVerified, "新凭据身份已核对") {
 		return
 	}
-	if !s.setState(task.ID, store.RecoveryApplyingCredentials, "正在写回原 Sub2 账号") {
-		return
-	}
-	if err := s.applyCredentials(ctx, task, oauth); err != nil {
-		s.fail(task.ID, store.RecoveryUnknown, "Sub2 凭据或缓存更新未确认，保持暂停；可继续恢复")
-		return
+	// A verified remote checkpoint already contains this version. Re-probe it
+	// without rewriting credentials or clearing an error raised by Sub2.
+	alreadyApplied := recoveryMarkerMatches(detail, task) && verifySub2RecoveryMetadata(detail, task.Sub2AccountID, task.AccountID, account, binding) == nil
+	if !alreadyApplied {
+		if !s.setState(task.ID, store.RecoveryApplyingCredentials, "正在写回原 Sub2 账号") {
+			return
+		}
+		if err := s.applyCredentials(ctx, task, oauth); err != nil {
+			fail(store.RecoveryApplyingCredentials, err)
+			return
+		}
 	}
 	after, err := s.sub2Account(ctx, task.Sub2AccountID)
-	if err != nil || verifySub2RecoveryDetail(after, task.Sub2AccountID, task.AccountID, account, binding) != nil || !recoveryMarkerMatches(after, task) {
-		s.fail(task.ID, store.RecoveryUnknown, "凭据已提交但 Sub2 状态回查不一致，可继续恢复")
+	if err != nil {
+		fail(store.RecoveryCredentialsApplied, err)
 		return
 	}
-	if scheduled, ok := boolField(after, "schedulable"); !ok || scheduled {
-		s.fail(task.ID, store.RecoveryUnknown, "Sub2 调度在恢复期间被更改，请人工核对")
+	if verifySub2RecoveryMetadata(after, task.Sub2AccountID, task.AccountID, account, binding) != nil || !recoveryMarkerMatches(after, task) {
+		require(store.RecoveryCredentialsApplied, "identity_changed")
+		return
+	}
+	if recoveryAccountDisabled(after) {
+		require(store.RecoveryCredentialsApplied, "account_unavailable")
+		return
+	}
+	if value, ok := boolField(after, "schedulable"); !ok || value {
+		require(store.RecoveryCredentialsApplied, "manual_pause")
 		return
 	}
 	if !s.setState(task.ID, store.RecoveryCredentialsApplied, "凭据已写回，正在通过 Sub2 检测可用性") {
 		return
 	}
 	if err := s.verifySub2AccountProbe(ctx, task.Sub2AccountID); err != nil {
-		s.fail(task.ID, store.RecoveryUnknown, "Sub2 实际出口检测未通过，保持暂停；可继续恢复")
+		fail(store.RecoveryCredentialsApplied, err)
 		return
 	}
 	beforeEnable, err := s.sub2Account(ctx, task.Sub2AccountID)
-	if err != nil || verifySub2RecoveryDetail(beforeEnable, task.Sub2AccountID, task.AccountID, account, binding) != nil || !recoveryMarkerMatches(beforeEnable, task) {
-		s.fail(task.ID, store.RecoveryUnknown, "检测后 Sub2 状态未通过核对，保持暂停")
+	if err != nil {
+		fail(store.RecoveryEnablingSchedule, err)
+		return
+	}
+	if verifySub2RecoveryDetail(beforeEnable, task.Sub2AccountID, task.AccountID, account, binding) != nil || !recoveryMarkerMatches(beforeEnable, task) {
+		require(store.RecoveryEnablingSchedule, "identity_changed")
 		return
 	}
 	if s.store.ValidateAccountRecoveryVersion(ctx, task.ID) != nil {
-		s.fail(task.ID, store.RecoveryUnknown, "凭据版本无法确认")
+		require(store.RecoveryEnablingSchedule, "version_changed")
 		return
+	}
+	if task.Purpose == "delivery" {
+		if err := s.sub2.applyDeliveryGroups(ctx, task, binding, beforeEnable); err != nil {
+			fail(store.RecoveryEnablingSchedule, err)
+			return
+		}
 	}
 	if !task.OriginalSchedulable {
 		if !s.setState(task.ID, store.RecoveryCompleted, "凭据已更新，Sub2 检测通过并保持原调度状态") {
@@ -544,14 +599,19 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 	}
 	if err := s.setSchedulable(ctx, task.Sub2AccountID, true); err != nil {
 		s.pauseSchedule(task.Sub2AccountID)
-		s.fail(task.ID, store.RecoveryUnknown, "凭据已更新但调度开启未确认，可继续恢复")
+		fail(store.RecoveryEnablingSchedule, err)
 		return
 	}
 	enabled, err := s.sub2Account(ctx, task.Sub2AccountID)
-	value, ok := boolField(enabled, "schedulable")
-	if err != nil || !ok || !value || verifySub2RecoveryDetail(enabled, task.Sub2AccountID, task.AccountID, account, binding) != nil || !recoveryMarkerMatches(enabled, task) {
+	if err != nil {
 		s.pauseSchedule(task.Sub2AccountID)
-		s.fail(task.ID, store.RecoveryUnknown, "最终状态无法确认，已请求暂停调度；可继续恢复")
+		fail(store.RecoveryEnablingSchedule, err)
+		return
+	}
+	value, ok := boolField(enabled, "schedulable")
+	if !ok || !value || verifySub2RecoveryDetail(enabled, task.Sub2AccountID, task.AccountID, account, binding) != nil || !recoveryMarkerMatches(enabled, task) {
+		s.pauseSchedule(task.Sub2AccountID)
+		require(store.RecoveryEnablingSchedule, "checkpoint_unconfirmed")
 		return
 	}
 	if !s.setState(task.ID, store.RecoveryCompleted, "凭据已更新，Sub2 检测通过并已开启调度") {
@@ -570,11 +630,14 @@ func (s *sub2RecoveryService) pauseSchedule(id int64) {
 func (s *sub2RecoveryService) loginAgain(ctx context.Context, taskID int64, account store.Account, lease *store.AccountRecoveryLease) (recoveryOAuthCredentials, error) {
 	var out recoveryOAuthCredentials
 	if s.loginWithProxies == nil {
-		return out, errors.New("login service unavailable")
+		return out, &recoveryOperationError{Code: "configuration", RequiresAction: true}
 	}
 	credentials, err := s.store.GetCredentialsByID(ctx, account.ID)
 	if err != nil {
 		return out, err
+	}
+	if strings.TrimSpace(credentials.Password) == "" {
+		return out, &recoveryOperationError{Code: "login_required", RequiresAction: true}
 	}
 	release, err := acquireRecoveryLoginSlot(ctx)
 	if err != nil {
@@ -612,7 +675,7 @@ func (s *sub2RecoveryService) loginAgain(ctx context.Context, taskID int64, acco
 			s.pauseRecovery(taskID)
 			return out, errors.New("AUTH 登录结果保存失败")
 		}
-		return recoveryOAuthCredentials{}, err
+		return recoveryOAuthCredentials{}, &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
 	}
 	stored := &store.Result{AccessToken: out.AccessToken, RefreshToken: out.RefreshToken, ChatGPTAccountID: out.ChatGPTAccountID, OrganizationID: out.OrganizationID, PlanType: out.PlanType, ExpiresAt: out.ExpiresAt, ExpiresIn: out.ExpiresIn}
 	if err := lease.FinishAttempt(finishCtx, taskID, attempt.ID, true, stored, nil); err != nil {
@@ -666,7 +729,13 @@ func (s *sub2RecoveryService) validateCandidate(ctx context.Context, accountID i
 
 func (s *sub2RecoveryService) sub2Account(ctx context.Context, id int64) (map[string]any, error) {
 	var detail map[string]any
-	err := s.sub2.apiJSON(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(id, 10), nil, &detail)
+	status, err := s.sub2.apiJSONStatus(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(id, 10), nil, &detail)
+	if err != nil && status > 0 {
+		var classified *recoveryOperationError
+		if !errors.As(err, &classified) {
+			err = recoveryHTTPError(status, 0)
+		}
+	}
 	return detail, err
 }
 
@@ -675,18 +744,13 @@ func (s *sub2RecoveryService) setSchedulable(ctx context.Context, id int64, enab
 }
 
 func (s *sub2RecoveryService) applyCredentials(ctx context.Context, task store.AccountRecoveryTask, credentials recoveryOAuthCredentials) error {
-	values := map[string]any{"access_token": credentials.AccessToken, "refresh_token": credentials.RefreshToken, "client_id": recoveryClientID}
+	values := map[string]any{"access_token": credentials.AccessToken, "refresh_token": credentials.RefreshToken, "client_id": recoveryClientID,
+		"organization_id": credentials.OrganizationID, "plan_type": credentials.PlanType}
 	if credentials.Email != "" {
 		values["email"] = credentials.Email
 	}
 	if credentials.ChatGPTAccountID != "" {
 		values["chatgpt_account_id"] = credentials.ChatGPTAccountID
-	}
-	if credentials.OrganizationID != "" {
-		values["organization_id"] = credentials.OrganizationID
-	}
-	if credentials.PlanType != "" {
-		values["plan_type"] = credentials.PlanType
 	}
 	if credentials.ExpiresAt > 0 {
 		values["expires_at"] = credentials.ExpiresAt
@@ -706,6 +770,158 @@ func (s *sub2RecoveryService) setState(id int64, state, message string) bool {
 
 func (s *sub2RecoveryService) fail(id int64, state, message string) { s.setState(id, state, message) }
 
+func recoveryRetryDelay(failure *recoveryOperationError, previousFailures int) time.Duration {
+	delay := time.Minute
+	switch failure.Code {
+	case "rate_limited", "probe_failed", "protocol_error", "login_failed":
+		delay = 5 * time.Minute
+	case "upstream_error":
+		delay = 2 * time.Minute
+	case "challenge":
+		delay = 15 * time.Minute
+	}
+	for i := 0; i < previousFailures && delay < time.Hour; i++ {
+		delay *= 2
+	}
+	if delay > time.Hour {
+		delay = time.Hour
+	}
+	if retryAfter := time.Duration(failure.RetryAfterSeconds) * time.Second; retryAfter > delay {
+		delay = retryAfter
+	}
+	return delay
+}
+
+func classifyRecoveryLoginError(err error) *recoveryOperationError {
+	var classified *recoveryOperationError
+	if errors.As(err, &classified) {
+		return classified
+	}
+	info := describeLoginError(err)
+	if info.AccountStatus != "" {
+		return &recoveryOperationError{Code: "account_unavailable", HTTPStatus: info.HTTPStatus, RequiresAction: true}
+	}
+	if info.HTTPStatus == http.StatusTooManyRequests || info.HTTPStatus >= 500 {
+		retryAfter := 0
+		var retry interface{ RetryAfterDuration() time.Duration }
+		if errors.As(err, &retry) {
+			retryAfter = int(retry.RetryAfterDuration().Seconds())
+		}
+		return recoveryHTTPError(info.HTTPStatus, retryAfter)
+	}
+	switch info.Code {
+	case login.LoginErrorTimeout:
+		return &recoveryOperationError{Code: "timeout"}
+	case login.LoginErrorCanceled:
+		return &recoveryOperationError{Code: "interrupted"}
+	case login.LoginErrorConnectionReset:
+		return &recoveryOperationError{Code: "network_error"}
+	case login.LoginErrorCloudflareChallenge:
+		return &recoveryOperationError{Code: "challenge", HTTPStatus: info.HTTPStatus}
+	case login.LoginErrorUnsupportedRegion, login.LoginErrorConfiguration, login.LoginErrorIdentity,
+		"invalid_password", "incorrect_password", "invalid_otp", "invalid_totp", "invalid_mfa", "mfa_required", "identity_mismatch", "invalid_credentials":
+		return &recoveryOperationError{Code: "login_required", HTTPStatus: info.HTTPStatus, RequiresAction: true}
+	}
+	return &recoveryOperationError{Code: "login_failed", HTTPStatus: info.HTTPStatus}
+}
+
+func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTask, stage string, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	current, readErr := s.store.GetAccountRecoveryTaskByID(ctx, task.ID)
+	if readErr != nil {
+		s.pauseRecovery(task.ID)
+		return
+	}
+	failure := classifyRecoveryError(err)
+	record := store.RecoveryFailure{State: store.RecoveryUnknown, Stage: stage, Code: failure.Code, Message: failure.Error()}
+	if failure.RequiresAction {
+		record.RetryAction, record.ManualAction = "manual", failure.Error()
+		if current.ResultCredentialAttemptID == 0 {
+			record.State = store.RecoveryFailed
+		}
+	} else {
+		record.RetryAction = "resume"
+		if current.ResultCredentialAttemptID == 0 || failure.CredentialInvalid {
+			record.RetryAction = "relogin"
+		}
+		next := time.Now().UTC().Add(recoveryRetryDelay(failure, current.RetryCount))
+		record.NextRetryAt = &next
+	}
+	if failure.Code == "manual_pause" {
+		record.State = store.RecoveryCanceled
+	}
+	if _, err := s.store.RecordAccountRecoveryFailure(ctx, task.ID, record); err != nil {
+		s.pauseRecovery(task.ID)
+	}
+}
+
+// This fence is shared by automatic requeue and execution, so changes between
+// scanning and claiming cannot turn an unrelated pause into a resume request.
+func (s *sub2RecoveryService) verifyRecoveryRetry(ctx context.Context, task store.AccountRecoveryTask, detail map[string]any, account store.Account, binding store.Sub2Import) error {
+	if task.RetryAction != "resume" && task.RetryAction != "relogin" {
+		return &recoveryOperationError{Code: "checkpoint_unconfirmed", RequiresAction: true}
+	}
+	if err := s.store.ValidateAccountRecoveryVersion(ctx, task.ID); err != nil {
+		return &recoveryOperationError{Code: "version_changed", RequiresAction: true}
+	}
+	if !task.OriginalSchedulable || recoveryAccountDisabled(detail) {
+		return &recoveryOperationError{Code: "manual_pause", RequiresAction: true}
+	}
+	if verifySub2RecoveryIdentity(detail, task.Sub2AccountID, task.AccountID, account, binding) != nil {
+		return &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
+	}
+	scheduled, ok := boolField(detail, "schedulable")
+	if !ok {
+		return &recoveryOperationError{Code: "checkpoint_unconfirmed", RequiresAction: true}
+	}
+	if s.delayedRecheckRetryOwned(ctx, task, detail) {
+		return nil
+	}
+	markerTask := task
+	if markerTask.ResultCredentialAttemptID == 0 && task.RetryAction == "relogin" {
+		markerTask.ResultCredentialAttemptID = task.SourceCredentialAttemptID
+	}
+	if recoveryMarkerMatches(detail, markerTask) {
+		if verifySub2RecoveryMetadata(detail, task.Sub2AccountID, task.AccountID, account, binding) != nil {
+			return &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
+		}
+		return nil
+	}
+	// A retry before the first successful apply has no remote checkpoint yet.
+	// It may continue only while Sub2 is still in the original error state.
+	status, _ := detail["status"].(string)
+	extra, _ := detail["extra"].(map[string]any)
+	_, hasMarker := extra["kkai_auth_recovery"]
+	priorMarker, _ := extra["kkai_auth_recovery"].(map[string]any)
+	priorVersion := int64(toFloat(priorMarker["credential_attempt_id"]))
+	priorTask := int64(toFloat(priorMarker["task_id"]))
+	originalMarker := !hasMarker || (priorTask > 0 && priorTask < task.ID && priorVersion == task.SourceCredentialAttemptID)
+	if task.Purpose == "delivery" && priorTask > 0 && priorTask < task.ID && priorVersion > 0 && priorVersion <= task.SourceCredentialAttemptID {
+		originalMarker = true
+	}
+	beforeApply := task.FailureStage == store.RecoveryValidating || task.FailureStage == store.RecoveryDisablingSchedule ||
+		task.FailureStage == store.RecoveryLoggingIn || task.FailureStage == store.RecoveryLoginSucceeded ||
+		task.FailureStage == store.RecoveryIdentityVerified || task.FailureStage == store.RecoveryApplyingCredentials
+	if beforeApply && originalMarker && strings.EqualFold(status, "error") {
+		return nil
+	}
+	// Delivery begins with saved fresh credentials on a healthy account. A
+	// successful pause precedes these persisted stages, so an interrupted apply
+	// can continue without another login. A timeout in the pause itself has no
+	// such proof and is deliberately excluded.
+	if task.Purpose == "delivery" && beforeApply && originalMarker && strings.EqualFold(status, "active") {
+		pauseConfirmed := task.FailureStage == store.RecoveryIdentityVerified || task.FailureStage == store.RecoveryApplyingCredentials
+		if scheduled || pauseConfirmed {
+			return nil
+		}
+	}
+	if !scheduled && strings.EqualFold(status, "active") {
+		return &recoveryOperationError{Code: "manual_pause", RequiresAction: true}
+	}
+	return &recoveryOperationError{Code: "checkpoint_unconfirmed", RequiresAction: true}
+}
+
 func (s *sub2RecoveryService) pauseRecovery(id int64) {
 	s.paused.Store(true)
 	log.Printf("恢复任务存储故障：已停止后续派发，修复存储后重启服务核对 task_id=%d", id)
@@ -718,11 +934,8 @@ func verifyOAuthIdentity(credentials recoveryOAuthCredentials, account store.Acc
 	if strings.TrimSpace(credentials.Email) == "" || !strings.EqualFold(strings.TrimSpace(credentials.Email), strings.TrimSpace(account.Email)) {
 		return errors.New("email mismatch")
 	}
-	if account.ChatGPTAccountID != "" && strings.TrimSpace(credentials.ChatGPTAccountID) == "" {
+	if strings.TrimSpace(credentials.ChatGPTAccountID) == "" {
 		return errors.New("chatgpt account id missing")
-	}
-	if account.ChatGPTAccountID != "" && credentials.ChatGPTAccountID != account.ChatGPTAccountID {
-		return errors.New("chatgpt account mismatch")
 	}
 	return nil
 }
@@ -750,6 +963,9 @@ func (s *sub2RecoveryService) sub2JSONBody(ctx context.Context, method, path str
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return recoveryHTTPError(resp.StatusCode, recoveryRetryAfter(resp.Header.Get("Retry-After")))
+	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		return err
@@ -761,10 +977,10 @@ func (s *sub2RecoveryService) sub2JSONBody(ctx context.Context, method, path str
 		Data    json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return &sub2APIError{Status: resp.StatusCode, Message: "Sub2 响应格式无效"}
+		return &recoveryOperationError{Code: "protocol_error", HTTPStatus: resp.StatusCode}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || envelope.Code != 0 {
-		return &sub2APIError{Status: resp.StatusCode, Code: envelope.Code, Reason: envelope.Reason, Message: "Sub2 请求未成功"}
+		return &sub2APIError{Status: resp.StatusCode, Code: envelope.Code, Message: "Sub2 请求未成功"}
 	}
 	if out != nil && len(envelope.Data) != 0 && string(envelope.Data) != "null" {
 		if err := json.Unmarshal(envelope.Data, out); err != nil {

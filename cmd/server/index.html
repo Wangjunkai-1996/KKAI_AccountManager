@@ -197,7 +197,7 @@
             letter-spacing: 0.01em;
         }
 
-        textarea, input[type="text"], input[type="number"], input[type="search"], select {
+        textarea, input[type="text"], input[type="password"], input[type="number"], input[type="search"], select {
             width: 100%;
             background: var(--bg-mid);
             border: 1px solid var(--border);
@@ -540,6 +540,17 @@
             font-size: 0.75rem;
         }
 
+        .history-attention { margin: .75rem 0 1rem; border: 1px solid rgba(233,165,104,.3); border-radius: 8px; background: rgba(233,165,104,.04); }
+        .history-attention[hidden] { display: none; }
+        .history-attention > summary { padding: .75rem; color: var(--warning); cursor: pointer; font-size: .85rem; }
+        .history-attention-list { list-style: none; padding: 0 .75rem .65rem; }
+        .history-attention-list li { display: flex; align-items: center; flex-wrap: wrap; gap: .45rem .75rem; padding: .65rem 0; border-top: 1px solid var(--border); }
+        .history-attention-list li > div { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+        .history-attention-list strong { font-size: .8rem; }
+        .history-attention-list p { margin-top: .3rem; color: var(--text-secondary); font-size: .75rem; line-height: 1.5; }
+        .history-automation { margin-top: .5rem; color: var(--text-secondary); font-size: .75rem; line-height: 1.5; overflow-wrap: anywhere; }
+        .history-automation.requires-action { color: var(--warning); }
+
         .history-grid {
             max-height: 520px;
             overflow-y: auto;
@@ -755,6 +766,67 @@
             white-space: nowrap;
         }
 
+        .history-account-card { grid-template-columns: 20px minmax(0, 1fr); gap: 0.65rem 0.85rem; padding: 1rem 1.1rem 0.85rem; transition: border-color .15s, background .15s; }
+        .history-account-card .history-select { padding-top: .2rem; }
+        .history-account-card .history-actions { grid-column: 2; padding-top: .7rem; border-top: 1px solid var(--border); }
+        .history-heading, .history-identity, .history-state-row { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+        .history-identity { min-width: 0; flex: 1 1 15rem; flex-wrap: nowrap; }
+        .history-account-card .history-email { font-family: inherit; font-size: .95rem; letter-spacing: -.01em; overflow-wrap: anywhere; white-space: normal; }
+        .history-account-number { color: var(--text-dim); font-size: .7rem; flex-shrink: 0; }
+        .history-pool-state { display: inline-flex; align-items: center; gap: .4rem; padding: .28rem .6rem; border-radius: 6px; font-size: .7rem; font-weight: 650; white-space: nowrap; }
+        .history-pool-state::before { content: ''; width: 6px; height: 6px; background: currentColor; border-radius: 50%; }
+        .history-pool-state.present { color: var(--success); background: rgba(110,231,183,.09); border: 1px solid rgba(110,231,183,.2); }
+        .history-pool-state.absent { color: #adb9cb; background: rgba(155,168,188,.09); border: 1px solid rgba(155,168,188,.2); }
+        .history-pool-state.unknown { color: var(--warning); background: rgba(233,165,104,.09); border: 1px solid rgba(233,165,104,.22); }
+        .history-recovery-count { color: #b3c5ff; background: transparent; border: 1px solid rgba(122,156,255,.2); border-radius: 6px; padding: .28rem .6rem; font: inherit; font-size: .72rem; white-space: nowrap; cursor: pointer; }
+        .history-recovery-count:hover, .history-recovery-count[aria-expanded="true"] { background: var(--accent-dim); border-color: #708cd1; }
+        .history-state-row { margin-top: .6rem; gap: .4rem; font-size: .73rem; }
+        .history-account-card .history-status { padding: .1rem .45rem; border: 0; border-radius: 4px; background: rgba(155,168,188,.07); }
+        .history-account-card .history-meta { gap: .45rem; margin-top: .55rem; font-size: .73rem; line-height: 1.6; }
+        .history-account-card .history-expiry { padding: 0; border: 0; background: none; }
+        .history-plan { color: var(--text-secondary); }
+        .history-diagnostics { margin-top: .65rem; background: rgba(233,165,104,.045); border-radius: 6px; }
+        .history-diagnostics > summary { display: flex; align-items: center; gap: .75rem; padding: .5rem .65rem; color: var(--warning); cursor: pointer; font-size: .78rem; line-height: 1.45; list-style: none; }
+        .history-diagnostics > summary > span:first-child { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .history-diagnostics > summary::-webkit-details-marker, .history-more > summary::-webkit-details-marker { display: none; }
+        .history-summary-hint { font-size: .68rem; color: var(--text-dim); white-space: nowrap; }
+        .history-diagnostics[open] > summary > span:first-child { white-space: normal; overflow-wrap: anywhere; }
+        .history-diagnostics-body { padding: 0 .65rem .6rem; max-height: 16rem; overflow: auto; }
+        .history-latest-recovery { margin-right: auto; color: var(--text-dim); font-size: .72rem; }
+        .history-account-card .history-actions .btn-secondary, .history-more > summary { padding: .4rem .65rem; font-size: .75rem; border-radius: 6px; }
+        .history-account-card .history-primary-action { color: #b3c5ff; background: var(--accent-dim); border-color: rgba(122,156,255,.28); order: 1; }
+        .history-account-card .history-primary-action:disabled { background: transparent; }
+        .history-more { position: relative; }
+        .history-more > summary { border: 1px solid var(--border); background: var(--bg-elevated); color: var(--text-secondary); cursor: pointer; list-style: none; }
+        .history-more > summary::after { content: ' ···'; }
+        .history-more-menu { display: flex; flex-wrap: wrap; gap: .4rem; padding-top: .55rem; }
+        .history-more[open] { flex-basis: 100%; }
+        .history-more[open] > summary { width: max-content; margin-left: auto; }
+        .history-more-menu button[data-history-action="delete"] { color: var(--error); margin-left: auto; }
+        .history-recovery-count:focus-visible, .history-account-card summary:focus-visible, .history-account-card button:focus-visible { outline: 2px solid #87a4ff; outline-offset: 3px; }
+        .history-recovery-popover { position: fixed; z-index: 25; width: min(400px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); display: flex; flex-direction: column; padding: 1rem; border: 1px solid rgba(122,156,255,.25); border-radius: 12px; background: #131b29; color: var(--text-primary); box-shadow: 0 18px 64px rgba(0,0,0,.5); }
+        .history-recovery-popover[hidden] { display: none; }
+        .recovery-popover-heading { display: flex; align-items: center; gap: .75rem; margin-bottom: .7rem; }
+        .recovery-popover-heading > div { flex: 1; min-width: 0; }
+        .recovery-popover-heading h3 { font-size: .88rem; }
+        .recovery-popover-heading p { color: var(--text-dim); font-size: .7rem; margin-top: .2rem; overflow-wrap: anywhere; }
+        .recovery-popover-heading .btn-icon { flex: 0 0 32px; width: 32px; height: 32px; }
+        .recovery-popover-body { min-height: 0; max-height: 25rem; overflow: auto; overscroll-behavior: contain; }
+        .recovery-count-summary { display: flex; align-items: baseline; gap: .7rem; font-size: .78rem; color: var(--text-secondary); }
+        .recovery-count-summary strong { color: var(--success); font-size: .95rem; }
+        .recovery-count-hint { font-size: .69rem; color: var(--text-dim); line-height: 1.5; margin: .45rem 0 1rem; }
+        .recovery-timeline { list-style: none; padding-left: .4rem; }
+        .recovery-timeline li { position: relative; padding: 0 0 1rem 1rem; border-left: 1px solid rgba(155,168,188,.2); }
+        .recovery-timeline li:last-child { padding-bottom: .15rem; }
+        .recovery-timeline li::before { content: ''; position: absolute; left: -4px; top: .3rem; width: 7px; height: 7px; background: var(--accent); border-radius: 50%; }
+        .recovery-timeline li.recovery-completed::before { background: var(--success); }
+        .recovery-timeline li.recovery-stopped::before { background: var(--warning); }
+        .recovery-record-heading { display: flex; justify-content: space-between; gap: .5rem; font-size: .78rem; }
+        .recovery-record-heading span, .recovery-timeline time, .recovery-record-update { color: var(--text-dim); font-size: .69rem; }
+        .recovery-record-update { display: block; }
+        .recovery-timeline li p { color: var(--text-secondary); font-size: .75rem; line-height: 1.5; margin-top: .35rem; overflow-wrap: anywhere; white-space: pre-wrap; }
+        .recovery-empty { color: var(--text-secondary); font-size: .8rem; line-height: 1.6; padding: 1rem 0; }
+
         .history-detail-overlay {
             position: fixed;
             inset: 0;
@@ -802,6 +874,20 @@
         .action-confirm-buttons button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
         .action-confirm-buttons .btn-danger { color: var(--error); border-color: var(--error); }
         .action-confirm-buttons .btn-danger:hover { color: var(--error); border-color: var(--error); background: rgba(248, 113, 113, 0.1); }
+        .account-form-dialog { width: min(580px, calc(100% - 2rem)); }
+        .account-form-dialog .input-group { margin: 1rem 0; }
+        .account-form-dialog .hint { overflow-wrap: anywhere; }
+        .delivery-options-row { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; margin-top: .75rem; }
+        .delivery-options-row .hint { flex: 1 1 12rem; margin: 0; }
+        .delivery-group-list { display: flex; flex-wrap: wrap; gap: .5rem; max-height: 160px; overflow: auto; padding: .25rem; margin: .5rem 0; }
+        .delivery-group-option { display: flex; gap: .5rem; align-items: center; padding: .5rem .75rem; border: 1px solid var(--border); border-radius: 8px; font-size: .85rem; min-height: 42px; }
+        .delivery-group-option input, .account-form-dialog input[type="checkbox"] { width: auto; }
+        .delivery-group-option:has(input:checked) { border-color: var(--accent); background: rgba(139, 92, 246, .12); }
+        .account-form-dialog .form-status { min-height: 1.5em; color: var(--text-secondary); font-size: .85rem; margin: .75rem 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+        .account-form-dialog .form-status.error { color: var(--error); }
+        .account-form-dialog input[type="password"], .account-form-dialog input[type="text"] { width: 100%; }
+        .account-form-dialog .input-group > .history-setting-toggle { margin-top: .6rem; }
+        .history-attention-actions { display: flex; gap: .5rem; flex-wrap: wrap; flex-shrink: 0; }
 
         .history-detail-header {
             display: flex;
@@ -868,6 +954,17 @@
             .history-actions { justify-content: flex-start; }
             .history-pagination { justify-content: flex-start; }
             .history-detail-summary { grid-template-columns: 1fr; }
+            .history-account-card { padding: .85rem .75rem; gap: .6rem; }
+            .history-account-card .history-actions { grid-column: 1 / -1; }
+            .history-account-card .history-select { grid-row: 1; }
+            .history-identity { flex-basis: 100%; }
+            .history-account-card .history-actions .btn-secondary, .history-more > summary, .history-recovery-count { min-height: 40px; }
+            .history-latest-recovery { flex: 1 0 100%; }
+            .history-account-card .history-meta { gap: .3rem .45rem; }
+            .history-summary-hint { display: none; }
+            .history-recovery-popover { padding: .85rem; }
+            .history-attention-list li > div { flex-basis: 100%; }
+            .history-attention-list button { min-height: 40px; }
         }
 
         .btn-icon {
@@ -1042,7 +1139,76 @@
 
         /* Remove fixed scroll constraints */
         .history-grid { max-height: none !important; overflow-y: visible !important; }
-        .status-grid { max-height: none !important; overflow-y: visible !important; }
+        .status-grid { max-height: none; }
+
+        /* Login workspace: keep actions outside the scrolling content. */
+        #panel-login { padding: 1rem clamp(1rem, 3vw, 2rem); }
+        .login-workspace { gap: 1rem; margin-bottom: 0; }
+        .login-workspace .card { padding: 1.25rem; animation: none; }
+        .login-workspace .card:hover { transform: none; }
+        .login-workspace .card-header { gap: .5rem; margin-bottom: 1rem; padding-bottom: .75rem; }
+        .login-workspace .card-title { font-size: 1.05rem; }
+        .login-workspace label { margin-bottom: .4rem; font-size: .8125rem; }
+        .login-workspace input, .login-workspace select { padding: .65rem .75rem; border-radius: 8px; }
+        .login-workspace .hint { margin-top: .35rem; }
+        .login-form-body { min-height: 0; }
+        .login-workspace .input-group { margin-bottom: .85rem; }
+        .login-workspace .input-label-row label { margin: 0; }
+        .login-format { color: var(--text-dim); font-size: .75rem; }
+        #accountsInput { display: block; min-height: 112px; height: clamp(112px, 22dvh, 208px); padding: .75rem; font-size: .8125rem; border-radius: 8px; }
+        .login-workspace .preflight-panel { margin-top: .5rem; padding: .5rem .65rem; }
+        .login-quick-options { display: grid; grid-template-columns: minmax(0, 1fr) minmax(100px, .48fr); gap: .75rem; }
+        .login-prefix-help { margin-bottom: .85rem; }
+        #accountNamePrefix[aria-invalid="true"] { border-color: var(--error); }
+        #accountNamePrefix[aria-invalid="true"] + .hint { color: var(--error); }
+        .login-delivery { border: 1px solid var(--border); border-radius: 10px; padding: .75rem; margin-bottom: .85rem; }
+        .login-delivery-heading { display: flex; align-items: center; justify-content: space-between; gap: .5rem; flex-wrap: wrap; }
+        .login-delivery-heading .history-setting-toggle { margin: 0; color: var(--text-primary); }
+        .login-workspace .btn-secondary { padding: .4rem .65rem; font-size: .75rem; min-height: 32px; cursor: pointer; }
+        .login-delivery #deliveryOptionsSummary { color: var(--text-secondary); }
+        .login-advanced { border-top: 1px solid var(--border); padding-top: .75rem; }
+        .login-advanced summary { cursor: pointer; color: var(--text-secondary); font-size: .8125rem; padding: .25rem 0; }
+        .login-advanced summary span { float: right; color: var(--text-dim); font-size: .75rem; }
+        .login-advanced summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+        .login-advanced[open] summary { margin-bottom: .75rem; }
+        .login-advanced .input-group:last-child { margin-bottom: 0; }
+        .login-submit { border-top: 1px solid var(--border); padding-top: .85rem; margin-top: 1rem; flex-shrink: 0; }
+        .login-submit .btn { min-height: 44px; padding: .75rem 1rem; font-size: .9375rem; border-radius: 8px; }
+        .login-result-actions { display: flex; flex-wrap: wrap; gap: .4rem; }
+        .login-workspace .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .5rem; margin-bottom: 1rem; }
+        .login-workspace .stat-item { padding: .7rem .4rem; border-radius: 8px; }
+        .login-workspace .stat-value { font-size: 1.5rem; margin-bottom: .2rem; }
+        .login-workspace .stat-label { letter-spacing: 0; }
+        .login-results .status-item { flex-shrink: 0; }
+        .login-results .empty-state { margin: auto 0; padding: 3rem 1rem; }
+        .login-results .empty-icon { font-size: 2.5rem; }
+        #statusGrid:focus-visible, .login-form-body:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+        @media (min-width: 1025px) {
+            #panel-login { overflow: hidden; }
+            .tab-login-grid, .login-workspace { height: 100%; min-height: 0; }
+            .login-workspace { grid-template-columns: minmax(0, .9fr) minmax(0, 1.2fr); }
+            .login-input, .login-results { display: flex; flex-direction: column; min-height: 0; }
+            .login-workspace .card-header, .login-results .stats { flex-shrink: 0; }
+            .login-form-body { flex: 1; overflow-y: auto; scrollbar-gutter: stable; padding-right: .4rem; }
+            #statusGrid { flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; }
+            #batchImportStatus { flex-shrink: 0; max-height: 25%; overflow-y: auto; }
+        }
+        @media (min-width: 1025px) and (max-height: 760px) {
+            .login-workspace .card { padding: 1rem; }
+            .login-workspace .card-header { margin-bottom: .5rem; padding-bottom: .5rem; }
+            #accountsInput { min-height: 96px; height: 96px; }
+            .login-workspace .input-group, .login-delivery { margin-bottom: .6rem; }
+            .login-prefix-help { margin-bottom: .6rem; }
+            .login-submit { margin-top: .6rem; padding-top: .6rem; }
+        }
+        @media (max-width: 1024px) {
+            .login-workspace .card { padding: 1rem; }
+            #statusGrid { max-height: 65dvh; overflow-y: auto; }
+        }
+        @media (max-width: 400px) {
+            .login-format { font-size: .6875rem; }
+            .login-advanced summary span { float: none; margin-left: .5rem; }
+        }
 
         /* ===== ACTION BAR ===== */
         .action-bar {
@@ -1077,30 +1243,56 @@
         <!-- ── 批量登录 ── -->
         <div id="panel-login" class="tab-panel active" data-tab="login" role="tabpanel" aria-labelledby="tab-login" tabindex="0">
             <div class="tab-login-grid">
-        <div class="main-grid">
-            <div class="card">
+        <div class="main-grid login-workspace">
+            <div class="card login-input">
                 <div class="card-header">
                     <h2 class="card-title">批量输入</h2>
                     <span class="badge" id="accountCount">0 个账号</span>
                 </div>
 
+                <div class="login-form-body" tabindex="0" role="region" aria-label="批量登录设置">
                 <div class="input-group">
-                    <label>账号列表</label>
+                    <div class="input-label-row">
+                        <label for="accountsInput">账号列表</label>
+                        <span class="login-format">每行一个 · 支持 --- 或 ---- 分隔</span>
+                    </div>
                     <textarea
                         id="accountsInput"
-                        placeholder="每行一个账号，支持3或4个短横线分隔
+                        aria-describedby="accountPreflight"
+                        placeholder="邮箱---密码---TOTP 密钥
 
-示例：
-user@example.com---MyPassword123---ABCD1234EFGH5678
-user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
-                    <p class="hint">
-                        💡 格式：<code>email---password---totp_secret</code>（支持3或4个短横线分隔）<br>
-                        💡 支持多行输入，每行一个账号
-                    </p>
-                    <div class="preflight-panel" id="accountPreflight" role="status" aria-live="polite"></div>
+可一次粘贴多个账号"></textarea>
+                    <div class="preflight-panel" id="accountPreflight" role="status" aria-live="polite" hidden></div>
                 </div>
 
-                <div class="input-group">
+                <div class="login-quick-options">
+                    <div>
+                        <label for="accountNamePrefix">账号前缀（可选）</label>
+                        <input type="text" id="accountNamePrefix" placeholder="AUTH" autocomplete="off" spellcheck="false" aria-describedby="accountNamePrefixHint" title="新建 Sub2 名称：前缀_月日时分_邮箱；已有账号名称不变">
+                        <p class="hint login-prefix-help" id="accountNamePrefixHint" role="status">留空使用 AUTH，最多 32 个字符。</p>
+                    </div>
+                    <div>
+                        <label for="concurrency">登录并发</label>
+                        <input type="number" id="concurrency" value="1" min="1" max="10" aria-describedby="concurrencyHint">
+                        <p class="hint" id="concurrencyHint">默认逐个处理</p>
+                    </div>
+                </div>
+
+                <div class="login-delivery">
+                    <div class="login-delivery-heading">
+                        <label class="history-setting-toggle" for="autoDeliverToggle">
+                            <input type="checkbox" id="autoDeliverToggle" disabled>
+                            <span>成功后自动交付 Sub2</span>
+                        </label>
+                        <button class="btn-secondary" id="deliveryOptionsBtn" type="button">交付参数</button>
+                    </div>
+                    <p class="hint" id="deliveryOptionsSummary">正在读取交付参数…</p>
+                    <p class="hint" id="autoDeliverHint">正在确认 Sub2 配置…</p>
+                </div>
+
+                <details class="login-advanced">
+                    <summary>网络与处理方式 <span id="loginConnectionSummary">IPv4 直连 · 并发模式</span></summary>
+                    <div class="input-group">
                     <div class="input-label-row">
                         <label for="proxyInput">HTTP 代理</label>
                         <button class="btn-secondary" id="proxyCheckBtn" type="button">测试代理</button>
@@ -1111,38 +1303,35 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                         inputmode="url"
                         autocomplete="off"
                         spellcheck="false"
-                        placeholder="http://用户名:密码@主机:端口">
+                        placeholder="代理地址；或 direct 使用服务器 IPv4 直连">
                     <p class="hint">
-                        例如：<code>http://user:pass@proxy.example.com:8080</code>。留空使用启动命令中的代理。
+                        留空走服务器 IPv4。其他出口可填 <code>http://user:pass@host:port</code>，或填 <code>direct</code> 明确直连。
                     </p>
                     <p class="hint" id="proxyCheckStatus" role="status" aria-live="polite"></p>
                 </div>
 
-                <div class="controls">
-                    <div class="control-group">
-                        <label>处理模式</label>
+                    <div class="input-group">
+                        <label for="modeSelect">处理模式</label>
                         <select id="modeSelect">
-                            <option value="parallel" selected>并发处理（默认 1）</option>
+                            <option value="parallel" selected>并发处理（按登录并发数量）</option>
                             <option value="sequential">顺序处理（逐个）</option>
                         </select>
                     </div>
-                    <div class="control-group">
-                        <label>并发数量</label>
-                        <input type="number" id="concurrency" value="1" min="1" max="10">
-                    </div>
+                </details>
                 </div>
 
-                <p class="hint">默认逐个处理账号以降低上游验证压力；确认单账号稳定后，可手动提高并发数量。</p>
-
+                <div class="login-submit">
                 <button class="btn btn-primary" id="startBtn">
                     <span>▶️</span>
                     <span>开始处理</span>
                 </button>
+                </div>
             </div>
 
-            <div class="card">
+            <div class="card login-results">
                 <div class="card-header">
                     <h2 class="card-title">处理状态</h2>
+                    <div class="login-result-actions">
                     <button class="btn-secondary" id="retryFailedBtn" disabled>
                         重试全部失败
                     </button>
@@ -1152,6 +1341,7 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                     <button class="btn-secondary" id="exportBtn" disabled>
                         导出结果
                     </button>
+                    </div>
                 </div>
 
                 <div class="stats">
@@ -1161,7 +1351,7 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                     </div>
                     <div class="stat-item">
                         <div class="stat-value" id="successCount" style="color: var(--success)">0</div>
-                        <div class="stat-label">成功</div>
+                        <div class="stat-label">登录成功</div>
                     </div>
                     <div class="stat-item">
                         <div class="stat-value" id="failedCount" style="color: var(--error)">0</div>
@@ -1174,10 +1364,10 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                 </div>
                 <p class="history-batch-status" id="batchImportStatus" role="status" aria-live="polite" hidden></p>
 
-                <div class="status-grid" id="statusGrid">
+                <div class="status-grid" id="statusGrid" tabindex="0" role="region" aria-label="账号处理结果">
                     <div class="empty-state">
                         <div class="empty-icon">📝</div>
-                        <p>在左侧输入账号信息后开始处理</p>
+                        <p>粘贴账号，点击「开始处理」</p>
                     </div>
                 </div>
             </div>
@@ -1205,6 +1395,10 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                 这里只显示账号状态和错误摘要，不会显示密码或 TOTP；重新登录成功后可复制 Refresh Token。已确认被官方删除的账号会提示清理记录。
             </p>
             <p class="hint" id="autoRecoveryDetail" role="status" aria-live="polite">正在读取自动恢复设置…</p>
+            <details class="history-attention" id="historyAttention" hidden>
+                <summary id="historyAttentionSummary">需要处理</summary>
+                <ul class="history-attention-list" id="historyAttentionList"></ul>
+            </details>
             <p class="hint">检测会发起少量模型请求。历史行的 Sub2 状态来自详情接口：原始“可调度”是人工开关，限流、过载、临时暂停和凭据过期会另外标记为“暂不可调度”。AUTH 401 与 Sub2 凭据状态分别显示；仍在 Sub2 池中且未人工暂停的账号，只有 AUTH 当前检测确认凭据失效时才会恢复，正常、人工暂停、已禁用或已删除的账号不会仅凭 Sub2 状态自动恢复。</p>
             <div class="input-group">
                 <label for="historySearchInput">搜索账号</label>
@@ -1270,6 +1464,13 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                     <div id="historyDetailBody"><div class="empty-state"><p>正在加载详情…</p></div></div>
                 </section>
             </div>
+            <section class="history-recovery-popover" id="historyRecoveryPopover" role="dialog" aria-labelledby="historyRecoveryPopoverHeading" aria-describedby="historyRecoveryPopoverTitle" hidden>
+                <div class="recovery-popover-heading">
+                    <div><h3 id="historyRecoveryPopoverHeading">复活记录</h3><p id="historyRecoveryPopoverTitle"></p></div>
+                    <button class="btn-icon" id="historyRecoveryPopoverClose" type="button" aria-label="关闭复活记录">×</button>
+                </div>
+                <div class="recovery-popover-body" id="historyRecoveryPopoverBody" aria-live="polite"></div>
+            </section>
         </div>
 
         <!-- ── 账号检测 ── -->
@@ -1295,7 +1496,7 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                     </select>
                 </label>
                 <label for="checkRoute">检测出口
-                    <select id="checkRoute"><option value="default">服务器默认代理</option><option value="direct">sys1 IPv4 直连</option></select>
+                    <select id="checkRoute"><option value="direct" selected>sys1 IPv4 直连（默认）</option><option value="default">服务器默认代理</option></select>
                 </label>
                 <label for="checkConcurrency">检测并发
                     <select id="checkConcurrency"><option value="1">1</option><option value="2" selected>2</option></select>
@@ -1335,7 +1536,7 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
             <span class="action-bar-label" id="historySelectionStatus" role="status" aria-live="polite">已选 0 个</span>
             <button class="btn-secondary" id="historyClearSelectionBtn" type="button" disabled>清空选择</button>
             <button class="btn-secondary" id="historyBatchReloginBtn" type="button" title="复活所选的失败、中断或停用账号" disabled>批量复活</button>
-            <button class="btn-secondary" id="historyBatchImportBtn" type="button" title="将所选可导入账号加入 Sub2 未分组" disabled>导入 Sub2</button>
+            <button class="btn-secondary" id="historyBatchImportBtn" type="button" title="选择 Sub2 分组与交付参数后导入" disabled>导入 Sub2</button>
             <button class="btn-secondary btn-danger" id="historyBatchDeleteBtn" type="button" disabled>批量删除</button>
         </div>
     </div>
@@ -1347,6 +1548,40 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
             <button class="btn-secondary" id="actionConfirmCancel" type="button" autofocus>取消</button>
             <button class="btn-secondary" id="actionConfirmAccept" type="button">继续</button>
         </div>
+    </dialog>
+
+    <dialog class="history-detail-panel action-confirm-dialog account-form-dialog" id="deliveryOptionsDialog" aria-labelledby="deliveryOptionsTitle" aria-describedby="deliveryOptionsMessage">
+        <h3 id="deliveryOptionsTitle">Sub2 交付参数</h3>
+        <p class="hint" id="deliveryOptionsMessage"></p>
+        <form id="deliveryOptionsForm">
+            <div class="input-group"><label for="deliveryNamePrefix">账号前缀（可选）</label><input type="text" id="deliveryNamePrefix" placeholder="AUTH" autocomplete="off" spellcheck="false" aria-describedby="deliveryNamePrefixHint"><p class="hint" id="deliveryNamePrefixHint">仅用于新建 Sub2 账号，留空使用 AUTH；最多 32 个字符。</p></div>
+            <fieldset class="input-group" style="border:0;padding:0">
+                <legend>目标分组（可多选）</legend>
+                <div class="delivery-group-list" id="deliveryGroups"></div>
+                <p class="hint" id="deliveryGroupsHint">不选分组时进入未分组。</p>
+            </fieldset>
+            <div class="controls">
+                <div class="control-group"><label for="deliveryPriority">Sub2 优先级</label><input type="number" id="deliveryPriority" min="0" max="2147483647" step="1" required></div>
+                <div class="control-group"><label for="deliveryConcurrency">Sub2 账号并发</label><input type="number" id="deliveryConcurrency" min="1" max="10000" step="1" required></div>
+            </div>
+            <p class="hint">数值越小优先级越高。账号并发用于 Sub2 请求调度，与批量登录并发独立；已有 Sub2 账号保留原配置。</p>
+            <label class="history-setting-toggle"><input type="checkbox" id="deliverySaveDefault"><span>同时保存为平台默认参数</span></label>
+            <p class="form-status" id="deliveryOptionsStatus" role="status" aria-live="polite"></p>
+            <div class="action-confirm-buttons"><button class="btn-secondary" id="deliveryOptionsCancel" type="button">取消</button><button class="btn-secondary" id="deliveryOptionsApply" type="submit">用于本批</button></div>
+        </form>
+    </dialog>
+
+    <dialog class="history-detail-panel action-confirm-dialog account-form-dialog" id="credentialsDialog" aria-labelledby="credentialsTitle" aria-describedby="credentialsAccount">
+        <h3 id="credentialsTitle">更新资料并自动继续</h3>
+        <p class="hint" id="credentialsAccount"></p>
+        <form id="credentialsForm" autocomplete="off">
+            <p class="hint">只填写需要更新的内容，留空保留原资料；已保存的密码、TOTP 和代理不会显示在这里。</p>
+            <div class="input-group"><label for="credentialsPassword">新密码</label><input id="credentialsPassword" type="password" autocomplete="new-password" placeholder="留空保留原密码"></div>
+            <div class="input-group"><label for="credentialsTotp">TOTP 密钥</label><input id="credentialsTotp" type="password" autocomplete="new-password" placeholder="留空保留原密钥"><label class="history-setting-toggle"><input id="credentialsClearTotp" type="checkbox"><span>明确移除已保存的 TOTP</span></label></div>
+            <div class="input-group"><label for="credentialsProxy">登录代理</label><input id="credentialsProxy" type="password" autocomplete="new-password" placeholder="代理地址；或 direct 使用 IPv4 直连"><p class="hint">输入 direct 使用服务器 IPv4 直连；留空保留账号原线路。直连可用性以实际登录结果为准。</p><label class="history-setting-toggle"><input id="credentialsClearProxy" type="checkbox"><span>清除账号代理，使用服务默认线路</span></label></div>
+            <p class="form-status" id="credentialsStatus" role="status" aria-live="polite"></p>
+            <div class="action-confirm-buttons"><button class="btn-secondary" id="credentialsCancel" type="button">取消</button><button class="btn-secondary" id="credentialsSave" type="submit">保存并自动继续</button></div>
+        </form>
     </dialog>
 
     <script src="/api/client.js"></script>

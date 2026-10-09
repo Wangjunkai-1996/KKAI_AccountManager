@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/login"
 	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/store"
@@ -24,27 +26,37 @@ type recoveryFixture struct {
 	account store.Account
 	server  *httptest.Server
 
-	mu              sync.Mutex
-	schedule        bool
-	detailEmail     string
-	detailStatus    string
-	detailError     string
-	credentialReady bool
-	externalAccount bool
-	recoveryMarker  map[string]any
-	refreshMode     string
-	refreshCalls    int
-	loginCalls      int
-	applyCalls      int
-	applyBody       map[string]any
-	applyKeepsError bool
-	probeOK         bool
-	testCalls       int
-	methods         []string
-	events          []string
+	mu                  sync.Mutex
+	schedule            bool
+	detailEmail         string
+	detailWorkspace     string
+	detailOrg           string
+	detailPlan          string
+	detailExpiry        int64
+	detailStatus        string
+	detailError         string
+	credentialReady     bool
+	externalAccount     bool
+	recoveryMarker      map[string]any
+	refreshMode         string
+	refreshCalls        int
+	loginCalls          int
+	applyCalls          int
+	applyBody           map[string]any
+	applyKeepsError     bool
+	applyKeepsWorkspace bool
+	applyFailsOnce      bool
+	probeOK             bool
+	probeBody           string
+	probeStatus         int
+	probePausesAccount  bool
+	enableFailsOnce     bool
+	testCalls           int
+	methods             []string
+	events              []string
 }
 
-func newRecoveryFixture(t *testing.T, schedulable bool) *recoveryFixture {
+func newRecoveryFixture(t *testing.T, schedulable bool, accessTokens ...string) *recoveryFixture {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -67,7 +79,11 @@ func newRecoveryFixture(t *testing.T, schedulable bool) *recoveryFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := history.FinishAttempt(ctx, attempt.ID, true, &store.Result{AccessToken: "old-at", RefreshToken: "old-rt", ChatGPTAccountID: "workspace"}, nil); err != nil {
+	accessToken := "old-at"
+	if len(accessTokens) > 0 {
+		accessToken = accessTokens[0]
+	}
+	if err := history.FinishAttempt(ctx, attempt.ID, true, &store.Result{AccessToken: accessToken, RefreshToken: "old-rt", ChatGPTAccountID: "workspace", PlanType: "self_serve_business_prolite"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	attempt.Release()
@@ -101,6 +117,7 @@ func newRecoveryFixture(t *testing.T, schedulable bool) *recoveryFixture {
 	f := &recoveryFixture{
 		store: history, db: db, account: account, schedule: schedulable,
 		detailEmail: account.Email, detailStatus: "error", detailError: "401 unauthorized",
+		detailWorkspace: "workspace", detailOrg: "business-org", detailPlan: "self_serve_business_prolite",
 		credentialReady: true, probeOK: true,
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.handle))
@@ -138,7 +155,7 @@ func (f *recoveryFixture) handle(w http.ResponseWriter, r *http.Request) {
 		detail := map[string]any{
 			"id": 901, "platform": "openai", "type": "oauth", "schedulable": f.schedule,
 			"status": f.detailStatus, "error_message": f.detailError,
-			"credentials":        map[string]any{"email": f.detailEmail, "chatgpt_account_id": "workspace"},
+			"credentials":        map[string]any{"email": f.detailEmail, "chatgpt_account_id": f.detailWorkspace, "organization_id": f.detailOrg, "plan_type": f.detailPlan, "expires_at": f.detailExpiry},
 			"credentials_status": map[string]any{"has_access_token": f.credentialReady, "has_refresh_token": f.credentialReady},
 			"extra":              map[string]any{"kkai_auth_import": map[string]any{"source_account_id": f.account.ID}},
 		}
@@ -183,6 +200,12 @@ func (f *recoveryFixture) handle(w http.ResponseWriter, r *http.Request) {
 			Schedulable bool `json:"schedulable"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Schedulable && f.enableFailsOnce {
+			f.enableFailsOnce = false
+			w.Header().Set("Retry-After", "180")
+			writeRecoveryError(w, http.StatusServiceUnavailable, "unavailable", "temporary failure")
+			return
+		}
 		f.schedule = body.Schedulable
 		if body.Schedulable {
 			f.events = append(f.events, "enable")
@@ -196,6 +219,19 @@ func (f *recoveryFixture) handle(w http.ResponseWriter, r *http.Request) {
 		f.applyCalls++
 		f.applyBody = body
 		f.events = append(f.events, "apply")
+		if f.applyFailsOnce {
+			f.applyFailsOnce = false
+			writeRecoveryError(w, http.StatusServiceUnavailable, "unavailable", "temporary failure")
+			return
+		}
+		if values, ok := body["credentials"].(map[string]any); ok {
+			if !f.applyKeepsWorkspace {
+				f.detailWorkspace, _ = values["chatgpt_account_id"].(string)
+			}
+			f.detailOrg, _ = values["organization_id"].(string)
+			f.detailPlan, _ = values["plan_type"].(string)
+			f.detailExpiry = int64(toFloat(values["expires_at"]))
+		}
 		if !f.applyKeepsError {
 			f.detailStatus, f.detailError, f.credentialReady = "active", "", true
 		}
@@ -208,8 +244,18 @@ func (f *recoveryFixture) handle(w http.ResponseWriter, r *http.Request) {
 	case "/admin/accounts/901/test":
 		f.testCalls++
 		f.events = append(f.events, "test")
+		if f.probePausesAccount {
+			f.schedule = false
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		if f.probeOK {
+		if f.probeStatus != 0 {
+			w.Header().Set("Retry-After", "180")
+			w.WriteHeader(f.probeStatus)
+			return
+		}
+		if f.probeBody != "" {
+			_, _ = io.WriteString(w, f.probeBody)
+		} else if f.probeOK {
 			_, _ = io.WriteString(w, "data: {\"type\":\"test_complete\",\"success\":true}\n\n")
 		} else {
 			_, _ = io.WriteString(w, "data: {\"type\":\"test_complete\",\"success\":false}\n\n")
@@ -474,6 +520,102 @@ func TestSub2RecoveryRejectsBlankLoginEmail(t *testing.T) {
 	}
 }
 
+func recoveryAccessToken(t *testing.T, workspace, userID, plan string) string {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"exp": int64(2100000000),
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": workspace, "chatgpt_user_id": userID, "chatgpt_plan_type": plan,
+		},
+		"https://api.openai.com/profile": map[string]any{"email": "recover@example.test"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "e30." + base64.RawURLEncoding.EncodeToString(body) + ".sig"
+}
+
+func TestSub2RecoveryChangesWorkspaceAndPlan(t *testing.T) {
+	for _, interrupted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "direct", true: "resume_before_remote_update"}[interrupted], func(t *testing.T) {
+			oldToken := recoveryAccessToken(t, "workspace", "same-user", "self_serve_business_prolite")
+			newToken := recoveryAccessToken(t, "personal-workspace", "same-user", "free")
+			f := newRecoveryFixture(t, true, oldToken)
+			f.applyFailsOnce = interrupted
+			f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
+				f.loginCalls++
+				return &login.LoginResult{Email: f.account.Email, AccessToken: newToken, RefreshToken: "new-rt", ChatGPTAccountID: "personal-workspace", PlanType: "free", ExpiresAt: 2100000000}, nil
+			}
+			f.service.process(f.task)
+			if interrupted {
+				if got := f.state(t); got.State != store.RecoveryUnknown || !got.Resumable || f.schedule || f.detailWorkspace != "workspace" {
+					t.Fatalf("checkpoint before apply=%+v schedule=%v workspace=%s", got, f.schedule, f.detailWorkspace)
+				}
+				_, statuses, err := f.service.sub2.syncAccountStatuses(context.Background())
+				status := statuses[f.account.ID]
+				if err != nil || status.Unknown || !status.Exists || status.Sub2AccountID != 901 {
+					t.Fatalf("workspace change hid resumable binding: status=%+v err=%v", status, err)
+				}
+				queued, created, err := f.service.enqueue(context.Background(), f.account.ID)
+				if err != nil || created || queued.ID != f.task.ID || queued.State != store.RecoveryQueued {
+					t.Fatalf("workspace change blocked resume: task=%+v created=%v err=%v", queued, created, err)
+				}
+				f.service.process(queued)
+			}
+			if got := f.state(t); got.State != store.RecoveryCompleted || got.Sub2AccountID != 901 || f.loginCalls != 1 || !f.schedule {
+				t.Fatalf("workspace migration=%+v login=%d schedule=%v", got, f.loginCalls, f.schedule)
+			}
+			_, saved, err := f.store.GetOAuthResultByID(context.Background(), f.account.ID)
+			if err != nil || saved.AccessToken != newToken || saved.ChatGPTAccountID != "personal-workspace" || saved.PlanType != "free" {
+				t.Fatalf("new local credentials not saved: workspace=%s plan=%s err=%v", saved.ChatGPTAccountID, saved.PlanType, err)
+			}
+			if f.detailWorkspace != "personal-workspace" || f.detailPlan != "free" || f.detailOrg != "" || f.detailExpiry != 2100000000 {
+				t.Fatalf("remote metadata workspace=%s plan=%s org=%s expires=%d", f.detailWorkspace, f.detailPlan, f.detailOrg, f.detailExpiry)
+			}
+		})
+	}
+}
+
+func TestSub2RecoveryAllowsDifferentStableUserWhenEmailMatches(t *testing.T) {
+	oldToken := recoveryAccessToken(t, "workspace", "original-user", "self_serve_business_prolite")
+	f := newRecoveryFixture(t, true, oldToken)
+	f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
+		f.loginCalls++
+		return &login.LoginResult{Email: f.account.Email, AccessToken: recoveryAccessToken(t, "personal-workspace", "another-user", "free"), RefreshToken: "new-rt", ChatGPTAccountID: "personal-workspace", PlanType: "free"}, nil
+	}
+	f.service.process(f.task)
+	account, err := f.store.GetAccountByID(context.Background(), f.account.ID)
+	if err != nil || account.LastErrorCode != "" || f.applyCalls != 1 || !f.schedule {
+		t.Fatalf("different user was not recovered: code=%s apply=%d schedule=%v err=%v", account.LastErrorCode, f.applyCalls, f.schedule, err)
+	}
+	_, saved, err := f.store.GetOAuthResultByID(context.Background(), f.account.ID)
+	if err != nil || saved.AccessToken == oldToken || saved.ChatGPTAccountID != "personal-workspace" {
+		t.Fatal("new credentials were not saved")
+	}
+}
+
+func TestSub2RecoveryCannotEnableWhenNewWorkspaceWasNotApplied(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.applyKeepsWorkspace = true
+	f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
+		return &login.LoginResult{Email: f.account.Email, AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "personal-workspace", PlanType: "free"}, nil
+	}
+	f.service.process(f.task)
+	if got := f.state(t); got.State != store.RecoveryUnknown || !got.Resumable || f.schedule || f.testCalls != 0 {
+		t.Fatalf("old workspace passed post-apply validation: task=%+v schedule=%v probes=%d", got, f.schedule, f.testCalls)
+	}
+}
+
+func TestSub2RecoveryAllowsMissingStableUserMetadata(t *testing.T) {
+	known := recoveryAccessToken(t, "workspace", "same-user", "free")
+	for _, tokens := range [][2]string{{known, "opaque-token"}, {"opaque-token", known}} {
+		credentials := recoveryOAuthCredentials{AccessToken: tokens[1], RefreshToken: "rt", Email: "recover@example.test", ChatGPTAccountID: "new-workspace"}
+		if err := verifyOAuthIdentity(credentials, store.Account{Email: credentials.Email, ChatGPTAccountID: "old-workspace"}); err != nil {
+			t.Fatalf("legacy token metadata blocked recovery: %v", err)
+		}
+	}
+}
+
 func TestSub2RecoveryResumeUsesCheckpointWithoutRefresh(t *testing.T) {
 	f := newRecoveryFixture(t, true)
 	f.probeOK = false
@@ -496,8 +638,159 @@ func TestSub2RecoveryResumeUsesCheckpointWithoutRefresh(t *testing.T) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.refreshCalls != 0 || f.loginCalls != 1 || f.applyCalls != 2 || !f.schedule {
+	if f.refreshCalls != 0 || f.loginCalls != 1 || f.applyCalls != 1 || !f.schedule {
 		t.Fatalf("resume reused checkpoint incorrectly: refresh=%d login=%d apply=%d schedule=%v", f.refreshCalls, f.loginCalls, f.applyCalls, f.schedule)
+	}
+}
+
+func recoveryRetryDue(t *testing.T, f *recoveryFixture) {
+	t.Helper()
+	if _, err := f.db.Exec(`UPDATE account_recovery_tasks SET next_retry_at=? WHERE id=?`, time.Now().Add(-time.Second).UnixMilli(), f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runQueuedRecovery(t *testing.T, f *recoveryFixture) {
+	t.Helper()
+	claimed, err := f.store.ClaimAccountRecoveryTask(context.Background(), f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.service.process(claimed)
+}
+
+func TestSub2RecoveryAutomaticCheckpointRetry(t *testing.T) {
+	for _, stage := range []string{"probe", "enable"} {
+		t.Run(stage, func(t *testing.T) {
+			f := newRecoveryFixture(t, true)
+			f.service.autoRecovery.Store(true)
+			if stage == "probe" {
+				f.probeStatus = http.StatusServiceUnavailable
+			} else {
+				f.enableFailsOnce = true
+			}
+			f.service.process(f.task)
+			failed := f.state(t)
+			if failed.State != store.RecoveryUnknown || failed.RetryAction != "resume" || failed.NextRetryAt == nil || failed.RequiresAction || f.schedule || f.detailStatus != "active" {
+				t.Fatalf("checkpoint not safely retained: %+v", failed)
+			}
+			f.service.retryDueRecoveries()
+			if f.state(t).State != store.RecoveryUnknown {
+				t.Fatal("retry bypassed persisted deadline")
+			}
+			f.probeStatus = 0
+			recoveryRetryDue(t, f)
+			f.service.retryDueRecoveries()
+			runQueuedRecovery(t, f)
+			got := f.state(t)
+			if got.State != store.RecoveryCompleted || got.RetryAction != "" || got.NextRetryAt != nil || f.loginCalls != 1 || f.applyCalls != 1 || !f.schedule {
+				t.Fatalf("checkpoint did not complete without relogin/reapply: %+v login=%d apply=%d schedule=%v", got, f.loginCalls, f.applyCalls, f.schedule)
+			}
+		})
+	}
+}
+
+func TestSub2RecoveryInvalidCheckpointRelogs(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.service.autoRecovery.Store(true)
+	f.probeBody = "data: {\"type\":\"error\",\"error\":{\"code\":\"token_revoked\",\"status\":401,\"message\":\"at-secret\"}}\n\n"
+	f.service.process(f.task)
+	failed := f.state(t)
+	if failed.RetryAction != "relogin" || failed.Resumable || failed.RequiresAction || failed.NextRetryAt == nil || strings.Contains(failed.LastError, "at-secret") {
+		t.Fatalf("invalid checkpoint retained or exposed error: %+v", failed)
+	}
+	oldVersion := failed.ResultCredentialAttemptID
+	f.probeBody = ""
+	recoveryRetryDue(t, f)
+	f.service.retryDueRecoveries()
+	queued := f.state(t)
+	if queued.ResultCredentialAttemptID != 0 || queued.SourceCredentialAttemptID != oldVersion {
+		t.Fatalf("checkpoint not invalidated: %+v", queued)
+	}
+	runQueuedRecovery(t, f)
+	if got := f.state(t); got.State != store.RecoveryCompleted || got.ResultCredentialAttemptID == oldVersion || f.loginCalls != 2 || f.applyCalls != 2 || !f.schedule {
+		t.Fatalf("invalid checkpoint did not relogin safely: %+v login=%d apply=%d", got, f.loginCalls, f.applyCalls)
+	}
+}
+
+func TestSub2RecoveryRetryRejectsChangedOwnership(t *testing.T) {
+	for _, change := range []string{"marker", "metadata", "disabled", "version", "original_pause"} {
+		t.Run(change, func(t *testing.T) {
+			f := newRecoveryFixture(t, true)
+			f.service.autoRecovery.Store(true)
+			f.probeStatus = http.StatusServiceUnavailable
+			f.service.process(f.task)
+			switch change {
+			case "marker":
+				f.recoveryMarker["task_id"] = float64(9999)
+			case "metadata":
+				f.detailWorkspace = "someone-else"
+			case "disabled":
+				f.detailStatus = "inactive"
+			case "version":
+				if err := f.store.UpdateOAuthResultByID(context.Background(), f.account.ID, store.Result{AccessToken: "separate-at", RefreshToken: "separate-rt", ChatGPTAccountID: "workspace"}); err != nil {
+					t.Fatal(err)
+				}
+			case "original_pause":
+				if _, err := f.db.Exec(`UPDATE account_recovery_tasks SET original_schedulable=0 WHERE id=?`, f.task.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			recoveryRetryDue(t, f)
+			f.service.retryDueRecoveries()
+			got := f.state(t)
+			if !got.RequiresAction || got.NextRetryAt != nil || f.loginCalls != 1 || f.applyCalls != 1 || f.schedule {
+				t.Fatalf("unsafe retry: %+v", got)
+			}
+		})
+	}
+}
+
+func TestSub2RecoveryTemporaryLoginFailureRetriesBeyondThree(t *testing.T) {
+	f := newRecoveryFixture(t, false)
+	f.service.autoRecovery.Store(true)
+	workingLogin := f.service.loginWithProxies
+	f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
+		f.loginCalls++
+		return nil, context.DeadlineExceeded
+	}
+	f.service.process(f.task)
+	for i := 0; i < 3; i++ {
+		recoveryRetryDue(t, f)
+		f.service.retryDueRecoveries()
+		runQueuedRecovery(t, f)
+	}
+	if got := f.state(t); got.RetryCount != 4 || got.RequiresAction || got.RetryAction != "relogin" || got.NextRetryAt == nil {
+		t.Fatalf("temporary errors hard-stopped: %+v", got)
+	}
+	f.service.loginWithProxies = workingLogin
+	recoveryRetryDue(t, f)
+	f.service.retryDueRecoveries()
+	runQueuedRecovery(t, f)
+	if got := f.state(t); got.State != store.RecoveryCompleted || !f.schedule {
+		t.Fatalf("retry did not recover: %+v", got)
+	}
+}
+
+func TestSub2RecoveryDeliveryRetryIgnoresAutomaticSwitch(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.service.autoRecovery.Store(false)
+	if _, err := f.db.Exec(`UPDATE account_recovery_tasks SET purpose='delivery',result_credential_attempt_id=source_credential_attempt_id,check_id=0 WHERE id=?`, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	f.task, err = f.store.GetAccountRecoveryTaskByID(context.Background(), f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.probeStatus = http.StatusServiceUnavailable
+	f.service.process(f.task)
+	f.probeStatus = 0
+	recoveryRetryDue(t, f)
+	f.service.retryDueRecoveries()
+	runQueuedRecovery(t, f)
+	if got := f.state(t); got.State != store.RecoveryCompleted || f.loginCalls != 0 || !f.schedule {
+		t.Fatalf("delivery stopped with auto switch off: %+v login=%d", got, f.loginCalls)
 	}
 }
 

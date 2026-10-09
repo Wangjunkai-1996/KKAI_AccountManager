@@ -108,11 +108,13 @@ var (
 )
 
 type LoginRequest struct {
-	Email         string `json:"email"`
-	Password      string `json:"password"`
-	TotpSecret    string `json:"totp_secret"`
-	Proxy         string `json:"proxy"`
-	UpstreamProxy string `json:"upstream_proxy"`
+	DeliveryOptions *store.DeliveryOptions `json:"delivery_options,omitempty"`
+	AutoDeliver     bool                   `json:"auto_deliver"`
+	Email           string                 `json:"email"`
+	Password        string                 `json:"password"`
+	TotpSecret      string                 `json:"totp_secret"`
+	Proxy           string                 `json:"proxy"`
+	UpstreamProxy   string                 `json:"upstream_proxy"`
 }
 
 type LoginResponse struct {
@@ -170,6 +172,9 @@ func main() {
 	accountRecoveryService = recoveryService
 	recoveryService.Start()
 	defer recoveryService.Stop()
+	deliveryService = newAccountDeliveryService(loginHistory, sub2Importer, recoveryService)
+	deliveryService.Start()
+	defer deliveryService.Stop()
 	accountChecker.Start()
 	defer accountChecker.Stop()
 
@@ -189,6 +194,8 @@ func main() {
 	http.HandleFunc("/api/history/login", corsMiddleware(handleHistoryLogin(service)))
 	http.HandleFunc("/api/history/", corsMiddleware(handleHistoryDelete()))
 	http.HandleFunc("/api/history", corsMiddleware(handleHistory()))
+	http.HandleFunc("/api/sub2/import-settings", corsMiddleware(sub2Importer.handleImportSettings))
+	http.HandleFunc("/api/account-deliveries/", corsMiddleware(deliveryService.handleAction))
 	http.HandleFunc("/api/sub2/import", corsMiddleware(sub2Importer.handleImport))
 	http.HandleFunc("/api/sub2/import/", corsMiddleware(sub2Importer.handleAction))
 	http.HandleFunc("/api/account-recovery", corsMiddleware(recoveryService.handleCollection))
@@ -530,9 +537,10 @@ func limitConcurrentLogins(slots chan struct{}, next http.HandlerFunc) http.Hand
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, map[string]interface{}{
-		"status":         "ok",
-		"time":           time.Now().Format(time.RFC3339),
-		"max_concurrent": *maxConcurrent,
+		"status":          "ok",
+		"time":            time.Now().Format(time.RFC3339),
+		"max_concurrent":  *maxConcurrent,
+		"sub2_configured": sub2Importer != nil && sub2Importer.configured(),
 	})
 }
 
@@ -599,11 +607,14 @@ func validateLoginRequest(req *LoginRequest) error {
 	if !login.ValidateTOTPSecret(req.TotpSecret) {
 		return fmt.Errorf("TOTP 密钥格式不正确（应为 Base32 格式）")
 	}
-	if err := login.ValidateHTTPProxy(req.Proxy); err != nil {
+	if err := login.ValidateLoginProxy(req.Proxy); err != nil {
 		return fmt.Errorf("代理配置无效: %w", err)
 	}
 	if err := login.ValidateHTTPProxy(req.UpstreamProxy); err != nil {
 		return fmt.Errorf("前置代理配置无效: %w", err)
+	}
+	if strings.EqualFold(strings.TrimSpace(req.Proxy), "direct") && strings.TrimSpace(req.UpstreamProxy) != "" {
+		return fmt.Errorf("IPv4 直连不能同时填写前置代理")
 	}
 
 	return nil

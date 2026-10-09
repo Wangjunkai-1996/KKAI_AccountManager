@@ -48,7 +48,8 @@ type authHTTPStatusError struct {
 	RetryAfter   time.Duration
 }
 
-func (e *authHTTPStatusError) Unwrap() error { return e.Cause }
+func (e *authHTTPStatusError) Unwrap() error                     { return e.Cause }
+func (e *authHTTPStatusError) RetryAfterDuration() time.Duration { return e.RetryAfter }
 
 // AuthHTTPStatus exposes an upstream auth status for the HTTP wrapper.
 func AuthHTTPStatus(err error) (int, bool) {
@@ -109,6 +110,8 @@ type Service struct {
 
 // LoginResult contains the result of a successful login
 type LoginResult struct {
+	AccountID        int64 `json:"account_id,omitempty"`
+	Delivery         any   `json:"delivery,omitempty"`
 	AccessToken      string
 	RefreshToken     string
 	ChatGPTAccountID string
@@ -179,6 +182,17 @@ func (s *Service) login(ctx context.Context, email, password, totpSecret string)
 	}
 	if s.config.UpstreamProxy != "" {
 		return s.loginThroughUpstream(ctx, email, password, totpSecret, s.config.UpstreamProxy)
+	}
+	if s.config.Proxy == "" {
+		relay, stop, err := startDirectIPv4Relay(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("启动 IPv4 直连失败: %w", err)
+		}
+		defer stop()
+		config := s.config
+		config.Proxy = relay
+		log.Printf("   🌐 IPv4 直连：浏览器与 token 交换使用服务器本机出口")
+		return NewService(config).loginWithRetries(ctx, email, password, totpSecret)
 	}
 
 	result, err := s.loginWithRetries(ctx, email, password, totpSecret)
@@ -769,7 +783,7 @@ func clickCodexConsent(ctx context.Context, page playwright.Page, email string) 
 }
 
 // LoginWithProxy runs one login with a request-specific HTTP proxy.
-// An empty proxy keeps the service-level proxy configured at startup.
+// An empty proxy keeps the service-level proxy; "direct" explicitly clears it.
 func (s *Service) LoginWithProxy(email, password, totpSecret, proxy string) (*LoginResult, error) {
 	return s.LoginWithProxies(email, password, totpSecret, proxy, "")
 }
@@ -782,23 +796,9 @@ func (s *Service) LoginWithProxies(email, password, totpSecret, proxy, upstream 
 // LoginWithProxiesContext applies one deadline across browser attempts, proxy fallback,
 // and token exchange. Cancellation waits for browser cleanup before returning.
 func (s *Service) LoginWithProxiesContext(ctx context.Context, email, password, totpSecret, proxy, upstream string) (*LoginResult, error) {
-	config := s.config
-	proxy = strings.TrimSpace(proxy)
-	upstream = strings.TrimSpace(upstream)
-	if proxy != "" {
-		config.Proxy = proxy
-	}
-	if upstream != "" {
-		config.UpstreamProxy = upstream
-	}
-	if err := ValidateHTTPProxy(config.Proxy); err != nil {
+	config, err := s.loginConfig(proxy, upstream)
+	if err != nil {
 		return nil, err
-	}
-	if err := ValidateHTTPProxy(config.UpstreamProxy); err != nil {
-		return nil, fmt.Errorf("前置代理无效: %w", err)
-	}
-	if config.UpstreamProxy != "" && config.Proxy == "" {
-		return nil, errors.New("填写前置代理时还需要填写 HTTP 出口代理")
 	}
 	ctx, cancel := context.WithTimeout(ctx, config.TotalTimeout)
 	defer cancel()
@@ -812,6 +812,36 @@ func (s *Service) LoginWithProxiesContext(ctx context.Context, email, password, 
 		emitProgress(ctx, "complete", "登录完成")
 	}
 	return result, err
+}
+
+func (s *Service) loginConfig(proxy, upstream string) (Config, error) {
+	config := s.config
+	config.Proxy = strings.TrimSpace(config.Proxy)
+	config.UpstreamProxy = strings.TrimSpace(config.UpstreamProxy)
+	proxy = strings.TrimSpace(proxy)
+	upstream = strings.TrimSpace(upstream)
+	if proxy != "" {
+		config.Proxy = proxy
+	}
+	if upstream != "" {
+		config.UpstreamProxy = upstream
+	}
+	if strings.EqualFold(strings.TrimSpace(config.Proxy), "direct") {
+		if upstream != "" {
+			return Config{}, errors.New("IPv4 直连不能同时填写前置代理")
+		}
+		config.Proxy, config.UpstreamProxy = "", ""
+	}
+	if err := ValidateHTTPProxy(config.Proxy); err != nil {
+		return Config{}, err
+	}
+	if err := ValidateHTTPProxy(config.UpstreamProxy); err != nil {
+		return Config{}, fmt.Errorf("前置代理无效: %w", err)
+	}
+	if config.UpstreamProxy != "" && config.Proxy == "" {
+		return Config{}, errors.New("填写前置代理时还需要填写 HTTP 出口代理")
+	}
+	return config, nil
 }
 
 type oauthTokenResponse struct {
@@ -1083,6 +1113,15 @@ func parseHTTPProxy(raw string) (*url.URL, error) {
 func ValidateHTTPProxy(raw string) error {
 	_, err := parseHTTPProxy(raw)
 	return err
+}
+
+// ValidateLoginProxy additionally accepts the explicit IPv4 direct selector.
+// Upstream proxies must continue to use ValidateHTTPProxy.
+func ValidateLoginProxy(raw string) error {
+	if strings.EqualFold(strings.TrimSpace(raw), "direct") {
+		return nil
+	}
+	return ValidateHTTPProxy(raw)
 }
 
 func parseOAuthIdentity(accessToken, idToken string) (*oauthIdentity, error) {

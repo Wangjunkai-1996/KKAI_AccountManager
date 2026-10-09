@@ -118,6 +118,42 @@ func TestHistoryListAndDeleteEndpoints(t *testing.T) {
 	}
 }
 
+func TestHistoryRecoveryCountsAndSafeTimeline(t *testing.T) {
+	history := newTestHistory(t)
+	ctx := context.Background()
+	account, err := history.UpsertCredentials(ctx, store.Credentials{Email: "recovery-history@example.test", Password: "secret-fixture-password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []string{store.RecoveryCompleted, store.RecoveryUnknown} {
+		task, _, err := history.CreateOrGetAccountRecoveryTask(ctx, account.ID, 0, 42, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = history.UpdateAccountRecoveryTask(ctx, task.ID, state, "safe recovery outcome"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{"/api/history", "/api/history/" + itoa(account.ID)} {
+		response := httptest.NewRecorder()
+		if path == "/api/history" {
+			handleHistory()(response, httptest.NewRequest(http.MethodGet, path, nil))
+		} else {
+			handleHistoryDelete()(response, httptest.NewRequest(http.MethodGet, path, nil))
+		}
+		body := response.Body.String()
+		if response.Code != http.StatusOK || !strings.Contains(body, `"recovery_count":1`) || !strings.Contains(body, `"recovery_attempt_count":2`) {
+			t.Fatalf("history counts %s: %d %s", path, response.Code, body)
+		}
+		if strings.Contains(body, "secret-fixture-password") || strings.Contains(body, "password_cipher") || strings.Contains(body, "access_token") {
+			t.Fatalf("sensitive recovery response: %s", body)
+		}
+		if path != "/api/history" && (!strings.Contains(body, `"recovery_history_available":true`) || !strings.Contains(body, `"recovery_history_truncated":false`) || !strings.Contains(body, `"state":"unknown"`) || !strings.Contains(body, `"state":"completed"`)) {
+			t.Fatalf("missing recovery timeline: %s", body)
+		}
+	}
+}
+
 func itoa(value int64) string {
 	return strconv.FormatInt(value, 10)
 }

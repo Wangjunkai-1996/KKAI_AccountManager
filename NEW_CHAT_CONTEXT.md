@@ -1,8 +1,42 @@
 # KKAI_AUTH 新对话交接上下文
 
-更新时间：2026-10-05（Asia/Shanghai）
+更新时间：2026-10-09（Asia/Shanghai）
 
 > 新对话先读取 `DOCS_INDEX.md`、本文和 `SYS1_DEPLOYMENT.md`。本文只记录项目状态，不保存账号密码、TOTP、代理凭据或 token。
+
+## 批量登录紧凑布局（2026-10-09）
+
+北京时间 02:25:11 已上线 `20261008T182221Z-compact-login`。桌面端双栏适配可用视口，前缀与登录并发并排，代理和处理模式折叠；表单与结果独立滚动，开始按钮固定在卡片底部。空输入不显示检查成功框，完整校验错误和键盘操作保留，手机端自然单列。
+
+1280×650、1366×768、1440×900 默认首屏、390×844 手机和 683×384 窄窗口验收通过；50 条结果独立滚动，8 条错误和展开设置不挤走开始按钮。Node 定向交互、语法和 Linux 构建通过。仅前端布局与提示变化，未运行完整套件或本轮真实 OAuth/Sub2 写入测试；发布与精确命令见 [部署记录](SYS1_DEPLOYMENT.md)。
+
+## 可选账号前缀（2026-10-09）
+
+北京时间 02:03:15 已上线 `20261008T180135Z-account-prefix`。批量登录区新增可选“账号前缀”，新建 Sub2 名称为 `前缀_MMDDHHmm_邮箱`（北京时间）；空白使用 `AUTH`，支持中文，最多 32 字符。前缀可随交付参数保存为平台默认，并随本批任务和重试保留；关闭自动交付后，同页手动导入默认使用原批前缀，也可在确认时修改。已有账号保留原名。
+
+前后端定向测试、窄窗口 UI、候选/回滚兼容和线上健康验收通过；历史账号 279 IPv4 完整登录成功（7,500ms）。未运行完整套件，也未为命名测试创建新的生产 Sub2 账号。精确验证与发布证据见 [部署记录](SYS1_DEPLOYMENT.md)。
+
+## 首次自动复检提速（2026-10-09）
+
+北京时间 01:36:59 已上线 `20261008T173543Z-fast-recheck`：恢复/交付成功后的首次实际 Sub2 复检由 5 分钟提前至 30 秒，第二次仍在完成后 30 分钟。已有最新完成任务中，尚未执行、未失败重试且仍采用旧 5 分钟计划的首检自动提前；保留失败退避。每分钟巡检用于筛选异常，不能代替实际凭据复检。30 秒为到期时间，繁忙时仍可能排队。
+
+定向 race 测试、隔离候选/回滚兼容和线上健康检查通过；历史账号 279 再次完成默认 IPv4 OAuth（8,116ms，AT/RT 已保存）。完整测试套件未运行；本轮没有人为制造新的生产恢复任务来验证 30 秒复检，调度边界与迁移由定向测试覆盖。发布和精确命令见 [部署记录](SYS1_DEPLOYMENT.md)。
+
+## 默认 IPv4 直连（当前配置）
+
+2026-10-08 08:30 UTC（北京时间 16:30）按用户要求移除 sys1 的默认代理：`/etc/openai-login/proxy.env` 中 `OPENAI_LOGIN_PROXY` 为空。当前 `20261008T182221Z-compact-login` 的登录代理框留空即走服务器 IPv4；Chrome 与 token 交换使用同一 tcp4 出口，检测页面也默认选择 IPv4，自动检测无代理时自行选择直连。账号自己保存或本次明确填写的代理仍优先。
+
+旧配置仅以 0600 权限保存在 `/var/lib/openai-login/backups/proxy.env-before-20261008T082500Z-ipv4-default`，未继续注入运行进程。当前回滚版本为 `20261008T180135Z-account-prefix`。空代理网络检查返回 `mode=direct,reachable=true`；HTTP 客户端仍收到认证站 403，这不等同于浏览器 OAuth 失败，也不证明完整登录成功。2026-10-08 08:46 UTC 已按用户授权使用历史账号 279 实测默认 IPv4：完整 OAuth 成功，耗时 7,224ms，AT/RT 已加密保存，attempt 290 为 success；日志确认无外部代理回退、无 challenge。先测的账号 278 两次在 MFA 返回 incorrect_code，具体资料/验证方式原因待确认。完整记录见 [IPv4 实测](SYS1_IPV4_OAUTH_DIAGNOSIS.md)。单次成功不代表长期成功率。
+
+## 2026-10-08 账号流程最新发布
+
+北京时间 16:10 发布 `20261008T080500Z-account-workflows`；16:12 延迟复核 active/running、NRestarts=0、实际二进制匹配、静态资源/有效路由/socket 正常、自动恢复开启且巡检继续。备份完整，回滚 `20261008T053100Z-account-automation` 就绪。
+
+新增批量 Sub2 分组/优先级/并发与平台默认；新建账号检测通过再入组，已有账号保留原配置。恢复/交付完成后约 30 秒和 30 分钟持久复检；修改密码/TOTP/代理后后台续跑，移交恢复与消费修改任务原子提交。未知创建只核对原标记，15 分钟仍查不到则明确提示人工核对；不盲目重复创建。
+
+`direct` 显式选择 sys1 IPv4 直连，空代理仍用默认代理。发布前原生 Chrome 默认走 IPv6 被 challenge；两个 IPv4 A 节点均进入邮箱页。发布后 08:46 UTC 已补齐历史账号完整直连 OAuth 实测，见上节。历史 IPv4 challenge 证据仍有效，不能承诺永久免验证。
+
+定向测试/验收命令见 [账号流程验证记录](ACCOUNT_WORKFLOW_VERIFICATION.md)，网络证据见 [IPv4 OAuth 诊断](SYS1_IPV4_OAUTH_DIAGNOSIS.md)。完整测试套件未运行，未手动使用真实账号验收新建分组导入。
 
 ## 项目位置
 
@@ -21,15 +55,23 @@
 - 数据库：`/var/lib/openai-login/data/accounts.db`
 - 加密密钥：`/var/lib/openai-login/data/accounts.key`
 - release 根目录：`/opt/openai-login/releases`
-- 当前 release：`20261005T124744Z-sub2-auth401-recovery`
-- 当前 commit：`4591e80`
-- 当前二进制 SHA-256：`d869c0c16498a8ab362e0be78c3aff617eec0ab96a469244244cd49099006714`
-- 回滚 release：`20261005T105500Z-sub2-status-ui`
+- 当前 release：`20261008T182221Z-compact-login`
+- 当前来源：本地 `main` HEAD `4efcdff` 加未提交工作区改动，未推送
+- 当前二进制 SHA-256：`666dd45943cf05c3becf859c7144a6043742fd0e466888cb54c1df08ef853534`
+- 回滚 release：`20261008T180135Z-account-prefix`
 - 浏览器运行方式：sys1 上的 Google Chrome + Xvfb，有头模式；浏览器流程实际发生在 sys1
 
-2026-10-05 发布 `20261005T124744Z-sub2-auth401-recovery`（commit `4591e80`）；回滚为 `20261005T105500Z-sub2-status-ui`。发布前备份为 `/var/lib/openai-login/backups/accounts-before-20261005T124744Z-sub2-auth401-recovery.db`。发布后服务 `active/running`、`NRestarts=0`，`/health` 返回 `status: ok`，有效入口 socket 返回 HTTP 200，公网未认证返回 HTTP 401。候选验证时自动恢复关闭，生产自动恢复 `enabled` 且 SQLite 开关保持开启；生产快照为 history 31、imports 27、statuses 31。账号 117/118/119 的 AUTH current 检测均为 HTTP 401 `credential_revoked`，Sub2 仍为 `active` 但 `schedulable=false`、`effective_schedulable=false`；自动恢复任务为 `unknown`，保持停止调度。完整健康、回滚和业务结果见 `SYS1_DEPLOYMENT.md`，精确验证命令见 `STATUS.md`。
+2026-10-08 已发布 `20261008T053100Z-account-automation`：自动断点续跑、按失败原因持久退避、登录成功后后台交付 Sub2、按账号去重的“需要处理”提醒。取消失败 3 次硬停止，交付不计入复活次数。定向 race/Go、Node、vet、桌面和窄屏 fixture、候选迁移及旧二进制兼容均通过；完整测试套件未运行。发布和延迟验收见 `SYS1_DEPLOYMENT.md`。
 
-本轮已上线 AUTH 401 恢复判定、批量登录结果导入的终态等待和展示、Sub2 导入名称 `AUTH_MMDDHHmm_email`、AUTH 401 与 Sub2 凭据/调度状态的独立呈现、原始 `schedulable`/`effective_schedulable` 及限流/过载/临时暂停信息展示。历史页新增“立即检测”快捷入口；“账号检测”Tab 仍保留批量检测、进度和单账号详情/恢复。
+2026-10-08 已发布自动恢复运行状态修复：设置接口和页面区分开启选择与实际运行，存储故障等真实停机显示原因，临时巡检错误仍自动重试；不新增账号次数停用策略。发布后 `auto_recovery_enabled=true,running=true`，备份及验证见 `SYS1_DEPLOYMENT.md`。
+
+历史记录：2026-10-07 09:33 UTC 发布 `20261007T092840Z-recovery-accessibility`，回滚为 `20261007T090920Z-userid-recovery`；本轮当前备份为 `/var/lib/openai-login/backups/accounts-before-20261007T092840Z-recovery-accessibility.db`。当前服务 `active/running`、`NRestarts=0`，本机和宿主入口 socket 健康正常，公网未认证返回 HTTP 401。账号 203 的 task 64、65 已真实恢复，task 64 完成后凭据版本 233 曾再次被上游撤销；task 65 写入版本 234 后，09:34 UTC 的独立 AUTH 模型检测 719 返回 HTTP 200、`outcome=ok`。完整时间线、备份和回滚证据见 `SYS1_DEPLOYMENT.md`。
+
+2026-10-08 05:30 UTC 最新复核：最终版服务 active/running、无重启或严重错误、回滚就绪；49 个账号、48 条恢复任务。账号 201 / task 60 已重新排队自动登录；账号 203/222 当前上游明确停用，不能沿用前一天成功记录判断可用。未手动触发真实新账号交付验收。
+
+当前恢复不以旧 workspace ID 或旧、新 JWT `chatgpt_user_id` 的相等作为阻断条件；保留邮箱、完整凭据、Sub2 原账号 ID/邮箱/绑定标记和写回后新元数据核对。历史卡片新增成功复活次数、复活记录浮窗、Sub2 在池/不在池/待核对标记和紧凑操作布局；缺失池状态统一显示“待核对”，浮窗支持 Tab/Shift+Tab 键盘进出。账号 216 与 203 均有真实恢复成功证据；账号 203 还通过独立 AUTH 模型检测。
+
+此前 `20261005T124744Z-sub2-auth401-recovery` 已上线 AUTH 401 恢复判定、批量登录结果导入的终态等待和展示、Sub2 导入名称 `AUTH_MMDDHHmm_email`、AUTH 401 与 Sub2 凭据/调度状态的独立呈现、原始 `schedulable`/`effective_schedulable` 及限流/过载/临时暂停信息展示。历史页已有“立即检测”快捷入口；“账号检测”Tab 仍保留批量检测、进度和单账号详情/恢复。
 
 ## 当前账号关联和恢复行为
 
@@ -39,7 +81,7 @@
 
 “自动检测恢复”保存到 SQLite，服务重启后保留；未保存时使用 `AUTH_AUTO_RECOVERY` 默认值。开启立即扫描，此后每 60 秒在后端巡检，关闭网页不影响运行；页面显示上次/下次扫描、摘要、检测及恢复进度。仍在 Sub2 池中且未人工暂停的账号，只有 AUTH 当前确认 401、令牌过期、凭据失效或缺少本地令牌后才直接 AUTH 重新登录，写回原 Sub2 账号并验证、恢复调度。Sub2 `status=error` 或 `schedulable=false` 不单独证明 401；正常、禁用、删除、未知及人工暂停的账号不会仅凭 Sub2 状态恢复。
 
-历史页提供“检测并恢复”和可恢复任务的“继续恢复”，人工操作不依赖自动开关；普通“重新登录”只更新 AUTH，不写回 Sub2。复用检测冷却和任务去重；自动恢复结束后冷却 30 分钟，同一凭据版本 24 小时内失败 3 次后停止自动重试。Sub2 异常不等于 401，AUTH 检测正常时不强制重登；异常加暂停仍不能完全判定人工/自动暂停来源。真实账号业务验收与上线证据以本次部署记录为准，不沿用历史成功结果。
+历史页提供“检测并恢复”和可恢复任务的“继续恢复”，人工操作不依赖自动开关；普通“重新登录”只更新 AUTH，不写回 Sub2。复用检测冷却和任务去重；临时故障按持久化原因退避，取消原先失败 3 次的硬性停止。已保存的新凭据优先断点续跑，明确失效才重新登录。Sub2 异常不等于 401，AUTH 检测正常时不强制重登；异常加暂停仍不能完全判定人工/自动暂停来源。真实账号业务验收与上线证据以本次部署记录为准，不沿用历史成功结果。
 
 ## Sub2 状态同步与自动恢复（前次发布记录）
 

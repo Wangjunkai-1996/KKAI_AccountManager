@@ -4,6 +4,126 @@
 
 > 这是 sys1 线上事实的唯一权威文档。新对话先读取 `DOCS_INDEX.md` 和 `NEW_CHAT_CONTEXT.md`，发生冲突时以本文的服务、端口、release、健康检查和验收结论为准。
 
+## 批量登录紧凑布局（2026-10-09 02:25 上海时间）
+
+- 2026-10-08 18:25:11 UTC 切换 `20261008T182221Z-compact-login`，SHA-256 `666dd45943cf05c3becf859c7144a6043742fd0e466888cb54c1df08ef853534`。本地 `main` HEAD `4efcdff` 加未提交改动，Mac 构建、直接上传 sys1；无代码托管同步。本轮仅变更 AUTH 前端布局和提示。
+- 桌面端双栏适配可用视口，账号前缀与登录并发并排，代理和处理模式用原生 details 折叠；保留摘要、完整错误与键盘操作。表单和处理结果分别滚动，开始按钮在卡片底部保持可见。低高度桌面缩短输入框与间距，手机自然单列；空白输入不再显示“输入检查通过”。
+- 本地合成数据浏览器验收：1366×768 和 1440×900 默认表单与页面无纵向溢出；1280×650 的表单 clientHeight=scrollHeight=419、开始按钮 bottom=617；390×844 手机按钮 bottom=789、无横向溢出；683×384 正确回流单列、无横向溢出。50 条结果仅结果区滚动，8 条输入错误、33 字符前缀错误和展开设置不挤走桌面开始按钮。details 键盘、DIRECT 大小写摘要、顺序模式禁用并发、交付弹窗均通过；JS 错误 0。截图 `/tmp/kkai-auth-compact-login.png`。
+- 定向 Node 交互/语法、HTML ID 唯一性检查、独立代码审查和 Linux amd64 构建通过；完整测试套件未运行。本轮未执行真实 OAuth、模型或 Sub2 业务写入验收，不沿用上一版本的登录成功作为本次实测证据。
+- 隔离候选复制 60 账号、关闭自动恢复且不配置 Sub2；health、布局标记、三份静态资源 hash、Node/driver hash、数据库完整性与回滚二进制兼容通过。停服前后各类在途任务均为 0。
+- 发布前备份 `/var/lib/openai-login/backups/accounts-before-20261008T182221Z-compact-login.db`，1,531,904 字节、0600、integrity_check=ok。
+- 18:26:37 UTC 延迟复核 active/running、NRestarts=0、实际 PID 2000702；二进制及资源 hash 一致，自动恢复开启且巡检已推进到 18:26:11，无错误/阻塞。有效 Nginx 路由仍为 `/run/tls/auth/login.sock`；本机/socket health 正常，公网未认证 HTTP401。严重故障、OAuth 拒绝与 5xx 日志聚合均 0，默认代理环境为空。
+- 账号 60、恢复任务 67、交付 7、复检 9、资料任务 0。回滚版本 `20261008T180135Z-account-prefix`，SHA-256 `7023dc1060ed8b901b5772e61a5a3a914f574282dbbddd4f38258391ac3192cb`；二进制、Node/driver、数据库和一致性备份已核验。回滚不覆盖业务数据库。
+- 隔离候选数据库/密钥和本次远端上传产物已精确清理；正式/回滚 release、备份与证据保留。release 证据：`DEPLOYMENT.json`、`CANDIDATE_ACCEPTANCE.json`、`ACCEPTANCE.json`、`DELAYED_ACCEPTANCE.json`。
+
+以下命令均通过；远端临时脚本已清理，命令仅为执行记录：
+
+```bash
+node cmd/server/client.test.cjs
+node --check cmd/server/client.js
+./build-linux.sh /tmp/openai-login-compact-login
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-stage-compact-login.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-deploy-compact-login.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-verify-compact-login.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-cleanup-compact-login.py'
+git diff --check
+```
+
+## 可选账号前缀（2026-10-09 02:03 上海时间）
+
+- 2026-10-08 18:03:15 UTC 切换 `20261008T180135Z-account-prefix`，SHA-256 `7023dc1060ed8b901b5772e61a5a3a914f574282dbbddd4f38258391ac3192cb`。仍来自本地 `main` HEAD `4efcdff` 加未提交改动，Mac 构建、直接上传 sys1，无代码托管同步。
+- 批量登录页新增可选账号前缀，交付参数弹窗可编辑并保存平台默认。`delivery_options.name_prefix` 随既有 JSON 快照保存，无 schema 变更；旧请求/空值回退 `AUTH`。前后端统一 Unicode 空白裁剪、最多 32 个码点、拒绝控制字符。新建账号命名为 `前缀_MMDDHHmm_邮箱`，仍限制总名称长度 100 字符；操作标记和身份关联独立于显示名，已有账号不改名。
+- 每批前缀冻结，重试沿用；关闭自动交付后，同页手动导入默认采用原批前缀并允许确认时覆盖。默认设置迟到不会覆盖主表单输入；弹窗加载期间前缀禁用，防止返回值覆盖正在输入的内容。
+- 定向 Go race、Node 交互/语法、独立代码审查通过。浏览器合成数据验收输入框与交付弹窗同步，536px 窄窗口 scrollWidth=clientWidth=536、JS 错误 0；截图 `/tmp/kkai-auth-account-prefix.png`。没有把虚构账号提交到生产。
+- 隔离候选复制 60 个账号，自动恢复关闭且不配置 Sub2；health、静态资源 hash、数据库完整性、Node/driver hash 与回滚二进制兼容均通过。切换前后各类在途任务为 0。
+- 发布前备份 `/var/lib/openai-login/backups/accounts-before-20261008T180135Z-account-prefix.db`，1,531,904 字节、0600、integrity_check=ok。
+- 18:04:00–18:04:07 UTC 使用历史账号 279、空代理、auto_deliver=false 完整 OAuth 成功，耗时 7,500ms，attempt 302 为 success，AT/RT 已加密保存。日志确认 IPv4、MFA、授权、token 交换成功，外部代理回退与 challenge 均 0。未为前缀验收创建新的生产 Sub2 账号，名称生成、保存默认、快照与重试由定向接口测试覆盖。
+- 18:05:19 UTC 延迟复核：active/running、NRestarts=0、实际 PID 1926007、二进制和资源 hash 匹配。自动恢复开启且巡检已推进至 18:05:15，无错误/阻塞；有效 Nginx 路由、socket、本机 health 正常，公网未认证 HTTP401。严重故障/OAuth拒绝/5xx 日志聚合均 0。
+- 账号 60、恢复任务 67、交付 7、复检 9、资料任务 0。回滚版本为 `20261008T173543Z-fast-recheck`，SHA-256 `12d23feed5826fed4ab7d568343e49aa45f6ccf3bac2b0a63906a2988fbc2cee`，运行环境和一致性备份已核验保留；回滚不覆盖业务数据库。
+- 候选及回滚兼容验收临时单元均已停止；隔离候选数据库/密钥目录、本次远端临时上传二进制、manifest 和四个验收脚本已清理。正式与回滚 release、数据库备份及验收证据保留。
+- 证据保存在 release 的 `DEPLOYMENT.json`、`ACCEPTANCE.json`、`LOGIN_ACCEPTANCE.json`、`DELAYED_ACCEPTANCE.json`。完整测试套件未运行。以下为本次通过的精确命令，远端脚本命令仅为执行记录，脚本已清理：
+
+```bash
+go test -race ./internal/store ./cmd/server -run 'TestDeliveryOptions|TestSub2Import|TestAccountDelivery|TestDelivery' -count=1 -timeout=90s
+node cmd/server/client.test.cjs
+node --check cmd/server/client.js
+./build-linux.sh /tmp/openai-login-account-prefix
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-stage-account-prefix.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-deploy-account-prefix.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-real-login-account-prefix.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-verify-account-prefix.py'
+git diff --check
+```
+
+## 首次自动复检提速（2026-10-09 01:36 上海时间）
+
+- 2026-10-08 17:36:59 UTC 切换 `20261008T173543Z-fast-recheck`，SHA-256 `12d23feed5826fed4ab7d568343e49aa45f6ccf3bac2b0a63906a2988fbc2cee`。来源为本地 `main` HEAD `4efcdff` 加未提交改动，仅修改复检调度和旧计划迁移；未同步代码托管。
+- 首检从成功完成后 5 分钟改为 30 秒，二检保持完成后 30 分钟。启动迁移仅提前最新 completed 任务中 pending/round=1/retry_count=0、无错误或人工提示、next_check_at 恰为 completed_at+300000 的旧计划。不修改失败退避、二检、非最新任务或正在执行的复检，不对历史任务补建复检。队列每 2 秒检查一次，恢复/资料修正任务优先，因此 30 秒是到期时间而非繁忙时完成时限。
+- Mac 构建并直接上传 sys1。隔离生产数据库副本含 57 个账号，自动恢复关闭且 Sub2 未配置；候选 health、旧计划迁移、静态资源/Node/driver hash、数据库完整性和旧版本读取通过。
+- 停服前后登录/导入/恢复/检测/交付/资料修正/复检在途均 0。备份 `/var/lib/openai-login/backups/accounts-before-20261008T173543Z-fast-recheck.db`，1,503,232 字节，0600，integrity_check=ok。
+- 17:38:17–17:38:25 UTC，历史账号 279 空代理、auto_deliver=false 完整 OAuth 成功，耗时 8,116ms，attempt 297 为 success，AT/RT 已加密保存。日志独立确认 IPv4、MFA、授权和 token 交换成功；无外部代理回退、无 challenge。普通重登不创建复检任务。
+- 17:38:54 UTC 延迟验收 active/running、NRestarts=0、实际 PID 1838477；自动恢复 enabled/running，巡检时间已推进，无阻塞或扫描错误。有效 Nginx 路由仍为 `/run/tls/auth/login.sock`，本机/socket 健康，公网未认证 HTTP401；panic/fatal/存储/锁/监听/OAuth拒绝/5xx 聚合均 0。
+- 当前 accounts 57、recovery tasks 64、deliveries 4、rechecks 6、repairs 0。最新 task 97/99 均已进入第二轮，仍精确安排在 completed_at+1800000；两条已被取代的历史首检重试记录保留。回滚保留 `20261008T082500Z-ipv4-default`（SHA-256 `e48f40f8662ea84a4042c38101a80a32eb66de45a80fea2a91e9b38505ed8b07`）及运行环境；回滚不覆盖业务数据库，也无需恢复默认外部代理。隔离候选数据库/密钥与本次远端临时上传产物已清理，以下远端脚本命令是本次执行记录。
+- 证据保存在该 release 的 `DEPLOYMENT.json`、`ACCEPTANCE.json`、`LOGIN_ACCEPTANCE.json`、`DELAYED_ACCEPTANCE.json`。未运行完整测试套件；本轮未人为创建生产恢复任务来验证首检 30 秒实时时序，完成事务、到期边界、迁移排除条件、幂等重启和复检恢复流程由定向测试验证。
+
+以下命令均通过：
+
+```bash
+go test -race ./internal/store ./cmd/server -run 'TestAccountRecoveryRecheck|TestSub2Recheck' -count=1 -timeout=90s
+./build-linux.sh /tmp/openai-login-fast-recheck
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-stage-fast-recheck.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-deploy-fast-recheck.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-real-login-fast-recheck.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 sys1 'sudo -n python3 /tmp/auth-verify-fast-recheck.py'
+git diff --check
+```
+
+## 默认 IPv4 直连（当前配置）
+
+2026-10-08 08:30 UTC（北京时间 16:30）按用户要求移除 sys1 的默认代理：`/etc/openai-login/proxy.env` 中 `OPENAI_LOGIN_PROXY` 为空。当前 `20261008T182221Z-compact-login` 的登录代理框留空即走服务器 IPv4；Chrome 与 token 交换使用同一 tcp4 出口，检测页面也默认选择 IPv4，自动检测无代理时自行选择直连。账号自己保存或本次明确填写的代理仍优先。
+
+旧配置仅以 0600 权限保存在 `/var/lib/openai-login/backups/proxy.env-before-20261008T082500Z-ipv4-default`，未继续注入运行进程。当前回滚版本为 `20261008T180135Z-account-prefix`。空代理网络检查返回 `mode=direct,reachable=true`；HTTP 客户端仍收到认证站 403，这不等同于浏览器 OAuth 失败，也不证明完整登录成功。2026-10-08 08:46 UTC 已按用户授权使用历史账号 279 实测默认 IPv4：完整 OAuth 成功，耗时 7,224ms，AT/RT 已加密保存，attempt 290 为 success；日志确认无外部代理回退、无 challenge。先测的账号 278 两次在 MFA 返回 incorrect_code，具体资料/验证方式原因待确认。完整记录见 [IPv4 实测](SYS1_IPV4_OAUTH_DIAGNOSIS.md)。单次成功不代表长期成功率。
+
+## 默认 IPv4 切换验收（2026-10-08）
+
+- 08:30:27 UTC 切换 `20261008T082500Z-ipv4-default`，SHA-256 `e48f40f8662ea84a4042c38101a80a32eb66de45a80fea2a91e9b38505ed8b07`。仅调整页面默认线路/提示及服务代理配置，无后端逻辑或数据库 schema 变更。
+- 候选 health、静态资源 hash、IPv4 默认选项、数据库完整性、旧二进制读取、Node/driver hash 验证通过。停服前后登录、导入、恢复、检测、交付、资料修改和复检在途均 0。
+- 发布前 SQLite 备份 `/var/lib/openai-login/backups/accounts-before-20261008T082500Z-ipv4-default.db`，1462272 字节、0600、integrity_check=ok；旧代理配置备份为上节路径，同为0600。回滚需同时考虑旧二进制和代理配置，业务数据库不回退覆盖。
+- 08:32:08 UTC 延迟复核 active/running、NRestarts=0，实际二进制 PID 19494；进程 OPENAI_LOGIN_PROXY 和通用 HTTP(S)/ALL_PROXY 均为空，argv 无代理覆盖，默认网络检查 mode=direct/reachable=true，认证站 HTTP403（网络检查不能证明浏览器登录结果）。
+- auto_recovery_enabled/running=true，last_scan_at 已推进到08:31:27 UTC，last_error为空；有效路由/本机/入口socket正常，公网未认证HTTP401。严重错误及OAuth拒绝/5xx日志聚合0；数据库、备份和回滚准备通过。账号53，恢复任务58；当前无新交付/复检/资料任务。
+- 当前release、回滚release、配置/数据库备份保留；本轮候选目录和远端临时上传文件清理完毕。未手动提交真实账号凭据；完整直连OAuth仍未验收。
+- 验证命令如下均通过；未运行完整测试套件：
+
+```bash
+node cmd/server/account-checks.test.cjs
+./build-linux.sh /tmp/openai-login-20261008T082500Z-ipv4-default
+git diff --check
+```
+
+## 2026-10-08 账号流程最新发布
+
+北京时间 16:10 发布 `20261008T080500Z-account-workflows`；16:12 延迟复核 active/running、NRestarts=0、实际二进制匹配、静态资源/有效路由/socket 正常、自动恢复开启且巡检继续。备份完整，回滚 `20261008T053100Z-account-automation` 就绪。
+
+新增批量 Sub2 分组/优先级/并发与平台默认；新建账号检测通过再入组，已有账号保留原配置。恢复/交付完成后约 5/30 分钟持久复检；修改密码/TOTP/代理后后台续跑，移交恢复与消费修改任务原子提交。未知创建只核对原标记，15 分钟仍查不到则明确提示人工核对；不盲目重复创建。
+
+`direct` 显式选择 sys1 IPv4 直连，空代理仍用默认代理。发布前原生 Chrome 默认走 IPv6 被 challenge；两个 IPv4 A 节点均进入邮箱页。发布后 08:46 UTC 已补齐历史账号完整直连 OAuth 实测，见上节。历史 IPv4 challenge 证据仍有效，不能承诺永久免验证。
+
+定向测试/验收命令见 [账号流程验证记录](ACCOUNT_WORKFLOW_VERIFICATION.md)，网络证据见 [IPv4 OAuth 诊断](SYS1_IPV4_OAUTH_DIAGNOSIS.md)。完整测试套件未运行，未手动使用真实账号验收新建分组导入。
+
+## 账号流程发布验收（2026-10-08 08:10 UTC）
+
+- release：`20261008T080500Z-account-workflows`；binary SHA-256：`f6fe65c332e63f18b8c91b784f25aef99b533aaf30d105dccd63cf3b7b04dfa3`。
+- 来源：本地 `main` HEAD `4efcdff3722b3457831ac9db2e36473aa36f8597` 加工作区改动，Mac 构建、直接上传 sys1；无代码托管同步。
+- 回滚：`20261008T053100Z-account-automation`，SHA-256 `9d5872b75714ee5b1e6aee12562226266c134bbd0f68113a8b6ecd155f28b939`；Node/driver 文件 hash 一致，旧二进制已验证能读取迁移后的隔离数据库。
+- 发布前数据库备份：`/var/lib/openai-login/backups/accounts-before-20261008T080500Z-account-workflows.db`，1441792 字节、0600、`integrity_check=ok`。停服前与停服后登录/导入/恢复/检测在途数均 0。
+- 08:09 UTC 隔离候选迁移 53 个账号，Sub2 未配置且自动恢复关闭，候选显式交付/资料任务清空；健康、三份静态资源 hash、数据库完整性、回滚 schema 兼容均通过。
+- 08:10:12 UTC 切换后 health/socket 正常；线上分组接口可用，10 个 OpenAI 分组；初始默认 `group_ids=[]`、priority=1、concurrency=3，未替用户擅选分组。
+- 08:12:11 UTC 延迟复核：服务 active/running，NRestarts=0，实际二进制 PID 4147390；自动恢复 enabled/running=true，上次扫描推进到 08:11:12 UTC，last_error 为空。有效 Nginx 仍指向 `/run/tls/auth/login.sock`，宿主 socket 健康正常，公网未认证 HTTP401。
+- 数据快照 accounts=53、account_recovery_tasks=58、account_deliveries=0、account_recovery_rechecks=0、account_credential_repairs=0。新复检只为之后成功完成的任务安排，不对历史完成任务批量补跑。
+- 发布日志 panic、fatal、database locked、storage failure、listen failure、OAuth 401/403、OAuth 5xx 聚合均为 0；数据库/备份完整性通过，回滚可用。不能把本次没有新任务解释为真实新建交付验收。
+- 本轮隔离候选数据库/密钥目录和远端临时上传文件已清理，当前 release、回滚 release 与发布前备份保留。
+- 发布记录位于该 release 的 `DEPLOYMENT.json`、`ACCEPTANCE.json`、`DELAYED_ACCEPTANCE.json`；精确测试命令见 [账号流程验证](ACCOUNT_WORKFLOW_VERIFICATION.md)。完整套件未运行；完整直连 OAuth 与真实新账号分组导入尚未执行。
+
 ## 线上架构
 
 - SSH 别名：`sys1`
@@ -17,19 +137,103 @@
 - release 根目录：`/opt/openai-login/releases`
 - 当前链接：`/opt/openai-login/current`
 
-当前部署基线（2026-10-05 发布后确认）：
+当前部署基线（2026-10-09 上海时间发布后确认）：
 
-- 当前 release：`20261005T124744Z-sub2-auth401-recovery`
-- 当前 commit：`4591e80`
-- 当前二进制 SHA-256：`d869c0c16498a8ab362e0be78c3aff617eec0ab96a469244244cd49099006714`
-- 回滚 release：`20261005T105500Z-sub2-status-ui`
+- 当前 release：`20261008T182221Z-compact-login`
+- 构建来源：本地 `main` HEAD `4efcdff3722b3457831ac9db2e36473aa36f8597` 加未提交工作区改动；未执行代码托管同步
+- 当前二进制 SHA-256：`666dd45943cf05c3becf859c7144a6043742fd0e466888cb54c1df08ef853534`
+- 回滚 release：`20261008T180135Z-account-prefix`
+- 回滚二进制 SHA-256：`7023dc1060ed8b901b5772e61a5a3a914f574282dbbddd4f38258391ac3192cb`
 - 当前服务应保持 `active (running)`，且 `NRestarts=0`
 - 当前服务端并发硬上限：10；页面选择的并发数由前端 worker 控制，实际不超过该上限。
-- 页面代理留空时使用 sys1 默认认证 HTTP 代理（节点地址仅记录为 `45.39.200.204:7269`，凭据保存在 `/etc/openai-login/proxy.env`，不写入文档）。
+- 页面代理留空时默认走 sys1 IPv4 直连；`/etc/openai-login/proxy.env` 的 `OPENAI_LOGIN_PROXY` 已清空，旧代理仅保留为服务器上的 0600 配置备份。
 - 历史列表中的 `expires_at` 表示 OAuth Access Token 有效期；Access Token 过期不等于账号或 Refresh Token 失效。
 - AUTH → Sub2 导入已启用；Sub2 地址、管理密钥和实例标识保存在 `/etc/openai-login/sub2api.env`（权限 `0600`），由 systemd drop-in 注入服务进程。
 - 本次仅发布 AUTH：外部账号关联、历史恢复入口、持久化后台巡检及缺少令牌恢复；Sub2 源码、镜像和线上版本未改。
 - 候选验证时自动恢复显式关闭；生产自动恢复为 `enabled` 并保持 SQLite 开关开启，开启立即扫描，此后每 60 秒后台检查 Sub2 异常账号。仅未保存选择时读取 `AUTH_AUTO_RECOVERY` 启动默认值。
+
+## 旧身份错误兼容补丁（2026-10-08）
+
+- 当前最终 release：`20261008T053100Z-account-automation`；回滚为 `20261008T052000Z-account-automation`，此前 `20261008T040000Z-recovery-runtime-status` 也保留。最终二进制 SHA-256：`9d5872b75714ee5b1e6aee12562226266c134bbd0f68113a8b6ecd155f28b939`。四项功能与下节保持一致，仅修正旧失败分类。
+- 初次发布延迟复核发现账号 201 / 旧 task 60 的 `identity_mismatch` 来自旧版本，不能证明当前规则仍会拒绝。兼容层改为重新登录并按当前邮箱/绑定规则核验；真实身份冲突仍会转为人工处理。
+- 发布前备份后，仅对 task 60 / account 201 作一次限定修正：要求仍为该账号最新任务、旧身份错误、无新凭据检查点，且当前成功凭据版本仍为 205；清空本轮错误回填的人工策略，让新后台重新分类。没有修改账号凭据或 Sub2 状态。其他停用、删除、版本变化任务不重置。
+- 最终候选再次使用 49 账号的隔离副本，关闭自动恢复且不配置 Sub2；schema、health、历史、静态资源、运行时 hash 和回滚二进制读取均通过。最终备份：`/var/lib/openai-login/backups/accounts-before-20261008T053100Z-account-automation.db`。
+- 最终切换为 05:28:49 UTC（北京时间 13:28:49），停止前后活动数均为 0；备份 1392640 字节、0600、integrity_check=ok。05:30:03 UTC 延迟复核服务仍 active/running、NRestarts=0，唯一实际二进制进程 PID 3620819 运行最终 release；health status=ok，自动恢复 enabled/running=true、无阻塞原因或巡检错误，last_scan_at 推进至 05:29:49 UTC。
+- 有效 Nginx auth.kkrich.ltd 路由仍为 `/run/tls/auth/login.sock`；宿主 socket 健康正常，公网未认证 HTTP 401。panic、fatal、数据库锁、存储故障、监听失败、OAuth 401/403 与 5xx 日志聚合均为 0。当前及回滚 binary/Node/driver hash、生产数据库和备份完整性通过，回滚就绪。
+- 延迟快照为 49 账号、48 恢复任务、0 交付任务；每账号最新任务为 completed 21、人工处理 5、等待自动重新登录 1。账号 201 / task 60 为 relogin + login_failed 并有持久下次重试时间，尚未声称本次实际 OAuth 已成功；账号 203/222 已被上游明确停用，保留人工提示。没有执行真实新账号自动交付验收，其完整链路由定向集成测试覆盖。两轮隔离候选和本次远端临时上传产物已清理，正式及回滚 release 保留。
+- 新增回归与构建通过；沿用下节未受影响的前端、store 和恢复链路检查，未运行完整测试套件：
+
+```bash
+go test -race ./cmd/server -run 'TestSub2Recovery(RechecksLegacyIdentityRules|AdoptsLegacyCheckpoint|RetryRejectsChangedOwnership)' -count=1 -timeout=60s
+go vet ./cmd/server
+./build-linux.sh /tmp/openai-login-20261008T053100Z-account-automation
+git diff --check
+```
+
+## 自动恢复、后台交付和人工提醒（2026-10-08）
+
+- 05:22:06 UTC（北京时间 13:22:06）切换 `20261008T052000Z-account-automation`；回滚 `20261008T040000Z-recovery-runtime-status`。只发布 AUTH，来源为本地 HEAD `4efcdff` 加未提交工作区改动，未执行代码托管同步。二进制 SHA-256：`45d1358c153cfce92e02de096a8787714df91ad07e29363183a9793e8d99d5dd`。
+- 新增持久化失败原因、阶段、重试动作和下次时间。网络、429、5xx 等自动退避，遵守 Retry-After；新凭据检测明确失效后重新登录。检测或启用中断优先复用已保存的新凭据；解除旧版失败 3 次硬性停止。旧失败任务分类后接入自动续跑，必须核对凭据版本、账号绑定和远端任务标记。
+- 成功登录与 `account_deliveries` 任务在同一 SQLite 事务提交。后台关联/导入后复用现有恢复引擎完成写回、检测和启用；交付任务不依赖全局自动巡检开关，关闭页面后继续。用稳定 DeliveryID 保证交接幂等，过期登录任务不覆盖新凭据，首次交付不计入复活次数。
+- 页面新增每批冻结的自动交付选项、独立登录/交付状态、自动重试时间及按账号去重的“需要处理”列表。真实人工问题才提示，保留键盘可用性；本地 fixture 在桌面及 390px 宽度验收，窄屏 document scrollWidth=clientWidth=390。
+- 隔离候选复制生产数据库（49 个账号），关闭自动恢复且不配置 Sub2；迁移、health、历史接口、三份静态资源 hash 通过。旧二进制也已成功打开迁移后的隔离数据库；Node 与 driver 文件 hash 与回滚版本一致。候选未发真实 OAuth、模型或 Sub2 写请求。
+- 发布前和停止服务后再次确认登录、导入、检测、恢复活动数均为 0。SQLite 一致性备份 `/var/lib/openai-login/backups/accounts-before-20261008T052000Z-account-automation.db`，1372160 字节、0600、integrity_check=ok；原 release 保留。
+- 即时验收：health status=ok、max_concurrent=10、sub2_configured=true，自动恢复 enabled/running=true、无阻塞；宿主入口 socket 健康正常，三份线上静态资源 hash 与本地产物一致。05:23:27 UTC 初版延迟复核健康和回滚通过；最终补丁验收见上节。
+- 边界：未手动触发真实 OAuth/新账号导入验收；自动导入不确定结果仅持续核对，不盲目重复创建。Sub2 接口未提供人工暂停的操作版本，因此无法识别“本任务暂停后用户再次设置同样的暂停值”；保留原调度意图、阶段、任务标记及版本核对，不声称覆盖不可观测的人工操作。
+
+定向验证全部通过，完整测试套件未运行：
+
+```bash
+go test -race ./cmd/server ./internal/store ./internal/login -run 'Test(AccountDelivery|RunWithHistory|DeliveryRecovery|AccountRecovery|Recovery|Sub2Recovery|Sub2Monitor|Sub2Import|SyncSub2|AutoRecovery|ParseRetryAfter|RetryDelay)' -count=1 -timeout=90s
+go vet ./cmd/server ./internal/store ./internal/login
+node cmd/server/client.test.cjs
+node --check cmd/server/client.js
+./build-linux.sh /tmp/openai-login-20261008T052000Z-account-automation
+git diff --check
+```
+
+## 自动恢复运行状态修复（2026-10-08）
+
+- 03:56:45 UTC（北京时间 11:56:45）完成切换，release：`20261008T040000Z-recovery-runtime-status`；回滚：`20261007T092840Z-recovery-accessibility`。二进制 SHA-256：`d87fb4205ae5623d20e48629902b8da71c81fdf6f67c9c61c0a02a27d4919871`。本次只修复 AUTH 状态接口与页面：新增 `running`、`blocked_reason`，区分用户开启选择与后台真实运行条件；存储故障、服务停止、缺少配置时显示暂停及原因，不显示虚假的下次巡检。临时巡检错误不误判为永久停止。自动恢复策略、账号重试规则和 Sub2 服务未修改。
+- 隔离候选使用独立空数据库且不配置 Sub2；开关置为开启时正确返回 `running=false` 和“Sub2 恢复服务未配置”。候选健康检查及三份静态资源 hash 通过，测试数据与候选进程已清理；未调用真实账号或模型。
+- 切换前确认登录、导入、检测和恢复活动数均为 0，停止服务后再次核对，再创建 SQLite 一致性备份 `/var/lib/openai-login/backups/accounts-before-20261008T040000Z-recovery-runtime-status.db`（1347584 字节，0600，`integrity_check=ok`）。用户自动恢复选择保持开启。
+- 发布后本机及有效入口 Unix socket 设置响应均为 `auto_recovery_enabled=true,running=true,blocked_reason=""`，首轮巡检完成；服务 `active/running`、`NRestarts=0`，公网未认证 HTTP 401。三份线上静态资源与本地 manifest 一致，client.js SHA-256 为 `fc7c6de6d174292da0a13e53672a1c5d321d9013d94a5f1d62906cb90c84934b`；Node/driver 与回滚 release 一致。
+- 03:59:18 UTC（北京时间 11:59:18）延迟复核：服务仍 `active/running`、`NRestarts=0`，唯一实际二进制进程 PID 3314636 运行新 release；上次巡检已推进到 03:58:45 UTC，`running=true`、无阻塞原因和巡检错误。发布以来 panic、fatal、数据库锁、存储故障、监听失败计数均为 0。生产数据库与备份完整性再次通过，回滚二进制、Node、driver hash 核对通过；本次远端临时上传文件已清理。
+- 下列定向验证全部通过，完整测试套件未运行；本轮未触发真实 OAuth 复活或模型调用，状态修复由真实数据库故障注入、前端回归和线上接口验证覆盖。
+
+```bash
+go test ./cmd/server -run 'Test(Sub2RecoverySettingsRuntimeStatus|Sub2RecoveryAutoSettings|Sub2Monitor|Sub2RecoveryStorageFailure|Sub2RecoveryCheckpointFailure)' -count=1 -timeout=60s
+go vet ./cmd/server
+node cmd/server/client.test.cjs
+node --check cmd/server/client.js
+./build-linux.sh /tmp/openai-login-20261008T040000Z-recovery-runtime-status
+git diff --check
+```
+
+## 身份校验修正与浮窗键盘发布验收（2026-10-07）
+
+- 账号 203 / Sub2 16839 的旧任务 53、56、59 均在登录后身份核对阶段以 `identity_mismatch` 停止，凭据没有写回。它们的问题不只是 workspace ID 变化：旧、新 JWT 的 `chatgpt_user_id` 也不一致。09:13 UTC 的 `20261007T090920Z-userid-recovery` 已移除此阻断核对，仍要求邮箱一致、完整 access/refresh token、原 Sub2 账号 ID/邮箱/绑定标记一致，并核验写回后的新 workspace、organization、plan、expires_at 和凭据状态。
+- 当前 `20261007T092840Z-recovery-accessibility` 于 09:33:00 UTC 切换，回滚为 `20261007T090920Z-userid-recovery`。本版补足复活次数按钮到记录浮窗的 Tab/Shift+Tab 焦点路径；历史卡片布局、成功复活次数、最近 100 条记录浮窗和醒目的 Sub2 在池标记均已上线。Linux amd64 二进制 SHA-256 为 `72272f5dde1c00c3e6599ce0a884a044e61a83f17c3f62abe64dc2e23e823e79`，Node/driver 从回滚 release 复用且 driver 文件树一致。
+- 切换前 SQLite 一致性备份为 `/var/lib/openai-login/backups/accounts-before-20261007T092840Z-recovery-accessibility.db`（724992 字节、0600、`integrity_check=ok`）。新二进制与线上文件 hash 一致；线上 HTML、`client.js`、`account-checks.js` SHA-256 分别为 `4a856145b05a3dccb9c3d409996b1affc76111ba1b8dc2ca4a428e1eb02d0d82`、`1643496fb3e5fe912ebb3b922862fa1562bb3b57080b7c5581d6d36ac35469c9`、`1c37fe582928c755f935f4e19783443262371c8c33c6b436c37614671ec1bb41`。
+- 发布后服务 `active/running`、`NRestarts=0`，本机和有效入口 Unix socket `/health` 正常，公网未认证 HTTP 401。定向 Go 测试、`go vet`、Node 客户端交互与语法检查、Linux amd64 构建、`git diff --check` 通过；未运行完整测试套件。
+- 账号 203 的 task 64 于 09:13:26 UTC completed，写入版本 233；09:19:25 UTC 独立 AUTH 检测 718 又收到上游 HTTP 401 `token_revoked`，不能把 task 64 的完成当作持续可用。task 65 于 09:19:59 UTC completed，写入版本 234；Sub2 16839 当前为 active、可调度。09:34 UTC 的独立 AUTH 检测 719 使用版本 234、默认代理和 `gpt-5.6-luna`，返回 HTTP 200、`outcome=ok`。目前无法从现有日志确定版本 233 被撤销的上游原因。
+- 09:39 UTC 延迟只读复核：当前 release 仍为 `20261007T092840Z-recovery-accessibility`，服务 `active/running`、`NRestarts=0`，本机 `/health` HTTP 200；09:33 切换后 journal 无新行，严重错误计数为 0。账号 203 保持 active，任务 65/凭据版本 234 为最新恢复结果；Sub2 16839 仍 active 且可调度，管理接口 HTTP 200。检查 719 后没有新的 AUTH 检查，因此没有新 401 记录，也不能据此推断长期有效。当前与回滚二进制 SHA-256、Node/driver、生产数据库和发布前备份完整性均再次核对通过；`/tmp` 中本次上传的二进制及 manifest 已清理。
+
+## 工作区切换恢复与历史卡片发布验收（2026-10-07）
+
+- 发布时间：2026-10-07 07:56:49 UTC；release：`20261007T074431Z-workspace-recovery`；回滚：`20261005T124744Z-sub2-auth401-recovery`。
+- 恢复流程不再把 workspace/account ID 当作不可变匹配键。同一稳定 ChatGPT 用户更换 workspace 后，仍会核对邮箱、完整 access/refresh token、稳定 `chatgpt_user_id`（两边 JWT 都提供时）以及原 Sub2 账号 ID、邮箱和绑定标记；写回后再严格核验新 workspace、organization、plan、expires_at 和凭据状态。
+- 历史卡片显示成功复活次数、恢复尝试次数、Sub2 在池/不在池/待核对状态；复活记录支持悬停、键盘聚焦、点击和触屏打开浮窗，最多展示最近 100 条并处理加载失败、空态、截断和过期响应。
+- Linux amd64 二进制 SHA-256：`a880de92a6ab040a3ea331199542a00e626d74aae4bc817440baa4b2b26f370f`；Node/driver 从回滚 release 复用；三份静态资源 hash 与本地构建一致。
+- 发布前 SQLite 备份：`/var/lib/openai-login/backups/accounts-before-20261007T074431Z-workspace-recovery.db`，权限 `0600`，大小 716800 字节，`integrity_check=ok`。旧 release 保留可回滚。
+- 发布后服务 `active/running`、`NRestarts=0`，`/health` 返回 `status=ok,max_concurrent=10`；实际宿主 socket `/srv/kkai/secrets/tls/kkrich-ltd/auth/login.sock` 返回 HTTP 200，公网未认证返回 HTTP 401。
+- 发布后数据库 `integrity_check=ok`，自动恢复开关仍为 `enabled`；快照为 accounts 30、imports 27、checks 715、recovery tasks 26（completed 15、unknown 11），复查时无运行中登录、检测、恢复或导入任务。发布窗口 panic、fatal、database locked、storage failure、listen tcp 日志计数均为 0。
+- 发布切换瞬间没有触发真实 OAuth 复活；跨 workspace、稳定用户核对、断点续跑、写回元数据和历史浮窗由定向 Go/Node/fixture 验证覆盖。延迟复核已补充真实线上复活证据如下。
+- 延迟复核（2026-10-07 08:18 UTC）确认服务仍 `active/running`、`NRestarts=0`、本机 `/health` 为 `status=ok`、宿主入口 socket 返回 HTTP 200、公网未认证返回 HTTP 401，发布窗口严重错误计数仍为 0；数据库与发布前备份 `integrity_check=ok`，回滚 release 仍保留。
+- 延迟复核期间账号 216 的 task 62 实际完成：账号从旧 workspace `43525e7a-5938-4af7-bba5-5ef3e6ab336a` 更新到新 workspace `52e729ef-5bd4-4ce6-83ba-1762c2302664`，Sub2 检测通过并重新开启调度；当前任务统计为 completed 16、unknown 11。该记录提供了真实跨 workspace 复活成功证据。
+- 2026-10-07 08:36:58 UTC 仅为历史卡片状态文案修正切换 `20261007T082500Z-history-status`；未改数据库或 Sub2，沿用上一 release 的数据备份和 Node/driver。新二进制 SHA-256 为 `7e4fb6ddef77fb76497fd097c796db7fd81848b95340a0de4fafafb6e2a28ef3`，上一 release 保留为回滚点。
+- 修正后复核服务 `active/running`、`NRestarts=0`、本机和宿主 socket `/health` 均为 `status=ok`，公网未认证 HTTP 401，发布窗口严重错误计数 0；线上 `/api/client.js` 已包含“Sub2 状态待核对”。
+- 08:49 UTC 延迟快照：accounts 30、imports 27、checks 717、recovery tasks 28（completed 17、unknown 11），无运行中任务；task 63（账号 216 / Sub2 16842）再次完成，凭据检测通过并重新开启调度。
 
 ## AUTH 401 恢复发布验收（2026-10-05）
 

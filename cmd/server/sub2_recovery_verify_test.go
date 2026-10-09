@@ -99,6 +99,53 @@ func TestRecoveryVerifyProbeTimeout(t *testing.T) {
 	}
 }
 
+func TestRecoveryVerifyErrorClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, code string
+		invalid, manual  bool
+	}{
+		{"revoked", `{"type":"error","error":{"code":"token_revoked","status":401,"message":"at-secret"}}`, "credential_invalid", true, false},
+		{"upstream_401", `{"type":"error","status":401}`, "credential_invalid", true, false},
+		{"disabled", `{"type":"error","error":{"code":"account_deactivated","status":401}}`, "account_unavailable", false, true},
+		{"limited", `{"type":"error","status":429}`, "rate_limited", false, false},
+		{"server_error", `{"type":"error","status":503}`, "upstream_error", false, false},
+		{"opaque_error", `{"type":"error","error":"token_revoked at-secret"}`, "probe_failed", false, false},
+		{"unstructured_401", `{"type":"error","message":"HTTP 401 at-secret"}`, "probe_failed", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := readRecoveryProbeEvents(strings.NewReader("data: " + tc.body + "\n\n"))
+			failure := classifyRecoveryError(err)
+			if failure.Code != tc.code || failure.CredentialInvalid != tc.invalid || failure.RequiresAction != tc.manual || strings.Contains(failure.Error(), "at-secret") {
+				t.Fatalf("wrong or unsafe classification: %+v", failure)
+			}
+		})
+	}
+	for _, status := range []int{401, 403, 404, 429, 503} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "180")
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, `{"error":"token_revoked","message":"at-secret"}`)
+		}))
+		svc := &sub2RecoveryService{sub2: &sub2ImportService{baseURL: server.URL, client: server.Client()}}
+		failure := classifyRecoveryError(svc.verifySub2AccountProbe(context.Background(), 42))
+		server.Close()
+		if failure.CredentialInvalid || failure.HTTPStatus != status || failure.RetryAfterSeconds != 180 || failure.RequiresAction != (status < 429) {
+			t.Fatalf("management failure mistaken for model failure: %+v", failure)
+		}
+	}
+}
+
+func TestRecoveryRetryBackoff(t *testing.T) {
+	failure := &recoveryOperationError{Code: "network_error"}
+	if recoveryRetryDelay(failure, 0) != time.Minute || recoveryRetryDelay(failure, 3) != 8*time.Minute || recoveryRetryDelay(failure, 100) != time.Hour {
+		t.Fatal("network backoff must grow with a bounded delay, without a hard stop")
+	}
+	failure.Code, failure.RetryAfterSeconds = "rate_limited", 7200
+	if recoveryRetryDelay(failure, 0) != 2*time.Hour {
+		t.Fatal("Retry-After was ignored")
+	}
+}
+
 func recoveryVerifyDetailFixture() map[string]any {
 	return map[string]any{
 		"id": float64(42), "platform": "openai", "type": "oauth", "status": "active", "error_message": "",
@@ -126,7 +173,7 @@ func TestRecoveryVerifyActualDTO(t *testing.T) {
 		{"missing_type", func(d map[string]any) { delete(d, "type") }, false, false},
 		{"wrong_platform", func(d map[string]any) { d["platform"] = "anthropic" }, false, false},
 		{"wrong_identity", func(d map[string]any) { d["credentials"].(map[string]any)["email"] = "other@example.test" }, false, false},
-		{"wrong_workspace", func(d map[string]any) { d["credentials"].(map[string]any)["chatgpt_account_id"] = "other" }, false, false},
+		{"previous_workspace", func(d map[string]any) { d["credentials"].(map[string]any)["chatgpt_account_id"] = "other" }, true, false},
 		{"missing_marker", func(d map[string]any) { delete(d, "extra") }, false, false},
 		{"synthetic", func(d map[string]any) { d["extra"].(map[string]any)["synthetic_ui_test"] = true }, false, false},
 	} {
@@ -160,7 +207,28 @@ func TestRecoveryVerifyExternalAssociation(t *testing.T) {
 	}
 	delete(detail, "extra")
 	detail["credentials"].(map[string]any)["chatgpt_account_id"] = "different-workspace"
-	if err := verifySub2RecoveryIdentity(detail, 42, 7, account, binding); err == nil {
-		t.Fatal("wrong workspace accepted")
+	if err := verifySub2RecoveryIdentity(detail, 42, 7, account, binding); err != nil {
+		t.Fatalf("workspace change prevented recovery of the bound account: %v", err)
+	}
+	if err := verifySub2RecoveryDetail(detail, 42, 7, account, binding); err == nil {
+		t.Fatal("post-apply workspace mismatch accepted")
+	}
+}
+
+func TestRecoveryVerifyUpdatedMetadata(t *testing.T) {
+	account := store.Account{Email: "recover@example.test", ChatGPTAccountID: "personal-workspace", PlanType: "free", ExpiresAt: 2100000000}
+	for _, field := range []string{"organization_id", "plan_type", "expires_at"} {
+		t.Run(field, func(t *testing.T) {
+			detail := recoveryVerifyDetailFixture()
+			credentials := detail["credentials"].(map[string]any)
+			credentials["chatgpt_account_id"], credentials["organization_id"], credentials["plan_type"], credentials["expires_at"] = account.ChatGPTAccountID, "", account.PlanType, float64(account.ExpiresAt)
+			if err := verifySub2RecoveryDetail(detail, 42, 7, account); err != nil {
+				t.Fatalf("correct updated metadata rejected: %v", err)
+			}
+			credentials[field] = "previous-value"
+			if err := verifySub2RecoveryDetail(detail, 42, 7, account); err == nil {
+				t.Fatalf("stale %s accepted", field)
+			}
+		})
 	}
 }

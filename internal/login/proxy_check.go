@@ -24,12 +24,11 @@ type ProxyCheckResult struct {
 // CheckProxy tests the configured/request proxy with one bounded HTTP request.
 // An empty proxy uses the service configuration and otherwise checks direct.
 func (s *Service) CheckProxy(ctx context.Context, proxy string) (ProxyCheckResult, error) {
-	proxy = strings.TrimSpace(proxy)
-	if proxy == "" {
-		proxy = strings.TrimSpace(s.config.Proxy)
+	config, err := s.loginConfig(proxy, "")
+	if err != nil {
+		return ProxyCheckResult{}, err
 	}
-	upstream := strings.TrimSpace(s.config.UpstreamProxy)
-	return checkProxyURL(ctx, proxyCheckURL, proxy, upstream)
+	return checkProxyURL(ctx, proxyCheckURL, config.Proxy, config.UpstreamProxy)
 }
 
 func checkProxyURL(parent context.Context, target, proxy, upstream string) (ProxyCheckResult, error) {
@@ -90,7 +89,7 @@ func checkProxyURLOnce(ctx context.Context, target, proxy, upstream string) (Pro
 	}
 	// Explicit Proxy:nil prevents ambient HTTP(S)_PROXY variables from changing
 	// the meaning of an empty proxy field.
-	transport := &http.Transport{Proxy: nil}
+	transport := &http.Transport{Proxy: nil, DialContext: dialDirectIPv4}
 	defer transport.CloseIdleConnections()
 	return doProxyCheck(ctx, target, result, transport)
 }

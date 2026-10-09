@@ -44,29 +44,37 @@ func initLoginHistory(dbPath, keyPath string) error {
 }
 
 type historyLoginRequest struct {
-	AccountID     int64  `json:"account_id"`
-	Proxy         string `json:"proxy"`
-	UpstreamProxy string `json:"upstream_proxy"`
+	DeliveryOptions *store.DeliveryOptions `json:"delivery_options,omitempty"`
+	AutoDeliver     bool                   `json:"auto_deliver"`
+	AccountID       int64                  `json:"account_id"`
+	Proxy           string                 `json:"proxy"`
+	UpstreamProxy   string                 `json:"upstream_proxy"`
 }
 
 type historyListResponse struct {
-	Success          bool                                `json:"success"`
-	Data             []store.Account                     `json:"data"`
-	Imports          []store.Sub2Import                  `json:"imports,omitempty"`
-	Sub2Statuses     map[int64]sub2AccountStatus         `json:"sub2_statuses,omitempty"`
-	Sub2Configured   bool                                `json:"sub2_configured"`
-	ImportsAvailable bool                                `json:"imports_available"`
-	ChecksAvailable  bool                                `json:"checks_available"`
-	Checks           map[int64]store.AccountCheckSummary `json:"checks"`
-	Recoveries       map[int64]store.AccountRecoveryTask `json:"recoveries"`
+	Success          bool                                   `json:"success"`
+	Data             []store.Account                        `json:"data"`
+	Imports          []store.Sub2Import                     `json:"imports,omitempty"`
+	Sub2Statuses     map[int64]sub2AccountStatus            `json:"sub2_statuses,omitempty"`
+	Sub2Configured   bool                                   `json:"sub2_configured"`
+	ImportsAvailable bool                                   `json:"imports_available"`
+	ChecksAvailable  bool                                   `json:"checks_available"`
+	Checks           map[int64]store.AccountCheckSummary    `json:"checks"`
+	Recoveries       map[int64]store.AccountRecoveryTask    `json:"recoveries"`
+	Deliveries       map[int64]store.AccountDelivery        `json:"deliveries"`
+	Rechecks         map[int64]store.AccountRecoveryRecheck `json:"rechecks"`
+	Repairs          map[int64]store.CredentialRepair       `json:"repairs"`
 }
 
 type historyDetailResponse struct {
-	Success         bool                  `json:"success"`
-	Account         store.Account         `json:"account"`
-	Attempts        []store.AttemptRecord `json:"attempts"`
-	Checks          []store.AccountCheck  `json:"checks"`
-	ChecksAvailable bool                  `json:"checks_available"`
+	Success                  bool                        `json:"success"`
+	Account                  store.Account               `json:"account"`
+	Attempts                 []store.AttemptRecord       `json:"attempts"`
+	RecoveryHistory          []store.AccountRecoveryTask `json:"recovery_history"`
+	RecoveryHistoryAvailable bool                        `json:"recovery_history_available"`
+	RecoveryHistoryTruncated bool                        `json:"recovery_history_truncated"`
+	Checks                   []store.AccountCheck        `json:"checks"`
+	ChecksAvailable          bool                        `json:"checks_available"`
 }
 
 func handleHistory() http.HandlerFunc {
@@ -101,13 +109,28 @@ func handleHistory() http.HandlerFunc {
 			}
 		}
 		configured := sub2Importer != nil && sub2Importer.configured()
+		deliveries, deliveryErr := listDeliveryStatuses(r.Context(), loginHistory)
+		if deliveryErr != nil {
+			respondJSONStatus(w, http.StatusServiceUnavailable, LoginResponse{Message: "读取交付状态失败，请稍后刷新", Code: "delivery_read_failed"})
+			return
+		}
+		rechecks, recheckErr := loginHistory.ListAccountRecoveryRechecks(r.Context())
+		repairs, repairErr := loginHistory.ListCredentialRepairs(r.Context())
+		if recheckErr != nil || repairErr != nil {
+			respondJSONStatus(w, http.StatusServiceUnavailable, LoginResponse{Message: "读取后台处理状态失败，请稍后刷新"})
+			return
+		}
 		respondJSON(w, historyListResponse{Success: true, Data: accounts, Imports: imports, Sub2Statuses: sub2Statuses, Sub2Configured: configured,
-			ImportsAvailable: importsErr == nil, ChecksAvailable: checksErr == nil, Checks: checks, Recoveries: recoveries})
+			ImportsAvailable: importsErr == nil, ChecksAvailable: checksErr == nil, Checks: checks, Recoveries: recoveries, Deliveries: deliveries, Rechecks: rechecks, Repairs: repairs})
 	}
 }
 
 func handleHistoryDelete() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/credentials") {
+			handleHistoryCredentials(w, r)
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodDelete {
 			respondJSONStatus(w, http.StatusMethodNotAllowed, LoginResponse{Message: "Method not allowed"})
 			return
@@ -138,7 +161,10 @@ func handleHistoryDelete() http.HandlerFunc {
 				return
 			}
 			checks, checksErr := loginHistory.ListAccountChecks(r.Context(), account.ID, 20)
-			respondJSON(w, historyDetailResponse{Success: true, Account: account, Attempts: attempts, Checks: checks, ChecksAvailable: checksErr == nil})
+			recoveryHistory, recoveryHistoryTruncated, recoveryHistoryErr := loginHistory.ListAccountRecoveryHistory(r.Context(), account.ID, 100)
+			respondJSON(w, historyDetailResponse{Success: true, Account: account, Attempts: attempts,
+				RecoveryHistory: recoveryHistory, RecoveryHistoryAvailable: recoveryHistoryErr == nil,
+				RecoveryHistoryTruncated: recoveryHistoryTruncated, Checks: checks, ChecksAvailable: checksErr == nil})
 			return
 		}
 		if err := loginHistory.DeleteAccountByID(r.Context(), id); errors.Is(err, store.ErrAccountBusy) {
@@ -201,7 +227,7 @@ func handleHistoryLogin(service *login.Service) http.HandlerFunc {
 			if proxy == "" {
 				proxy = credentials.Proxy
 			}
-			loginReq := LoginRequest{Email: credentials.Email, Password: credentials.Password, TotpSecret: credentials.TOTPSecret, Proxy: proxy, UpstreamProxy: strings.TrimSpace(req.UpstreamProxy)}
+			loginReq := LoginRequest{Email: credentials.Email, Password: credentials.Password, TotpSecret: credentials.TOTPSecret, Proxy: proxy, UpstreamProxy: strings.TrimSpace(req.UpstreamProxy), AutoDeliver: req.AutoDeliver, DeliveryOptions: req.DeliveryOptions}
 			if err := validateLoginRequest(&loginReq); err != nil {
 				respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: err.Error()})
 				return
@@ -224,8 +250,33 @@ func runWithHistory(ctx context.Context, req LoginRequest, run func(context.Cont
 }
 
 func runWithHistoryAccount(ctx context.Context, accountID int64, req LoginRequest, run func(context.Context) (*login.LoginResult, error)) (*login.LoginResult, error) {
+	if req.AutoDeliver && (loginHistory == nil || sub2Importer == nil || !sub2Importer.configured()) {
+		return nil, &recoveryOperationError{Code: "configuration", RequiresAction: true}
+	}
 	if loginHistory == nil {
 		return run(ctx)
+	}
+	var options store.DeliveryOptions
+	if req.AutoDeliver {
+		requested := req.DeliveryOptions
+		if requested == nil && accountID > 0 {
+			deliveries, err := loginHistory.ListLatestAccountDeliveries(ctx)
+			if err != nil {
+				return nil, err
+			}
+			for _, d := range deliveries {
+				if d.AccountID == accountID && d.DestinationKey == sub2Importer.destinationKey {
+					copy := d.Options
+					requested = &copy
+					break
+				}
+			}
+		}
+		var err error
+		options, err = sub2Importer.loadOptions(ctx, requested)
+		if err != nil {
+			return nil, &recoveryOperationError{Code: "configuration", RequiresAction: true}
+		}
 	}
 	persistCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -253,7 +304,14 @@ func runWithHistoryAccount(ctx context.Context, accountID int64, req LoginReques
 		return nil, fmt.Errorf("login returned no result")
 	}
 	stored := &store.Result{AccessToken: result.AccessToken, RefreshToken: result.RefreshToken, ChatGPTAccountID: result.ChatGPTAccountID, OrganizationID: result.OrganizationID, PlanType: result.PlanType, ExpiresAt: result.ExpiresAt, ExpiresIn: result.ExpiresIn}
-	if err := loginHistory.FinishAttempt(finishCtx, attempt.ID, true, stored, nil); err != nil {
+	result.AccountID = attempt.AccountID
+	if req.AutoDeliver {
+		delivery, err := loginHistory.FinishAttemptAndQueueDelivery(finishCtx, attempt.ID, stored, sub2Importer.destinationKey, options)
+		if err != nil {
+			return nil, fmt.Errorf("save login and delivery: %w", err)
+		}
+		result.Delivery = delivery
+	} else if err := loginHistory.FinishAttempt(finishCtx, attempt.ID, true, stored, nil); err != nil {
 		return nil, fmt.Errorf("save login history: %w", err)
 	}
 	return result, nil

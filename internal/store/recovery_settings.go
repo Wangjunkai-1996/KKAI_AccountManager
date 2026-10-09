@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"time"
 )
 
 func (s *Store) initRecoverySettings(ctx context.Context) error {
@@ -45,12 +44,4 @@ func (s *Store) AutomaticRecoveryCheck(ctx context.Context, batchID string) (boo
 	var automatic bool
 	err := s.db.QueryRowContext(ctx, `SELECT request_key LIKE 'recovery-auto-%' FROM account_check_batches WHERE id=?`, batchID).Scan(&automatic)
 	return automatic, err
-}
-
-// Stop recurring login failures after three attempts for the current stored
-// credentials within a day. The operator can still explicitly retry.
-func (s *Store) AutomaticRecoveryRetryAllowed(ctx context.Context, accountID int64) (bool, error) {
-	var failures int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_recovery_tasks WHERE account_id=? AND state IN ('failed','unknown') AND source_credential_attempt_id=COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=? AND status='success'),0) AND created_at>?`, accountID, accountID, time.Now().Add(-24*time.Hour).UnixMilli()).Scan(&failures)
-	return failures < 3, err
 }

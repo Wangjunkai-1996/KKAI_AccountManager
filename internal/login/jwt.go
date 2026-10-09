@@ -38,6 +38,35 @@ func ParseJWT(token string) (*JWTPayload, error) {
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal JWT payload: %w", err)
 	}
+	// Current OAuth tokens nest these claims; retain the flat names for older
+	// credentials while preferring the token's explicit nested identity.
+	var nested struct {
+		Auth struct {
+			ChatGPTAccountID string `json:"chatgpt_account_id"`
+			ChatGPTUserID    string `json:"chatgpt_user_id"`
+			ChatGPTPlanType  string `json:"chatgpt_plan_type"`
+			OrganizationID   string `json:"poid"`
+		} `json:"https://api.openai.com/auth"`
+		Profile struct {
+			Email string `json:"email"`
+			Name  string `json:"name"`
+		} `json:"https://api.openai.com/profile"`
+	}
+	if err := json.Unmarshal(payload, &nested); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal nested JWT claims: %w", err)
+	}
+	for target, value := range map[*string]string{
+		&data.ChatGPTAccountID: nested.Auth.ChatGPTAccountID,
+		&data.ChatGPTUserID:    nested.Auth.ChatGPTUserID,
+		&data.ChatGPTPlanType:  nested.Auth.ChatGPTPlanType,
+		&data.OrganizationID:   nested.Auth.OrganizationID,
+		&data.Email:            nested.Profile.Email,
+		&data.Name:             nested.Profile.Name,
+	} {
+		if value != "" {
+			*target = value
+		}
+	}
 
 	return &data, nil
 }

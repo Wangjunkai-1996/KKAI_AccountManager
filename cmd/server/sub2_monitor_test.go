@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,6 +32,73 @@ func newMonitorFixture(t *testing.T) *recoveryFixture {
 		return probe.Result{Outcome: "unauthorized", HTTPStatus: http.StatusUnauthorized, RequestAttempted: true}
 	}
 	return f
+}
+
+func TestSub2RecoverySettingsRuntimeStatus(t *testing.T) {
+	for _, scenario := range []string{"running", "disabled", "storage_failure", "stopped", "unconfigured", "transient_error"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newRecoveryFixture(t, false)
+			s := f.service
+			s.autoRecovery.Store(true)
+			next := time.Now().Add(time.Minute)
+			s.monitorState.NextScanAt = &next
+			s.monitorState.Scanning = true
+			wantReason := ""
+			switch scenario {
+			case "disabled":
+				s.autoRecovery.Store(false)
+			case "storage_failure":
+				if _, err := f.db.Exec(`CREATE TRIGGER settings_storage_failure BEFORE UPDATE ON account_recovery_tasks BEGIN SELECT RAISE(ABORT,'storage failure'); END`); err != nil {
+					t.Fatal(err)
+				}
+				if s.setState(f.task.ID, store.RecoveryValidating, "") {
+					t.Fatal("expected injected storage failure")
+				}
+				wantReason = "恢复任务存储故障"
+				for _, enabled := range []string{"false", "true"} {
+					request := httptest.NewRequest(http.MethodPut, "/api/account-recovery/settings", strings.NewReader(`{"enabled":`+enabled+`}`))
+					request.Header.Set("Content-Type", "application/json")
+					response := httptest.NewRecorder()
+					s.handleAction(response, request)
+					if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"running":false`) || !strings.Contains(response.Body.String(), wantReason) {
+						t.Fatalf("toggling settings hid storage failure: %d %s", response.Code, response.Body.String())
+					}
+				}
+			case "stopped":
+				s.cancel()
+				wantReason = "恢复服务已停止"
+			case "unconfigured":
+				s.sub2 = nil
+				wantReason = "Sub2 恢复服务未配置"
+			case "transient_error":
+				s.monitorState.LastError = "Sub2 状态同步失败，下次扫描重试"
+			}
+			response := httptest.NewRecorder()
+			s.handleAction(response, httptest.NewRequest(http.MethodGet, "/api/account-recovery/settings", nil))
+			var settings struct {
+				Enabled       bool       `json:"auto_recovery_enabled"`
+				Running       bool       `json:"running"`
+				BlockedReason string     `json:"blocked_reason"`
+				NextScanAt    *time.Time `json:"next_scan_at"`
+				Scanning      bool       `json:"scanning"`
+				LastError     string     `json:"last_error"`
+			}
+			if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &settings) != nil {
+				t.Fatalf("settings response: %d %s", response.Code, response.Body.String())
+			}
+			wantEnabled := scenario != "disabled"
+			wantRunning := wantEnabled && wantReason == ""
+			if settings.Enabled != wantEnabled || settings.Running != wantRunning || settings.Scanning != wantRunning || (settings.NextScanAt != nil) != wantRunning {
+				t.Fatalf("incorrect runtime status: %s", response.Body.String())
+			}
+			if (wantReason == "" && settings.BlockedReason != "") || !strings.Contains(settings.BlockedReason, wantReason) {
+				t.Fatalf("blocked reason=%q want=%q", settings.BlockedReason, wantReason)
+			}
+			if scenario == "transient_error" && settings.LastError == "" {
+				t.Fatal("transient scan error was hidden")
+			}
+		})
+	}
 }
 
 func TestSub2MonitorEnableScansChecksAndRecovers(t *testing.T) {
@@ -380,15 +448,104 @@ func TestSub2MonitorRecoversMissingLocalCredentials(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if returnedWorkspace == "workspace" {
-				if got.State != store.RecoveryCompleted || got.ResultCredentialAttemptID <= 0 || f.loginCalls != 1 || f.applyCalls != 1 || !f.schedule {
-					t.Fatalf("first-login recovery=%+v login=%d apply=%d schedule=%v", got, f.loginCalls, f.applyCalls, f.schedule)
+			if got.State != store.RecoveryCompleted || got.ResultCredentialAttemptID <= 0 || f.loginCalls != 1 || f.applyCalls != 1 || !f.schedule || f.detailWorkspace != returnedWorkspace {
+				t.Fatalf("first-login recovery=%+v login=%d apply=%d schedule=%v workspace=%s", got, f.loginCalls, f.applyCalls, f.schedule, f.detailWorkspace)
+			}
+		})
+	}
+}
+
+func TestSub2MonitorAfterCompletedTaskChecksNewFailure(t *testing.T) {
+	for _, purpose := range []string{"recovery", "delivery"} {
+		t.Run(purpose, func(t *testing.T) {
+			ctx := context.Background()
+			var f *recoveryFixture
+			if purpose == "delivery" {
+				var delivery *accountDeliveryService
+				f, delivery, _ = newDeliveryFixture(t)
+				delivery.runOnce()
+				var err error
+				f.task, err = f.store.GetLatestAccountRecoveryTask(ctx, f.account.ID)
+				if err != nil || f.task.Purpose != "delivery" {
+					t.Fatalf("delivery handoff=%+v err=%v", f.task, err)
 				}
 			} else {
-				version, err := f.store.GetAccountCredentialVersion(ctx, f.account.ID)
-				if err != nil || version != 0 || got.State == store.RecoveryCompleted || f.applyCalls != 0 || f.schedule {
-					t.Fatalf("wrong workspace applied: recovery=%+v version=%d apply=%d schedule=%v err=%v", got, version, f.applyCalls, f.schedule, err)
-				}
+				f = newRecoveryFixture(t, true)
+			}
+			f.service.process(f.task)
+			if got := f.state(t); got.State != store.RecoveryCompleted {
+				t.Fatalf("initial operation=%+v", got)
+			}
+			forceDueRecheck(t, f)
+			if !f.service.processNextRecheck() || currentRecheck(t, f).Round != 2 {
+				t.Fatal("first successful recheck did not schedule round two")
+			}
+			f.service.autoRecovery.Store(true)
+			f.service.checker = newAccountCheckService(f.store, "", "")
+			t.Cleanup(f.service.checker.Stop)
+			checks, err := f.store.ListAccountChecks(ctx, f.account.ID, 20)
+			if err != nil || len(checks) != 1 || checks[0].Freshness != "stale" {
+				t.Fatalf("old 401 must be stale after login: checks=%+v err=%v", checks, err)
+			}
+			// A successful operation must not reuse the previous token's 401.
+			f.service.enqueueAutomatic(f.account.ID)
+			f.service.scanSub2Accounts()
+			if _, active, err := f.store.GetActiveAccountRecoveryTask(ctx, f.account.ID); err != nil || active {
+				t.Fatalf("stale 401 queued another recovery: active=%v err=%v", active, err)
+			}
+			f.mu.Lock()
+			f.detailStatus, f.detailError, f.schedule = "error", "Token revoked (401)", false
+			f.mu.Unlock()
+			f.service.scanSub2Accounts()
+			work, err := f.store.ClaimAccountCheck(ctx)
+			if err != nil || work == nil || work.Check.ID == checks[0].ID {
+				t.Fatalf("new Sub2 failure after success did not queue a fresh AUTH check: work=%+v err=%v summary=%s", work, err, f.service.monitorState.Summary)
+			}
+			if _, active, err := f.store.GetActiveAccountRecoveryTask(ctx, f.account.ID); err != nil || active {
+				t.Fatalf("Sub2 error alone reused stale 401: active=%v err=%v", active, err)
+			}
+		})
+	}
+}
+
+func TestSub2MonitorAfterCompletedTaskRecoversCurrent401(t *testing.T) {
+	for _, path := range []string{"scan_error", "scan_active", "automatic_callback"} {
+		t.Run(path, func(t *testing.T) {
+			ctx := context.Background()
+			f := newRecoveryFixture(t, true)
+			f.service.process(f.task)
+			completed := f.state(t)
+			if completed.State != store.RecoveryCompleted {
+				t.Fatalf("initial recovery=%+v", completed)
+			}
+			_, _, err := f.store.CreateAccountCheckBatch(ctx, store.AccountCheckInput{
+				RequestKey: "after-completed", AccountIDs: []int64{f.account.ID}, Concurrency: 1, ProxyMode: "direct",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			work, err := f.store.ClaimAccountCheck(ctx)
+			if err != nil || work == nil {
+				t.Fatalf("new credential check=%+v err=%v", work, err)
+			}
+			status := http.StatusUnauthorized
+			if _, err := f.store.FinishAccountCheck(ctx, work.Check.ID, store.AccountCheckResult{Outcome: "unauthorized", HTTPStatus: &status}); err != nil {
+				t.Fatal(err)
+			}
+			f.service.autoRecovery.Store(true)
+			if path == "scan_error" {
+				f.mu.Lock()
+				f.detailStatus, f.detailError, f.schedule = "error", "Token revoked (401)", false
+				f.mu.Unlock()
+			}
+			if path == "automatic_callback" {
+				f.service.enqueueAutomatic(f.account.ID)
+			} else {
+				f.service.scanSub2Accounts()
+			}
+			task, active, err := f.store.GetActiveAccountRecoveryTask(ctx, f.account.ID)
+			if err != nil || !active || task.ID == completed.ID || task.CheckID != work.Check.ID || task.SourceCredentialAttemptID != completed.ResultCredentialAttemptID {
+				t.Fatalf("current 401 after success did not queue a new recovery: task=%+v active=%v err=%v", task, active, err)
 			}
 		})
 	}

@@ -64,21 +64,23 @@ type Failure struct {
 // Account contains safe account metadata. It never contains passwords, TOTP,
 // access tokens, refresh tokens, or proxy credentials.
 type Account struct {
-	ID               int64     `json:"id"`
-	Email            string    `json:"email"`
-	Status           string    `json:"status"`
-	ChatGPTAccountID string    `json:"chatgpt_account_id,omitempty"`
-	OrganizationID   string    `json:"organization_id,omitempty"`
-	PlanType         string    `json:"plan_type,omitempty"`
-	ExpiresAt        int64     `json:"expires_at,omitempty"`
-	LastErrorCode    string    `json:"last_error_code,omitempty"`
-	LastError        string    `json:"last_error,omitempty"`
-	LastHTTPStatus   int       `json:"last_http_status,omitempty"`
-	AttemptCount     int       `json:"attempt_count"`
-	LastAttemptAt    time.Time `json:"last_attempt_at,omitempty"`
-	LastSuccessAt    time.Time `json:"last_success_at,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID                   int64     `json:"id"`
+	Email                string    `json:"email"`
+	Status               string    `json:"status"`
+	ChatGPTAccountID     string    `json:"chatgpt_account_id,omitempty"`
+	OrganizationID       string    `json:"organization_id,omitempty"`
+	PlanType             string    `json:"plan_type,omitempty"`
+	ExpiresAt            int64     `json:"expires_at,omitempty"`
+	LastErrorCode        string    `json:"last_error_code,omitempty"`
+	LastError            string    `json:"last_error,omitempty"`
+	LastHTTPStatus       int       `json:"last_http_status,omitempty"`
+	AttemptCount         int       `json:"attempt_count"`
+	RecoveryCount        int       `json:"recovery_count"`
+	RecoveryAttemptCount int       `json:"recovery_attempt_count"`
+	LastAttemptAt        time.Time `json:"last_attempt_at,omitempty"`
+	LastSuccessAt        time.Time `json:"last_success_at,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 // Attempt is a login attempt's safe metadata. Release must be called by the
@@ -184,6 +186,10 @@ func Open(dbPath, keyPath string) (*Store, error) {
 		return nil, err
 	}
 	if err = s.migrateAccountRecoveryTasks(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err = s.migrateAccountDeliveries(); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -761,14 +767,14 @@ func (s *Store) GetAccountByID(ctx context.Context, id int64) (Account, error) {
 	return scanAccount(row)
 }
 
-const accountSelect = `SELECT id,email,status,COALESCE(chatgpt_account_id,''),COALESCE(organization_id,''),COALESCE(plan_type,''),expires_at,COALESCE(last_error_code,''),COALESCE(last_error,''),last_http_status,attempt_count,(SELECT COALESCE(MAX(started_at),0) FROM login_attempts la WHERE la.account_id=accounts.id),last_success_at,created_at,updated_at FROM accounts`
+const accountSelect = `SELECT id,email,status,COALESCE(chatgpt_account_id,''),COALESCE(organization_id,''),COALESCE(plan_type,''),expires_at,COALESCE(last_error_code,''),COALESCE(last_error,''),last_http_status,attempt_count,(SELECT COALESCE(MAX(started_at),0) FROM login_attempts la WHERE la.account_id=accounts.id),last_success_at,created_at,updated_at,COALESCE((SELECT COUNT(*) FROM account_recovery_tasks rt WHERE rt.account_id=accounts.id AND rt.purpose='recovery'),0),COALESCE((SELECT COUNT(*) FROM account_recovery_tasks rt WHERE rt.account_id=accounts.id AND rt.purpose='recovery' AND rt.state='completed'),0) FROM accounts`
 
 type scanner interface{ Scan(...interface{}) error }
 
 func scanAccount(row scanner) (Account, error) {
 	var a Account
 	var lastAttempt, lastSuccess, created, updated int64
-	if err := row.Scan(&a.ID, &a.Email, &a.Status, &a.ChatGPTAccountID, &a.OrganizationID, &a.PlanType, &a.ExpiresAt, &a.LastErrorCode, &a.LastError, &a.LastHTTPStatus, &a.AttemptCount, &lastAttempt, &lastSuccess, &created, &updated); err != nil {
+	if err := row.Scan(&a.ID, &a.Email, &a.Status, &a.ChatGPTAccountID, &a.OrganizationID, &a.PlanType, &a.ExpiresAt, &a.LastErrorCode, &a.LastError, &a.LastHTTPStatus, &a.AttemptCount, &lastAttempt, &lastSuccess, &created, &updated, &a.RecoveryAttemptCount, &a.RecoveryCount); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Account{}, ErrAccountNotFound
 		}
