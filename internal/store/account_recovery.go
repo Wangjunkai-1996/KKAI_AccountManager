@@ -72,10 +72,11 @@ type RecoveryFailure struct {
 	RetryAction  string
 	NextRetryAt  *time.Time
 	ManualAction string
-	// ExpectedState and ExpectedUpdatedAt optionally fence a late worker result
-	// to the task snapshot it observed before making a remote request.
-	ExpectedState     string
-	ExpectedUpdatedAt int64
+	// ExpectedState enables a snapshot fence. RetryCount distinguishes failed
+	// rounds even when their state and millisecond timestamp are identical.
+	ExpectedState      string
+	ExpectedUpdatedAt  int64
+	ExpectedRetryCount int
 }
 
 func (s *Store) migrateAccountRecoveryTasks() error {
@@ -401,8 +402,8 @@ func (s *Store) RecordAccountRecoveryFailure(ctx context.Context, id int64, fail
 	query := `UPDATE account_recovery_tasks SET state=?,last_error=?,failure_stage=?,error_code=?,retry_action=?,next_retry_at=?,retry_count=retry_count+1,manual_action=?,updated_at=? WHERE id=? AND state NOT IN ('completed','canceled')`
 	args := []any{failure.State, strings.TrimSpace(failure.Message), strings.TrimSpace(failure.Stage), strings.TrimSpace(failure.Code), failure.RetryAction, next, strings.TrimSpace(failure.ManualAction), time.Now().UnixMilli(), id}
 	if strings.TrimSpace(failure.ExpectedState) != "" {
-		query += ` AND state=?`
-		args = append(args, strings.TrimSpace(failure.ExpectedState))
+		query += ` AND state=? AND retry_count=?`
+		args = append(args, strings.TrimSpace(failure.ExpectedState), failure.ExpectedRetryCount)
 	}
 	if failure.ExpectedUpdatedAt > 0 {
 		query += ` AND updated_at=?`

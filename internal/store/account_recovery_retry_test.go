@@ -63,6 +63,40 @@ func TestRecoveryRetryPolicyPersistsAndClears(t *testing.T) {
 	}
 }
 
+func TestRecoveryFailureSnapshotRejectsSameMillisecondNewRound(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	id := checkTestAccount(t, s, "retry-failure-aba")
+	task, _, err := s.CreateOrGetAccountRecoveryTask(ctx, id, 0, 42, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := RecoveryFailure{State: RecoveryUnknown, Stage: RecoveryLoggingIn, Code: "network_error", RetryAction: "relogin"}
+	old, err := s.RecordAccountRecoveryFailure(ctx, task.ID, failure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RetryAccountRecoveryTask(ctx, task.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimAccountRecoveryTask(ctx, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.RecordAccountRecoveryFailure(ctx, task.ID, failure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE account_recovery_tasks SET updated_at=? WHERE id=?`, old.UpdatedAt.UnixMilli(), task.ID); err != nil {
+		t.Fatal(err)
+	}
+	failure.ExpectedState, failure.ExpectedUpdatedAt, failure.ExpectedRetryCount = old.State, old.UpdatedAt.UnixMilli(), old.RetryCount
+	failure.Code = "identity_changed"
+	got, err := s.RecordAccountRecoveryFailure(ctx, task.ID, failure)
+	if !errors.Is(err, ErrAccountRecoveryStale) || got.RetryCount != current.RetryCount || got.ErrorCode != current.ErrorCode {
+		t.Fatalf("same-millisecond stale snapshot accepted: %+v err=%v", got, err)
+	}
+}
+
 func TestRecoveryRetryCheckpointNeverAdoptsNewerLogin(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()

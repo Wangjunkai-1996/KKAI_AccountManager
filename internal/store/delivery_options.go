@@ -138,7 +138,25 @@ func (s *Store) QueueAccountDelivery(ctx context.Context, accountID int64, desti
 	defer tx.Rollback()
 	existing, lookupErr := scanAccountDelivery(tx.QueryRowContext(ctx, accountDeliverySelect+` WHERE destination_key=? AND account_id=? AND credential_version=?`, destination, accountID, version))
 	if lookupErr == nil {
-		if existing.State == "requires_action" && existing.RecoveryTaskID == 0 {
+		if existing.State == "canceled" {
+			return existing, ErrAccountDeliverySettled
+		}
+		if existing.RecoveryTaskID > 0 {
+			// The delivery row stays verifying after handoff; its recovery task
+			// carries the current action/cancellation state shown in the UI.
+			var state, action, manual string
+			if err := tx.QueryRowContext(ctx, `SELECT state,retry_action,manual_action FROM account_recovery_tasks WHERE id=?`, existing.RecoveryTaskID).Scan(&state, &action, &manual); err != nil {
+				return existing, err
+			}
+			if state == RecoveryCanceled {
+				return existing, ErrAccountDeliverySettled
+			}
+			if existing.State == "requires_action" || action == "manual" || manual != "" {
+				return existing, ErrAccountDeliveryRequiresAction
+			}
+			return existing, nil
+		}
+		if existing.State == "requires_action" {
 			// A requires_action delivery can be corrected in place only while no
 			// import intent exists. Once an import row exists, its payload and
 			// idempotency key may already have been sent to Sub2; replacing the

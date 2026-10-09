@@ -716,8 +716,8 @@ function historyRefreshDelay() {
     const checking = [...historyChecks.values()].some(item => ['queued', 'running'].includes(item.latest_task?.state));
     const recovering = [...historyRecoveries.values()].some(item => historyRecoveryActive(item));
     const delivering = [...historyDeliveries.values()].some(item => ['queued', 'checking', 'importing', 'verifying', 'working'].includes(item.state));
-    const repairing = [...historyRepairs.values()].some(item => ['queued', 'checking', 'retry_wait'].includes(item.state));
-    const waiting = [...historyRecoveries.values(), ...historyDeliveries.values()].some(item => item.next_retry_at && !item.requires_action && !['completed', 'success', 'canceled'].includes(item.state));
+    const repairing = [...historyRepairs.values()].some(item => ['queued', 'checking'].includes(item.state));
+    const waiting = [...historyRecoveries.values(), ...historyDeliveries.values(), ...historyRepairs.values()].some(item => item.next_retry_at && !item.requires_action && !['completed', 'success', 'canceled'].includes(item.state));
     return checking || recovering || delivering || repairing || historyRecoveryRequests.size || recoverySettings.scanning ? 5000
         : recoverySettings.autoRecoveryEnabled || waiting ? 60000 : 5 * 60000;
 }

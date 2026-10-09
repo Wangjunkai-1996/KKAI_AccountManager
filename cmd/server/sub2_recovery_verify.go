@@ -108,20 +108,18 @@ func recoveryRetryAfter(raw string) int {
 }
 
 // parseRecoveryWrappedError accepts the exact error string emitted by Sub2's
-// account-test endpoint when an upstream request fails.  The status and JSON
-// body are both validated before they are used as probe evidence; arbitrary
-// text containing "401" must remain an opaque probe failure.
+// account-test endpoint when an upstream request fails. Its status is authoritative;
+// a JSON body can provide a more specific code but cannot replace that status.
 func parseRecoveryWrappedError(raw string) (status int, code string, ok bool) {
 	const prefix = "API returned "
 	if !strings.HasPrefix(raw, prefix) {
 		return 0, "", false
 	}
 	rest := strings.TrimPrefix(raw, prefix)
-	separator := strings.Index(rest, ": ")
-	if separator <= 0 || separator == len(rest)-2 {
+	if len(rest) < 4 || rest[3] != ':' {
 		return 0, "", false
 	}
-	statusRaw := rest[:separator]
+	statusRaw := rest[:3]
 	if strings.Trim(statusRaw, "0123456789") != "" {
 		return 0, "", false
 	}
@@ -130,23 +128,19 @@ func parseRecoveryWrappedError(raw string) (status int, code string, ok bool) {
 		return 0, "", false
 	}
 	var envelope struct {
-		Code       string          `json:"code"`
-		Status     int             `json:"status"`
-		StatusCode int             `json:"status_code"`
-		Error      json.RawMessage `json:"error"`
+		Code  string          `json:"code"`
+		Error json.RawMessage `json:"error"`
 	}
-	if json.Unmarshal([]byte(strings.TrimSpace(rest[separator+2:])), &envelope) != nil {
-		return 0, "", false
+	if json.Unmarshal([]byte(strings.TrimSpace(rest[4:])), &envelope) != nil {
+		return status, "", true
 	}
 	if envelope.Code != "" {
 		code = envelope.Code
 	}
 	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
 		var nested struct {
-			Code       string `json:"code"`
-			Type       string `json:"type"`
-			Status     int    `json:"status"`
-			StatusCode int    `json:"status_code"`
+			Code string `json:"code"`
+			Type string `json:"type"`
 		}
 		if json.Unmarshal(envelope.Error, &nested) == nil {
 			if nested.Code != "" {
@@ -154,17 +148,7 @@ func parseRecoveryWrappedError(raw string) (status int, code string, ok bool) {
 			} else if nested.Type != "" {
 				code = nested.Type
 			}
-			if nested.Status != 0 {
-				status = nested.Status
-			} else if nested.StatusCode != 0 {
-				status = nested.StatusCode
-			}
 		}
-	}
-	if envelope.Status != 0 {
-		status = envelope.Status
-	} else if envelope.StatusCode != 0 {
-		status = envelope.StatusCode
 	}
 	return status, code, true
 }
@@ -206,6 +190,7 @@ func recoveryProbeEventError(payload []byte) *recoveryOperationError {
 		} else {
 			var code string
 			if json.Unmarshal(event.Error, &code) == nil {
+				event.Code = code
 				if status, wrappedCode, ok := parseRecoveryWrappedError(code); ok {
 					event.Status = status
 					event.Code = wrappedCode

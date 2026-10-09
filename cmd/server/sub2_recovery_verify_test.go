@@ -105,6 +105,8 @@ func TestRecoveryVerifyErrorClassification(t *testing.T) {
 		invalid, manual  bool
 	}{
 		{"revoked", `{"type":"error","error":{"code":"token_revoked","status":401,"message":"at-secret"}}`, "credential_invalid", true, false},
+		{"string_revoked", `{"type":"error","error":"token_revoked"}`, "credential_invalid", true, false},
+		{"string_invalid", `{"type":"error","error":"invalid_token"}`, "credential_invalid", true, false},
 		{"upstream_401", `{"type":"error","status":401}`, "credential_invalid", true, false},
 		{"disabled", `{"type":"error","error":{"code":"account_deactivated","status":401}}`, "account_unavailable", false, true},
 		{"wrapped_upstream_401", `{"type":"error","error":"API returned 401: {\"error\":{\"code\":\"token_revoked\"}}"}`, "credential_invalid", true, false},
@@ -133,6 +135,40 @@ func TestRecoveryVerifyErrorClassification(t *testing.T) {
 		if failure.CredentialInvalid || failure.HTTPStatus != status || failure.RetryAfterSeconds != 180 || failure.RequiresAction != (status < 429) {
 			t.Fatalf("management failure mistaken for model failure: %+v", failure)
 		}
+	}
+}
+
+func TestRecoveryVerifyWrappedError(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw, code string
+		status          int
+		invalid, manual bool
+	}{
+		{"text_body", "API returned 401: unauthorized at-secret", "credential_invalid", 401, true, false},
+		{"empty_body", "API returned 401:", "credential_invalid", 401, true, false},
+		{"no_space_body", "API returned 401:unauthorized", "credential_invalid", 401, true, false},
+		{"disabled", `API returned 401: {"error":{"code":"account_disabled","status":503}}`, "account_unavailable", 401, false, true},
+		{"body_status_ignored", `API returned 401: {"status":503,"status_code":502,"error":{"status":429,"status_code":403}}`, "credential_invalid", 401, true, false},
+		{"body_cannot_create_401", `API returned 503: {"status":401,"error":{"status_code":401}}`, "upstream_error", 503, false, false},
+		{"wrong_prefix", "HTTP 401: at-secret", "probe_failed", 0, false, false},
+		{"embedded_prefix", "failure: API returned 401: at-secret", "probe_failed", 0, false, false},
+		{"missing_colon", "API returned 401 at-secret", "probe_failed", 0, false, false},
+		{"four_digits", "API returned 0401: at-secret", "probe_failed", 0, false, false},
+		{"suffix_digit", "API returned 4010: at-secret", "probe_failed", 0, false, false},
+		{"signed_status", "API returned +401: at-secret", "probe_failed", 0, false, false},
+		{"low_status", "API returned 099: at-secret", "probe_failed", 0, false, false},
+		{"high_status", "API returned 600: at-secret", "probe_failed", 0, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := json.Marshal(map[string]any{"type": "error", "error": tc.raw})
+			if err != nil {
+				t.Fatal(err)
+			}
+			failure := recoveryProbeEventError(payload)
+			if failure.Code != tc.code || failure.HTTPStatus != tc.status || failure.CredentialInvalid != tc.invalid || failure.RequiresAction != tc.manual || strings.Contains(failure.Error(), "at-secret") {
+				t.Fatalf("wrong or unsafe classification: %+v", failure)
+			}
+		})
 	}
 }
 

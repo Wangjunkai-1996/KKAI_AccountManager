@@ -838,7 +838,7 @@ func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTa
 	// new round. Active workers are allowed to advance through states locally,
 	// so only failed/unknown snapshots get this early stale check.
 	if (task.State == store.RecoveryFailed || task.State == store.RecoveryUnknown) &&
-		(current.State != task.State || current.UpdatedAt.UnixMilli() != task.UpdatedAt.UnixMilli()) {
+		(current.State != task.State || current.UpdatedAt.UnixMilli() != task.UpdatedAt.UnixMilli() || current.RetryCount != task.RetryCount) {
 		return
 	}
 	failure := classifyRecoveryError(err)
@@ -861,6 +861,7 @@ func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTa
 	}
 	record.ExpectedState = current.State
 	record.ExpectedUpdatedAt = current.UpdatedAt.UnixMilli()
+	record.ExpectedRetryCount = current.RetryCount
 	if _, err := s.store.RecordAccountRecoveryFailure(ctx, task.ID, record); err != nil {
 		// A late result losing the CAS is expected during a manual requeue or
 		// completion. It is not a storage failure and must not globally pause
@@ -938,14 +939,12 @@ func (s *sub2RecoveryService) verifyRecoveryRetry(ctx context.Context, task stor
 	workerPauseConfirmed := task.FailureStage == store.RecoveryLoggingIn ||
 		task.FailureStage == store.RecoveryLoginSucceeded ||
 		task.FailureStage == store.RecoveryIdentityVerified ||
-		task.FailureStage == store.RecoveryApplyingCredentials ||
-		task.FailureStage == store.RecoveryCredentialsApplied ||
-		task.FailureStage == store.RecoveryEnablingSchedule
+		task.FailureStage == store.RecoveryApplyingCredentials
 	if !scheduled && strings.EqualFold(status, "active") {
 		// A saved checkpoint must still prove the same remote identity. If a
 		// marker was present and no longer matches, treat it as ownership loss;
 		// the worker's old pause does not authorize retrying another account.
-		if workerPauseConfirmed && originalMarker {
+		if beforeApply && workerPauseConfirmed && originalMarker {
 			return nil
 		}
 		return &recoveryOperationError{Code: "manual_pause", RequiresAction: true}
