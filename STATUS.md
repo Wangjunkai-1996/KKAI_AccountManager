@@ -2,7 +2,15 @@
 
 更新时间：2026-10-10（Asia/Shanghai）
 
-## 当前发布：后续审查整改（2026-10-10）
+## 浏览器与交付修复（2026-10-10）
+
+当前 release 为 `20261010T104000Z-runtime-delivery-fix`，源码 `f2d13b2` 已推送 `origin/main`。修复 Node 复制权限导致浏览器秒失败，固化真实服务用户的 Node/driver/原生及有头、无头浏览器发布验收；无头模式可使用系统 Chrome，容器保留 bundled Chromium 回退；运行环境权限故障按持久退避自动恢复。
+
+交付普通检测失败改为 30 秒、60 秒，再按 5 分钟起指数退避；仅作用于交付 `probe_failed` 且无 Retry-After，429 与上游等待要求保持。到期后受每 60 秒扫描和 worker 队列影响，不承诺精确 30 秒完成。账号锁忙只延后 2 秒、不计失败，避免队首阻塞；前端不再吞掉完成后的刷新，并显示重试原因及到期状态。
+
+截图中的三条交付已有两条完成；另一条 Sub2 检测通过，但当前分组 [12,13] 与原提交 [12,44] 冲突，保持暂停并等待用户选择。此项不能通过缩短重试或绕过分组保护解决。完整发布、验证命令与证据见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。以下为历史记录。
+
+## 历史发布：后续审查整改（2026-10-10）
 
 线上 `20261010T093908Z-lifecycle-migration-hardening`，源码 `f28a11e` 已推送。完成多目标恢复/检测/历史隔离与旧库升级、优雅停机、数据库 readiness、历史缓存、实时监控及 Docker 持久化/浏览器运行环境整改。回滚保留 `20261010T044103Z-destination-isolation`。
 
@@ -95,19 +103,19 @@
 | 服务 | `openai-login.service` |
 | sys1 本机监听 | `127.0.0.1:18082` |
 | Mac 隧道 | `./open-sys1.sh` |
-| 当前 release | `20261009T054200Z-recovery-final` |
-| 回滚 release | `20261009T053050Z-recovery-delivery-races` |
-| 当前来源 | 代码提交 `53bde86`，已推送 `origin/main`；随后提交发布记录 |
+| 当前 release | `20261010T104000Z-runtime-delivery-fix` |
+| 回滚 release | `20261010T093908Z-lifecycle-migration-hardening` |
+| 当前来源 | 代码提交 `f2d13b2`，已推送 `origin/main`；随后提交发布记录 |
 | 数据库 | `/var/lib/openai-login/data/accounts.db` |
 | 密钥 | `/var/lib/openai-login/data/accounts.key` |
 | 最近健康检查 | 发布后复核：active/running，NRestarts=0，`/health` 返回 `status: ok`，入口 socket HTTP 200，回滚就绪 |
-| 数据库备份（当前 release 发布前） | `/var/lib/openai-login/backups/accounts-before-20261009T054200Z-recovery-final.db`，0600，integrity_check=ok |
-| 当前二进制 SHA-256 | `1f8cab2c57223d111797023e9f54074c8d7f9641f4eda6bf29e11cb9a315cbe7` |
+| 数据库备份（当前 release 发布前） | `/var/lib/openai-login/backups/accounts-before-20261010T104000Z-runtime-delivery-fix.db`，0600，integrity_check=ok |
+| 当前二进制 SHA-256 | `19e471fc9515e1ac10414e3008a1d29ce1c2eb09a206412fb0f07016e775b274` |
 | 导入配置 | `sub2_configured=true`；使用 Sub2 既有接口，Sub2 源码和线上版本未改 |
 | 公网身份验证 | 有效入口 socket HTTP 200，公网未认证 HTTP 401；未验证认证后公网业务 |
-| 本轮功能验收 | 八项审查修复已上线；正式回归/race/Node、候选及回滚兼容通过；未人为触发真实 OAuth 或生产故障 |
+| 本轮功能验收 | 运行环境与交付修复已上线；定向 race/Node、候选/回滚/生产浏览器通过；生产完整 OAuth 8,110ms 成功 |
 | 自动恢复设置 | 生产自动恢复 `enabled` 并保存到 SQLite，立即及每 60 秒后台扫描，页面关闭后继续 |
-| 线上快照（2026-10-09 13:46:24 上海时间） | accounts 71、recovery tasks 86、deliveries 16、rechecks 26、repairs 0；auto recovery enabled/running，巡检继续，错误聚合 0 |
+| 线上快照（2026-10-10 18:39:50 上海时间） | accounts 116、recovery tasks 195、deliveries 61、rechecks 120、repairs 0；auto recovery enabled/running，巡检继续，错误聚合 0 |
 | sys1 IPv4 模型检测（历史） | 此前真实 HTTP200 / 完整模型完成事件，1,982ms |
 | 默认代理模型检测（历史） | 此前单账号连续两次成功；候选两个账号并发2正常，重叠3,035ms |
 | 浏览器直连历史限制 | 授权流程曾收到 `403 + cf-mitigated: challenge`；不可将该浏览器结论套用到模型检测 |

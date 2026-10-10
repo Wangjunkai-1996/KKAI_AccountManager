@@ -1,5 +1,39 @@
 # sys1 线上部署说明
 
+## 浏览器运行环境与交付修复发布（2026-10-10 18:38 上海时间）
+
+- `2026-10-10T10:38:03Z` 切换至 `20261010T104000Z-runtime-delivery-fix`，源码 `f2d13b268525e3574893873a3b403bb33d48dfa7` 已推送 `origin/main`。Linux amd64 SHA-256：`19e471fc9515e1ac10414e3008a1d29ce1c2eb09a206412fb0f07016e775b274`。只发布 AUTH；Sub2 源码、配置和版本未修改。
+- Node 复制明确设置 `0755`；新增 `verify-runtime.sh`，要求真实 systemd 服务用户执行 Node、Playwright CLI 和原生/有头/无头浏览器 smoke。候选、回滚、切换后均在真实服务挂载命名空间及显示环境通过。系统 Chrome 可用于 headless，缺少系统 Chrome 时保留 bundled fallback；本轮未构建 Docker 或验收容器浏览器。
+- `fork/exec` 权限拒绝显示 `browser_runtime_permission` 固定文案，不泄漏路径；单次登录不盲目重试，后台恢复以 5 分钟起步持久退避，环境修好后可继续，不误落入账号人工处理。
+- 仅交付任务 `probe_failed` 且没有 Retry-After，按 30 秒、60 秒、5 分钟、10 分钟、20 分钟、40 分钟、1 小时退避；429、协议错误、自动恢复及上游明确等待要求保持旧策略。到期仍由每 60 秒巡检入队，再由 worker 执行，期限不等于完成时间。已保存的旧重试期限不批量改写。
+- 锁忙交付保持 queued、延后 2 秒且不计失败；前五条占锁不会阻塞第六条。前端合并在途刷新后的下一轮请求，避免完成状态被旧快照覆盖；等待显示后端安全原因，过期时间改为“已到重试时间，等待后台执行”并每 5 秒刷新。
+- 三条用户反馈的交付在几秒内已导入。task 225 首轮完成、226 首轮检测失败后于 10:13 UTC 完成；224 两次 `probe_failed`，第三次检测成功，但实际分组 `[12,13]` 与提交目标 `[12,44]` 不符，在分组保护处停止。邮箱、workspace、organization、plan、expiry、import/recovery marker 均匹配；尚未收到用户对分组取舍的答复，未覆盖远端分组或解除调度暂停。
+- 候选副本 116 账号、自动恢复关闭、Sub2 未配置；候选完整 IPv4 OAuth 7,535ms 成功，凭据仅写候选库。候选 health/ready、静态资源、SQLite 完整性和回滚 schema 兼容通过。切换前后登录/导入/恢复/检测/交付/资料任务/复检在途均为 0。
+- 备份 `/var/lib/openai-login/backups/accounts-before-20261010T104000Z-runtime-delivery-fix.db`，3,039,232 字节、0600、integrity_check=ok。回滚保留 `20261010T093908Z-lifecycle-migration-hardening`（已修复 Node 权限），SHA-256 `3fe7edd98296f477761306a6af4962de8e289752c3c58728a3c9cbb7ade24e67`；不回退覆盖数据库。
+- `10:38:44–10:38:52 UTC` 正式服务历史账号 279 IPv4、auto_deliver=false 完整 OAuth 成功，8,110ms，attempt 472 为 success、AT/RT 已持久化。`10:39:50 UTC` 延迟验收 active/running、NRestarts=0、实际二进制匹配、health/ready/socket正常、巡检推进至 10:39:04；公网未认证 HTTP401，有效 AUTH 路由 `/run/tls/auth/login.sock`，静态资源 hash 匹配。启动以来浏览器权限/启动失败、登录失败、panic/fatal、数据库锁、存储/监听、OAuth401/403/5xx 聚合均为 0。
+- 正式 release 保留 `DEPLOYMENT.json`、`CANDIDATE_ACCEPTANCE.json`、`CANDIDATE_LOGIN.json`、`CANDIDATE_RUNTIME.txt`、`ROLLBACK_RUNTIME.txt`、`ACCEPTANCE.json`、`LOGIN_ACCEPTANCE.json`、`PRODUCTION_RUNTIME.txt`、`DELAYED_ACCEPTANCE.json`。临时候选及未发布的中间产物清理，正式、回滚及备份保留。
+- 定向 race、Go/vet、Node、shell 检查通过。未运行仓库完整套件；未人为触发真实 Challenge、故意让新生产交付失败或以新账号验证本次 30 秒退避。Sub2 初次 SSE 失败原始原因未持久化，现有证据只能确认 `probe_failed`，不能据此归因为特定上游状态。
+
+最终相关验证命令（均通过；远端临时脚本清理后下列为执行记录）：
+
+```bash
+go test -race ./internal/login ./cmd/server -run 'Test(Browser|ShouldUseNativeChrome|FindSystemChrome|WaitForChromeCDP|DescribeError|Sub2RecoveryBrowserPermission|RecoveryLogin|RecoveryRetry)' -count=1 -timeout=120s
+go test -race ./cmd/server -run 'Test(AccountDelivery|DeliveryProbe|Sub2RecoveryBrowserPermission|RecoveryRetry)' -count=1 -timeout=120s
+go test -race ./cmd/server -run '^TestAccountDelivery(BusyWaitsForNextTickWithoutFailure|BusyBatchDoesNotStarveFollowingTask|NonBusyLeaseErrorIsRecorded)$' -count=1 -timeout=120s
+go vet ./internal/login ./cmd/server
+node --check cmd/server/client.js
+node cmd/server/client.test.cjs
+bash -n verify-runtime.sh
+shellcheck verify-runtime.sh
+git diff --check
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c ./internal/login -o /tmp/kkai-auth-login-smoke.test
+./build-linux.sh /tmp/openai-login-20261010T104000Z-runtime-delivery-fix
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-stage-runtime-delivery-fix.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-deploy-runtime-delivery-fix.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-real-login-runtime-delivery-fix.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-verify-runtime-delivery-fix.py'
+```
+
 ## 浏览器启动故障恢复（2026-10-10 18:04 上海时间）
 
 - 17:51 发布复制旧 release 的 Node 时，仅核对内容 hash。旧文件是服务用户所有、`0700`；root 执行 `shutil.copy2` 后，新文件变成 root 所有且仍为 `0700`，`openai-login` 无法执行。Chrome 本身可以启动，但 Playwright driver 无法启动，登录在 browser 阶段约 0.5 秒失败。
@@ -269,13 +303,13 @@ git diff --check
 - release 根目录：`/opt/openai-login/releases`
 - 当前链接：`/opt/openai-login/current`
 
-当前部署基线（2026-10-10 UTC 发布后确认）：
+当前部署基线（2026-10-10 10:39 UTC 发布后确认）：
 
-- 当前 release：`20261010T093908Z-lifecycle-migration-hardening`
-- 构建来源：本地 `main` 代码提交 `f28a11ec753ba34f7100b129dfc52a371263c7f0`，已推送 `origin/main`
-- 当前二进制 SHA-256：`3fe7edd98296f477761306a6af4962de8e289752c3c58728a3c9cbb7ade24e67`
-- 回滚 release：`20261010T044103Z-destination-isolation`
-- 回滚二进制 SHA-256：`109850dfe0798593af7312135fe191c0605696d6b9be3bf306d9efd5be0665d4`
+- 当前 release：`20261010T104000Z-runtime-delivery-fix`
+- 构建来源：本地 `main` 代码提交 `f2d13b268525e3574893873a3b403bb33d48dfa7`，已推送 `origin/main`
+- 当前二进制 SHA-256：`19e471fc9515e1ac10414e3008a1d29ce1c2eb09a206412fb0f07016e775b274`
+- 回滚 release：`20261010T093908Z-lifecycle-migration-hardening`
+- 回滚二进制 SHA-256：`3fe7edd98296f477761306a6af4962de8e289752c3c58728a3c9cbb7ade24e67`
 - 当前服务应保持 `active (running)`，且 `NRestarts=0`
 - 当前服务端并发硬上限：10；页面选择的并发数由前端 worker 控制，实际不超过该上限。
 - 页面代理留空时默认走 sys1 IPv4 直连；`/etc/openai-login/proxy.env` 的 `OPENAI_LOGIN_PROXY` 已清空，旧代理仅保留为服务器上的 0600 配置备份。
