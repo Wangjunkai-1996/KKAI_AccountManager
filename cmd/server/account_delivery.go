@@ -103,8 +103,11 @@ func (s *accountDeliveryService) process(ctx context.Context, task store.Account
 	lease, err := s.store.AcquireAccountRecovery(ctx, task.AccountID)
 	if err != nil {
 		// A login can commit its delivery just before releasing the account
-		// lease. Leave that delivery due for the next worker tick.
-		if !errors.Is(err, store.ErrAccountBusy) {
+		// lease. Yield until the next tick so other due deliveries can advance.
+		if errors.Is(err, store.ErrAccountBusy) {
+			next := time.Now().Add(2 * time.Second)
+			s.update(task, "queued", "", "", &next, 0)
+		} else {
 			s.failed(task, err)
 		}
 		return
