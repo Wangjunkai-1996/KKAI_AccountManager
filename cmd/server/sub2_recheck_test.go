@@ -57,7 +57,7 @@ func TestSub2RecheckInvalidActualCredentialQueuesOneRecovery(t *testing.T) {
 	f := newRecoveryFixture(t, true)
 	f.service.autoRecovery.Store(true)
 	f.service.process(f.task)
-	f.probeBody = "data: {\"type\":\"error\",\"status\":401,\"code\":\"token_revoked\"}\n\n"
+	f.probeBody = "data: {\"type\":\"error\",\"error\":\"Token revoked (401): Encountered invalidated oauth token for user, failing request\"}\n\n"
 	forceDueRecheck(t, f)
 	if !f.service.processNextRecheck() {
 		t.Fatal("follow-up not processed")

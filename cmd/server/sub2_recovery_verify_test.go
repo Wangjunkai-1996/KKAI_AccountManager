@@ -146,6 +146,11 @@ func TestRecoveryVerifyWrappedError(t *testing.T) {
 		invalid, manual bool
 	}{
 		{"text_body", "API returned 401: unauthorized at-secret", "credential_invalid", 401, true, false},
+		{"wrapped_sub2_token_revoked", "Token revoked (401): Encountered invalidated oauth token for user, failing request", "credential_invalid", 401, true, false},
+		{"revoked_wrong_status", "Token revoked (503): at-secret", "probe_failed", 0, false, false},
+		{"revoked_missing_colon", "Token revoked (401) at-secret", "probe_failed", 0, false, false},
+		{"revoked_embedded_prefix", "failure: Token revoked (401): at-secret", "probe_failed", 0, false, false},
+		{"revoked_malformed_status", "Token revoked (0401): at-secret", "probe_failed", 0, false, false},
 		{"empty_body", "API returned 401:", "credential_invalid", 401, true, false},
 		{"no_space_body", "API returned 401:unauthorized", "credential_invalid", 401, true, false},
 		{"disabled", `API returned 401: {"error":{"code":"account_disabled","status":503}}`, "account_unavailable", 401, false, true},

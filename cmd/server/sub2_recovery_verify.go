@@ -111,6 +111,11 @@ func recoveryRetryAfter(raw string) int {
 // account-test endpoint when an upstream request fails. Its status is authoritative;
 // a JSON body can provide a more specific code but cannot replace that status.
 func parseRecoveryWrappedError(raw string) (status int, code string, ok bool) {
+	// Accept Sub2's fixed revoked-token diagnostic, not arbitrary text that
+	// happens to mention 401. The diagnostic body is never retained.
+	if strings.HasPrefix(raw, "Token revoked (401):") {
+		return http.StatusUnauthorized, "token_revoked", true
+	}
 	const prefix = "API returned "
 	if !strings.HasPrefix(raw, prefix) {
 		return 0, "", false
