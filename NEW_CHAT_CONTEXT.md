@@ -6,9 +6,9 @@
 
 ## 当前线上最终 release（2026-10-10）
 
-当前线上为 `20261010T001828Z-retry-policy-final`，源码提交 `319f13b`，二进制 SHA-256：`54c1f86f5eafc21eca85b02af8d4235d15ee447b3b93812c2e15b179876ad672`；回滚为 `20261009T155200Z-challenge-retry`。重试总预算由登录、代理 fallback、Challenge 等待和浏览器重建共享，HTTP 408/429/5xx 与临时网络错误按剩余预算处理，确定性 OAuth/普通 4xx 终止。恢复写回有 checkpoint、`retry_count`、marker 和取消/删除竞态门禁。
+当前线上为 `20261010T013500Z-retry-challenge-cleanup`，源码提交 `a61b7b8`，二进制 SHA-256：`6cb8ffd46140e1c67624da2dbda794d5bfc847be920efd3dbdfb96f135a5a75c`；回滚为 `20261010T001828Z-retry-policy-final`。邮箱/密码/MFA/Consent Challenge 提交进入外层重试，临时 Chromium 网络错误和超大 `Retry-After` 已修复；账号删除清理有 lease、凭据版本和 `operation_id` CAS。
 
-延迟验收 `2026-10-10T01:02:15Z` 通过：服务 active/running、`NRestarts=0`，本机与有效 Unix socket `/health` 为 `status=ok`，公网未认证 HTTP 401；自动恢复 enabled/running，扫描持续推进且 `last_error` 为空。详细发布记录见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。
+延迟验收 `2026-10-10T02:16:03Z` 通过：新 release、socket、401 和自动恢复扫描均正常，启动以来错误聚合为 0。真实浏览器 Challenge 未执行（本机缺 Playwright driver）。详细发布记录见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。
 
 ## 浏览器 challenge 自动重试发布（2026-10-10）
 
@@ -79,10 +79,10 @@
 - 数据库：`/var/lib/openai-login/data/accounts.db`
 - 加密密钥：`/var/lib/openai-login/data/accounts.key`
 - release 根目录：`/opt/openai-login/releases`
-- 当前 release：`20261010T001828Z-retry-policy-final`
-- 当前来源：本地 `main` 的代码提交 `319f13b`，已推送 `origin/main`；随后提交发布记录
-- 当前二进制 SHA-256：`54c1f86f5eafc21eca85b02af8d4235d15ee447b3b93812c2e15b179876ad672`
-- 回滚 release：`20261009T155200Z-challenge-retry`
+- 当前 release：`20261010T013500Z-retry-challenge-cleanup`
+- 当前来源：本地 `main` 的代码提交 `a61b7b8`，已推送 `origin/main`；随后提交发布记录
+- 当前二进制 SHA-256：`6cb8ffd46140e1c67624da2dbda794d5bfc847be920efd3dbdfb96f135a5a75c`
+- 回滚 release：`20261010T001828Z-retry-policy-final`
 - 浏览器运行方式：sys1 上的 Google Chrome + Xvfb，有头模式；浏览器流程实际发生在 sys1
 
 2026-10-08 已发布 `20261008T053100Z-account-automation`：自动断点续跑、按失败原因持久退避、登录成功后后台交付 Sub2、按账号去重的“需要处理”提醒。取消失败 3 次硬停止，交付不计入复活次数。定向 race/Go、Node、vet、桌面和窄屏 fixture、候选迁移及旧二进制兼容均通过；完整测试套件未运行。发布和延迟验收见 `SYS1_DEPLOYMENT.md`。

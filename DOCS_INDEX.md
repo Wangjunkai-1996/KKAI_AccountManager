@@ -4,9 +4,9 @@
 
 这是新对话的入口文件。新对话不要先依赖旧聊天记录，按下面顺序读取当前文档。
 
-## 当前线上 release：重试预算、恢复并发与 Challenge 最终发布（2026-10-10）
+## 当前线上 release：Challenge 提交竞态与删除清理保护（2026-10-10）
 
-`20261010T001828Z-retry-policy-final` 已上线，源码 `319f13b`，Linux amd64 二进制 SHA-256：`54c1f86f5eafc21eca85b02af8d4235d15ee447b3b93812c2e15b179876ad672`。登录、代理 fallback、Challenge 和浏览器重建共享总重试预算；HTTP 408/429/5xx 与临时网络错误按剩余预算重试，确定性 OAuth/普通 4xx 终止。恢复写回增加 checkpoint、`retry_count`、marker 及取消/删除竞态门禁。`2026-10-10T01:02:15Z` 延迟验收通过，服务、socket、401、自动恢复扫描和错误聚合正常；回滚为 `20261009T155200Z-challenge-retry`。本轮未手动触发真实 OAuth。
+`20261010T013500Z-retry-challenge-cleanup` 已上线，源码 `a61b7b8`，Linux amd64 二进制 SHA-256：`6cb8ffd46140e1c67624da2dbda794d5bfc847be920efd3dbdfb96f135a5a75c`。邮箱/密码/MFA/Consent Challenge 提交进入外层重试；临时网络错误、超大 `Retry-After`、账号删除清理 lease/凭据版本/operation CAS 已修复。`2026-10-10T02:16:03Z` 延迟验收通过，服务、socket、401、自动恢复扫描和错误聚合正常；回滚为 `20261010T001828Z-retry-policy-final`。真实浏览器 Challenge 未执行（缺 Playwright driver），定向单元/race 测试通过。
 
 ## 八项审查修复（2026-10-09 13:44:42 上海时间）
 

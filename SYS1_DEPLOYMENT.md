@@ -4,6 +4,13 @@
 
 > 这是 sys1 线上事实的唯一权威文档。新对话先读取 `DOCS_INDEX.md` 和 `NEW_CHAT_CONTEXT.md`，发生冲突时以本文的服务、端口、release、健康检查和验收结论为准。
 
+## Challenge 提交竞态与删除清理保护发布（2026-10-10）
+
+- 切换时间 `2026-10-10T02:10:17Z`，release `20261010T013500Z-retry-challenge-cleanup`，源码提交 `a61b7b847f58d152358ac23da47213c749a9367f`，Linux amd64 二进制 SHA-256：`6cb8ffd46140e1c67624da2dbda794d5bfc847be920efd3dbdfb96f135a5a75c`。回滚 release 为 `20261010T001828Z-retry-policy-final`；发布前备份 `/var/lib/openai-login/backups/accounts-before-20261010T013500Z-retry-challenge-cleanup.db`，完整性通过。
+- 修复邮箱、密码、MFA、Consent 提交触发 Challenge 时被旧表单遮蔽而停住的问题；保留 HTTP 状态和 `Retry-After` 进入外层浏览器重试，补齐 Chromium 临时网络错误重试并防止超大 `Retry-After` 溢出。账号删除清理增加账号 lease、凭据版本校验和 `operation_id` CAS，避免旧检测删除新登录或重绑的 Sub2 账号。
+- 候选隔离数据库、健康、自动恢复关闭和回滚兼容通过；停服前后在途任务均为 0。延迟验收 `2026-10-10T02:16:03Z`：服务 active/running、`NRestarts=0`，主机及 `/srv/kkai/secrets/tls/kkrich-ltd/auth/login.sock` `/health` 为 `status=ok`，公网未认证返回 HTTP 401；自动恢复 `enabled=true,running=true`，`last_scan_at=2026-10-10T02:15:17Z`，`last_error=""`；启动以来 panic、fatal、database locked、存储、监听、OAuth 401/403/5xx 聚合均为 0。
+- 正式 release、回滚 release、生产备份和 `DEPLOYMENT.json`/`CANDIDATE_ACCEPTANCE.json`/`ACCEPTANCE.json`/`DELAYED_ACCEPTANCE.json` 保留；上传脚本、临时二进制和候选数据库已清理。未手动触发真实 OAuth；本机缺少 Playwright driver，真实浏览器 Challenge 流程未执行，单元、race、定向测试覆盖已通过。
+
 ## 重试预算、恢复并发与 Challenge 最终发布（2026-10-10）
 
 - 当前 release：`20261010T001828Z-retry-policy-final`，源码提交 `319f13b428b7733a7521692171cf8be24d4b78f0`，Linux amd64 二进制 SHA-256：`54c1f86f5eafc21eca85b02af8d4235d15ee447b3b93812c2e15b179876ad672`。候选于 `2026-10-10T00:19:51Z` 完成隔离验收；上线前数据库备份为 `/var/lib/openai-login/backups/accounts-before-20261010T001828Z-retry-policy-final.db`。
