@@ -773,9 +773,55 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     await run('loadHistory()');
     assert.equal(run('accounts[1].delivery.state'), 'completed', 'history refresh follows the server delivery terminal state');
     assert.match(run('deliveryStatusText(accounts[0].delivery)'), /下次自动继续交付/);
+    assert.match(run('deliveryStatusText(accounts[0].delivery)'), /网络超时/, 'retrying deliveries explain the safe server-reported reason');
+    assert.ok(run('historyRefreshDelay()') > 5000 && run('historyRefreshDelay()') <= 60000, 'future retries keep the ordinary interval or wake when due');
+    deliveries[9001].next_retry_at = new Date(Date.now() - 1000).toISOString();
+    deliveries[9001].last_error = '<img src=x onerror=alert(1)>待核对';
+    await run('loadHistory()');
+    assert.equal(run('historyRefreshDelay()'), 5000, 'due retries refresh promptly with automatic recovery disabled');
+    assert.match(run('deliveryStatusText(accounts[0].delivery)'), /已到重试时间，等待后台执行/);
+    assert.doesNotMatch(run('deliveryStatusText(accounts[0].delivery)'), /下次自动/);
+    assert.match(el('historyGrid').innerHTML, /&lt;img src=x onerror=alert\(1\)&gt;待核对/, 'retry explanations remain escaped in history markup');
+    assert.doesNotMatch(el('historyGrid').innerHTML, /<img/);
     assert.equal(el('historyAttention').hidden, true, 'temporary delivery errors are not manual alerts');
     assert.match(el('historyGrid').innerHTML, /Sub2 交付完成/);
     assert.doesNotMatch(run("automaticTaskPolicy({state:'completed',next_retry_at:'2026-10-08T00:00:00Z',retry_action:'resume'})"), /重试|下次/);
+    // A batch finishing while an older history snapshot is in flight must
+    // still fetch the delivery state that exists after the batch finished.
+    const normalFetchBeforeDeliveryRace = context.fetch;
+    const staleDeliverySnapshot = gate();
+    const freshDeliverySnapshot = gate();
+    let heldDeliverySnapshot = false;
+    let deliverySnapshotRequests = 0;
+    context.fetch = async (url, options) => {
+        const reply = await normalFetchBeforeDeliveryRace(url, options);
+        if (url === '/api/history') {
+            deliverySnapshotRequests++;
+            const snapshot = await reply.json();
+            if (!heldDeliverySnapshot) {
+                heldDeliverySnapshot = true;
+                await staleDeliverySnapshot.promise;
+            } else {
+                await freshDeliverySnapshot.promise;
+            }
+            return response(snapshot);
+        }
+        return reply;
+    };
+    const oldDeliveryRefresh = run('loadHistory()');
+    await flush();
+    deliveries[9001] = { id: 91, account_id: 9001, state: 'completed' };
+    let batchFinishedRefreshSettled = false;
+    const batchFinishedRefresh = run('loadHistory()').then(() => { batchFinishedRefreshSettled = true; });
+    const concurrentDeliveryRefreshes = Array.from({ length: 5 }, () => run('loadHistory()'));
+    staleDeliverySnapshot.release();
+    await flush();
+    assert.equal(deliverySnapshotRequests, 2, 'overlapping refresh callers coalesce into one follow-up request');
+    assert.equal(batchFinishedRefreshSettled, false, 'batch completion waits for the fresh snapshot instead of only the old request');
+    freshDeliverySnapshot.release();
+    await Promise.all([oldDeliveryRefresh, batchFinishedRefresh, ...concurrentDeliveryRefreshes]);
+    context.fetch = normalFetchBeforeDeliveryRace;
+    assert.equal(run('accounts[0].delivery.state'), 'completed', 'batch completion refresh must not reuse an older waiting delivery snapshot');
     deliveries[9001] = { id: 91, account_id: 9001, state: 'requires_action', requires_action: true, manual_action: '<img src=x onerror=alert(1)>请核对绑定', last_error: '身份冲突' };
     recoveries[9001] = { id: 91, account_id: 9001, purpose: 'delivery', state: 'unknown', requires_action: true, manual_action: '同一交付的内部任务，不应重复' };
     rows.push({ id: 9003, email: 'transient@example.test', status: 'error', last_error_code: 'timeout', last_error: '临时超时' },

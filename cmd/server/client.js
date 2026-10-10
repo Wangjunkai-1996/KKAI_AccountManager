@@ -200,6 +200,8 @@ let processing = false;
 let startBatchInFlight = false;
 let proxyChecking = false;
 let historyLoading = false;
+let historyLoadPromise = null;
+let historyRefreshRequested = false;
 let historyBusyID = '';
 let historyPage = 1;
 let historyPageSize = 20;
@@ -641,10 +643,29 @@ window.retryAccount = function(id) {
 
 async function loadHistory() {
     if (historyLoading) {
-        while (historyLoading) await new Promise(resolve => setTimeout(resolve, 25));
-        return;
+        historyRefreshRequested = true;
+        return historyLoadPromise;
     }
     historyLoading = true;
+    historyLoadPromise = (async () => {
+        try {
+            do {
+                historyRefreshRequested = false;
+                await loadHistorySnapshot();
+            } while (historyRefreshRequested);
+        } finally {
+            historyLoading = false;
+            historyLoadPromise = null;
+            historySearchInput.disabled = processing || historyBatchRunning;
+            refreshHistoryBtn.disabled = processing || historyBatchRunning;
+            historyRefreshAt = Date.now() + historyRefreshDelay();
+            renderHistory();
+        }
+    })();
+    return historyLoadPromise;
+}
+
+async function loadHistorySnapshot() {
     historyLoadError = '';
     historySearchInput.disabled = true;
     refreshHistoryBtn.disabled = true;
@@ -697,12 +718,6 @@ async function loadHistory() {
     } catch (error) {
         historyLoadError = error.message || '历史加载失败';
         historyRefreshStatus.textContent = historyLoadError;
-    } finally {
-        historyLoading = false;
-        historySearchInput.disabled = processing || historyBatchRunning;
-        refreshHistoryBtn.disabled = processing || historyBatchRunning;
-        historyRefreshAt = Date.now() + historyRefreshDelay();
-        renderHistory();
     }
 }
 
@@ -717,9 +732,13 @@ function historyRefreshDelay() {
     const recovering = [...historyRecoveries.values()].some(item => historyRecoveryActive(item));
     const delivering = [...historyDeliveries.values()].some(item => ['queued', 'checking', 'importing', 'verifying', 'working'].includes(item.state));
     const repairing = [...historyRepairs.values()].some(item => ['queued', 'checking'].includes(item.state));
-    const waiting = [...historyRecoveries.values(), ...historyDeliveries.values(), ...historyRepairs.values()].some(item => item.next_retry_at && !item.requires_action && !['completed', 'success', 'canceled'].includes(item.state));
-    return checking || recovering || delivering || repairing || historyRecoveryRequests.size || recoverySettings.scanning ? 5000
-        : recoverySettings.autoRecoveryEnabled || waiting ? 60000 : 5 * 60000;
+    const waiting = [...historyRecoveries.values(), ...historyDeliveries.values(), ...historyRepairs.values()].filter(item => item.next_retry_at && !item.requires_action && !['completed', 'success', 'canceled'].includes(item.state));
+    if (checking || recovering || delivering || repairing || historyRecoveryRequests.size || recoverySettings.scanning) return 5000;
+    if (waiting.length) {
+        const nextRetry = Math.min(...waiting.map(item => Date.parse(item.next_retry_at)).filter(Number.isFinite));
+        return Number.isFinite(nextRetry) ? Math.max(5000, Math.min(60000, nextRetry - Date.now())) : 60000;
+    }
+    return recoverySettings.autoRecoveryEnabled ? 60000 : 5 * 60000;
 }
 
 async function pollHistory() {
@@ -1363,14 +1382,18 @@ function automaticTaskPolicy(task, kind = '恢复') {
     if (!task || ['completed', 'success', 'canceled'].includes(task.state)) return '';
     if (task.requires_action === true) return `需要处理：${task.manual_action || task.last_error || '请查看详情并处理'}`;
     const action = { resume: `继续${kind}`, relogin: '重新登录', manual: '等待人工处理' }[task.retry_action] || `继续${kind}`;
-    return task.next_retry_at ? `下次自动${action}：${formatHistoryTime(task.next_retry_at)}` : '';
+    if (!task.next_retry_at) return '';
+    const retryAt = Date.parse(task.next_retry_at);
+    return Number.isFinite(retryAt) && retryAt <= Date.now()
+        ? '已到重试时间，等待后台执行'
+        : `下次自动${action}：${formatHistoryTime(task.next_retry_at)}`;
 }
 
 function deliveryStatusText(task) {
     if (!task) return '交付状态暂未确认，请在账号历史查看持久记录';
     const stages = { associating: '正在关联账号', importing: '正在导入 Sub2', applying: '正在写回凭据', verifying: '正在验证 Sub2 可用性', enabling: '正在恢复调度' };
     const states = { queued: '等待自动交付', checking: '正在核对 Sub2 账号', importing: '正在导入 Sub2', verifying: '正在验证 Sub2 可用性', working: stages[task.stage] || '正在自动交付', retry_wait: '等待自动重试', completed: 'Sub2 交付完成', requires_action: '交付需要处理', canceled: '交付已取消' };
-    return [states[task.state] || '交付状态待核对', automaticTaskPolicy(task, '交付')].filter(Boolean).join(' · ');
+    return [states[task.state] || '交付状态待核对', task.state === 'retry_wait' ? task.last_error : '', automaticTaskPolicy(task, '交付')].filter(Boolean).join(' · ');
 }
 
 function syncLoginDeliveries() {

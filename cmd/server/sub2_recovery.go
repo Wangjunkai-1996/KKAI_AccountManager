@@ -790,6 +790,19 @@ func (s *sub2RecoveryService) setState(id int64, state, message string) bool {
 
 func (s *sub2RecoveryService) fail(id int64, state, message string) { s.setState(id, state, message) }
 
+func recoveryTaskRetryDelay(task store.AccountRecoveryTask, failure *recoveryOperationError) time.Duration {
+	previousFailures := task.RetryCount
+	if task.Purpose == "delivery" && failure.Code == "probe_failed" && failure.RetryAfterSeconds <= 0 {
+		// Fresh credentials can take time to work through Sub2. Try two short
+		// rechecks before the normal five-minute exponential backoff.
+		if previousFailures < 2 {
+			return time.Duration(previousFailures+1) * 30 * time.Second
+		}
+		previousFailures -= 2
+	}
+	return recoveryRetryDelay(failure, previousFailures)
+}
+
 func recoveryRetryDelay(failure *recoveryOperationError, previousFailures int) time.Duration {
 	delay := time.Minute
 	switch failure.Code {
@@ -914,7 +927,7 @@ func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTa
 		if current.ResultCredentialAttemptID == 0 || failure.CredentialInvalid {
 			record.RetryAction = "relogin"
 		}
-		next := time.Now().UTC().Add(recoveryRetryDelay(failure, current.RetryCount))
+		next := time.Now().UTC().Add(recoveryTaskRetryDelay(current, failure))
 		record.NextRetryAt = &next
 	}
 	if failure.Code == "manual_pause" {

@@ -102,7 +102,11 @@ func (s *accountDeliveryService) process(ctx context.Context, task store.Account
 	}
 	lease, err := s.store.AcquireAccountRecovery(ctx, task.AccountID)
 	if err != nil {
-		s.failed(task, &recoveryOperationError{Code: "account_busy"})
+		// A login can commit its delivery just before releasing the account
+		// lease. Leave that delivery due for the next worker tick.
+		if !errors.Is(err, store.ErrAccountBusy) {
+			s.failed(task, err)
+		}
 		return
 	}
 	defer lease.Release()
@@ -126,7 +130,10 @@ func (s *accountDeliveryService) process(ctx context.Context, task store.Account
 		s.update(task, "canceled", "已有更新的登录结果，旧交付已取消", "", nil, 0)
 		return
 	}
-	if _, active, err := s.store.GetActiveAccountRecoveryTaskForDestination(ctx, task.AccountID, task.DestinationKey); err != nil || active {
+	if _, active, err := s.store.GetActiveAccountRecoveryTaskForDestination(ctx, task.AccountID, task.DestinationKey); err != nil {
+		s.failed(task, err)
+		return
+	} else if active {
 		s.failed(task, &recoveryOperationError{Code: "account_busy"})
 		return
 	}
