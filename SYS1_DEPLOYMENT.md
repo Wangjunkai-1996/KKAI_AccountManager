@@ -1,5 +1,12 @@
 # sys1 线上部署说明
 
+## 多目标交付隔离修复发布（2026-10-10）
+
+- 切换时间约 `2026-10-10T05:03:34Z`，release `20261010T044103Z-destination-isolation`，源码提交 `da7289f5b84c0e61643254a84b212854b4577048`，Linux amd64 二进制 SHA-256：`109850dfe0798593af7312135fe191c0605696d6b9be3bf306d9efd5be0665d4`。回滚 release 为 `20261010T013500Z-retry-challenge-cleanup`；发布前备份 `/var/lib/openai-login/backups/accounts-before-20261010T044103Z-destination-isolation.db`，权限 `0600`，SQLite `integrity_check=ok`。
+- 修复多 destination 交付查询、到期调度、唤醒、凭据修复和导入回调的串目标问题；新登录只取消同一 destination 的旧交付，不再误取消其他目标任务。新增双 destination 回归覆盖 latest/due/wake 和新登录清理。
+- 候选使用生产数据库只读副本、关闭 Sub2 环境，候选 `/health` 返回 `status=ok` 且数据库完整性通过。正式切换后服务 `active/running`、`NRestarts=0`，本机及 `/srv/kkai/secrets/tls/kkrich-ltd/auth/login.sock` `/health` 为 `status=ok`，公网未认证返回 HTTP 401；`/api/account-recovery/settings` 显示 `enabled=true,running=true,last_error=""`，扫描继续推进；切换窗口日志严重错误聚合为 0。旧 release 保留。
+- 定向验证通过：`go test ./internal/store ./cmd/server -count=1 -timeout=120s`、对应 `-race`、`go vet ./internal/store ./cmd/server`、`git diff --check`、Linux amd64 构建。未运行仓库完整测试套件，未手动触发真实 OAuth 或真实浏览器 Challenge；健康检查不代表上游长期登录成功率。
+
 这份文件是 `KKAI_AUTH` 的 sys1 线上部署记录。账号密码、TOTP、代理凭据和 access/refresh token 不写入文档。
 
 > 这是 sys1 线上事实的唯一权威文档。新对话先读取 `DOCS_INDEX.md` 和 `NEW_CHAT_CONTEXT.md`，发生冲突时以本文的服务、端口、release、健康检查和验收结论为准。
@@ -217,13 +224,13 @@ git diff --check
 - release 根目录：`/opt/openai-login/releases`
 - 当前链接：`/opt/openai-login/current`
 
-当前部署基线（2026-10-09 上海时间发布后确认）：
+当前部署基线（2026-10-10 UTC 发布后确认）：
 
-- 当前 release：`20261009T054200Z-recovery-final`
-- 构建来源：本地 `main` 代码提交 `53bde86f241f9050dda95e5887872621f4882921`，已推送 `origin/main`；构建时工作区干净，随后提交发布记录
-- 当前二进制 SHA-256：`1f8cab2c57223d111797023e9f54074c8d7f9641f4eda6bf29e11cb9a315cbe7`
-- 回滚 release：`20261009T053050Z-recovery-delivery-races`
-- 回滚二进制 SHA-256：`5a0d9aee1b0faaf026cac97f3601a5e14a9f87f3513a1b06477d3b7c39a5ec02`
+- 当前 release：`20261010T044103Z-destination-isolation`
+- 构建来源：本地 `main` 代码提交 `da7289f5b84c0e61643254a84b212854b4577048`，已推送 `origin/main`
+- 当前二进制 SHA-256：`109850dfe0798593af7312135fe191c0605696d6b9be3bf306d9efd5be0665d4`
+- 回滚 release：`20261010T013500Z-retry-challenge-cleanup`
+- 回滚二进制 SHA-256：`6cb8ffd46140e1c67624da2dbda794d5bfc847be920efd3dbdfb96f135a5a75c`
 - 当前服务应保持 `active (running)`，且 `NRestarts=0`
 - 当前服务端并发硬上限：10；页面选择的并发数由前端 worker 控制，实际不超过该上限。
 - 页面代理留空时默认走 sys1 IPv4 直连；`/etc/openai-login/proxy.env` 的 `OPENAI_LOGIN_PROXY` 已清空，旧代理仅保留为服务器上的 0600 配置备份。
