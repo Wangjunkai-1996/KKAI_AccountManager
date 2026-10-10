@@ -36,14 +36,20 @@ COPY go.mod go.sum ./
 # 下载依赖
 RUN go mod download
 
-# 复制源代码
-COPY . .
+# 只复制编译需要的源码，不把本地凭据或数据库写入镜像。
+COPY cmd ./cmd
+COPY internal ./internal
 
 # 安装 Playwright 浏览器驱动（关键步骤）
 RUN go run github.com/mxschmitt/playwright-go/cmd/playwright@v0.6201.1 install --with-deps chromium
 
 # 编译
 RUN go build -o openai-login-web ./cmd/server
+
+# SQLite 与加密密钥必须一起持久化。
+ENV OPENAI_LOGIN_DB=/app/data/accounts.db \
+    OPENAI_LOGIN_KEY=/app/data/accounts.key
+VOLUME ["/app/data"]
 
 # 暴露端口
 EXPOSE 8080

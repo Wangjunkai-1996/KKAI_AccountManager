@@ -1,6 +1,7 @@
 services:
   openai-login:
     build: .
+    image: openai-login-web:latest
     container_name: openai-login-web
     # Keep the management UI private by default; put an authenticated reverse
     # proxy in front of it when remote access is required.
@@ -8,6 +9,11 @@ services:
       - "127.0.0.1:8080:8080"
     env_file:
       - .sub2api.env
+    environment:
+      OPENAI_LOGIN_DB: /app/data/accounts.db
+      OPENAI_LOGIN_KEY: /app/data/accounts.key
+    volumes:
+      - auth-data:/app/data
     command: ["./openai-login-web", "-bind=0.0.0.0", "-headless=true", "-open-browser=false"]
     restart: unless-stopped
     # 如果需要使用代理
@@ -35,3 +41,7 @@ services:
       timeout: 5s
       start_period: 15s
       retries: 3
+
+volumes:
+  auth-data:
+    name: openai-login-data

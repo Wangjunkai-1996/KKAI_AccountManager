@@ -650,7 +650,7 @@ func TestLegacyDeliveryRecoveryMigrationUsesDeliveryDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	taskResult, err := s.db.ExecContext(ctx, `INSERT INTO account_recovery_tasks(account_id,sub2_account_id,delivery_id,destination_key,state,created_at,updated_at) VALUES(?,?,?, '', 'completed', ?, ?)`, account.ID, 505, deliveryID, time.Now().UnixMilli(), time.Now().UnixMilli())
+	taskResult, err := s.db.ExecContext(ctx, `INSERT INTO account_recovery_tasks(account_id,sub2_account_id,delivery_id,destination_key,state,created_at,updated_at) VALUES(?,?,?, 'alpha', 'completed', ?, ?)`, account.ID, 505, deliveryID, time.Now().UnixMilli(), time.Now().UnixMilli())
 	if err != nil {
 		t.Fatal(err)
 	}

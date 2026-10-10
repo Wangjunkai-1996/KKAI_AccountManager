@@ -54,7 +54,7 @@ CREATE INDEX IF NOT EXISTS account_delivery_history ON account_deliveries(accoun
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE account_recovery_tasks SET destination_key=(SELECT d.destination_key FROM account_deliveries d WHERE d.id=account_recovery_tasks.delivery_id) WHERE destination_key='' AND delivery_id>0 AND EXISTS (SELECT 1 FROM account_deliveries d WHERE d.id=account_recovery_tasks.delivery_id)`)
+	_, err = s.db.Exec(`UPDATE account_recovery_tasks SET destination_key=(SELECT d.destination_key FROM account_deliveries d WHERE d.id=account_recovery_tasks.delivery_id) WHERE delivery_id>0 AND EXISTS (SELECT 1 FROM account_deliveries d WHERE d.id=account_recovery_tasks.delivery_id)`)
 	if err != nil {
 		return err
 	}

@@ -1,347 +1,107 @@
-# 🐳 Docker 部署指南
+# Docker 部署指南
 
-> 通用/历史参考：sys1 当前使用独立 systemd 服务、Google Chrome、Xvfb 和本机 `127.0.0.1:18082`，不使用本文的 Docker Compose 方案。线上发布请只看 `SYS1_DEPLOYMENT.md`；本文中的 `8080`、`your-server` 和 Docker 示例不能覆盖线上配置。
+> 本文只用于通用 Docker 部署。sys1 使用独立 systemd 服务；线上发布以 `SYS1_DEPLOYMENT.md` 为准。
 
-## 📋 前置要求
+Docker 路径统一使用主 `Dockerfile` 的 Debian、锁定版本 Playwright driver、配套 Node 和 bundled Chromium。旧 `Dockerfile.local` 的 Alpine 快捷路径已移除；`quick-docker.sh` 复用 Compose。
 
-在 OVH 物理机上需要安装：
-- Docker (>= 20.10)
-- Docker Compose (>= 2.0)
+## 首次启动
 
-安装命令：
+需要 Docker Engine 20.10+ 和 Docker Compose v2。在项目根目录准备 `.sub2api.env`，填入实际 Sub2 配置并设为 `0600`；不接入 Sub2 时创建空文件即可。不要将账号密码、密钥或 token 提交到仓库。
+
 ```bash
-# 安装 Docker
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
+# 首次创建配置文件；已有配置时不要覆盖。
+touch .sub2api.env
+chmod 600 .sub2api.env
 
-# 安装 Docker Compose
-sudo apt-get update
-sudo apt-get install docker-compose-plugin
+./quick-docker.sh
+docker compose ps
+docker compose logs -f
 ```
 
-## 🚀 快速开始
+默认只监听宿主机 `127.0.0.1:8080`。SQLite 数据库与加密密钥共同保存在命名卷 `openai-login-data`，容器内路径为 `/app/data/accounts.db`、`/app/data/accounts.key`。`docker compose down` 或删除容器会保留该卷；`docker compose down -v`、`docker volume rm` 会删除数据，不用于普通升级。不要覆盖 `OPENAI_LOGIN_DB`/`OPENAI_LOGIN_KEY` 指向卷外路径。
 
-### 方式一：使用 docker-compose（推荐）
+同一数据卷只运行一个 AUTH 实例；不要通过多副本共享该 SQLite 卷。
+
+## 手动构建和启动
 
 ```bash
-# 1. 上传项目到服务器
-scp -r openai-login user@your-ovh-server:/opt/
-
-# 2. SSH 登录服务器
-ssh user@your-ovh-server
-
-# 3. 进入项目目录
-cd /opt/openai-login
-
-# 4. 启动服务
-docker-compose up -d
-
-# 5. 查看日志
-docker-compose logs -f
-
-# 6. 默认仅本机访问；远程访问请配置带认证的反向代理
-# http://127.0.0.1:8080
+./build-docker.sh
+docker run -d \
+  --name openai-login-web \
+  -p 127.0.0.1:8080:8080 \
+  --env-file .sub2api.env \
+  --mount type=volume,src=openai-login-data,dst=/app/data \
+  --restart unless-stopped \
+  openai-login-web:latest
 ```
 
-### 方式二：使用构建脚本
+镜像的 `CMD` 已包含程序名及监听、headless 参数，默认运行无需额外参数。需要覆盖时必须给出可执行程序，例如 `openai-login-web:latest ./openai-login-web -bind=0.0.0.0 -headless=true -open-browser=false -max-concurrent=2`，不能在镜像名后只写 flags。Compose 已运行时不要再同时启动手动容器。
+
+## 旧容器首次迁移
+
+旧版本未挂载数据卷，直接重建会丢失数据库与加密密钥。`quick-docker.sh` 会阻止替换此类容器。先检查原容器实际数据路径；以下示例针对默认 `/app/data`，`legacy_container` 按实际名称填写 `openai-login` 或 `openai-login-web`。
 
 ```bash
-# 1. 构建镜像
-chmod +x build-docker.sh
+legacy_container=openai-login
+# 先完成新镜像构建，构建失败时旧服务仍可继续运行。
 ./build-docker.sh
 
-# 2. 启动容器
-docker-compose up -d
+# 等待在途登录/恢复任务结束，再停旧容器取得一致性数据副本。
+docker stop "$legacy_container"
+umask 077
+backup_dir="$PWD/docker-data-backup-$(date +%Y%m%dT%H%M%S)"
+mkdir "$backup_dir"
+docker cp "$legacy_container:/app/data/." "$backup_dir/"
+test -s "$backup_dir/accounts.db"
+test -s "$backup_dir/accounts.key"
+
+docker volume create openai-login-data
+# 仅允许写入空卷，防止覆盖已有业务数据。
+docker run --rm \
+  --mount type=volume,src=openai-login-data,dst=/app/data \
+  --mount type=bind,src="$backup_dir",dst=/backup,readonly \
+  --entrypoint sh openai-login-web:latest \
+  -c 'test -z "$(ls -A /app/data)" && cp -a /backup/. /app/data/'
+
+# 保留原容器和本地备份以供回退；不要删除命名卷。
+docker rename "$legacy_container" openai-login-legacy
+docker compose up -d
+docker compose ps
+curl -fsS http://127.0.0.1:8080/ready
 ```
 
-### 方式三：手动构建和运行
+任一步失败都应先处理该步骤，不继续替换旧容器。确认历史账号可读后再自行清理旧容器；数据库与密钥备份必须成对保留，备份目录包含敏感信息。已配置自定义数据路径或 bind mount 的部署，按实际路径迁移，不套用默认目录。
+
+## 后续更新与验收
 
 ```bash
-# 1. 构建镜像
-docker build -t openai-login-web:latest .
-
-# 2. 运行容器
-docker run -d \
-  --name openai-login \
-  -p 127.0.0.1:8080:8080 \
-  --restart unless-stopped \
-  openai-login-web:latest \
-  -bind=0.0.0.0 -headless=true -open-browser=false
-
-# 3. 查看日志
-docker logs -f openai-login
+./quick-docker.sh
+docker compose ps
+curl -fsS http://127.0.0.1:8080/health
+curl -fsS http://127.0.0.1:8080/ready
+docker compose logs --tail=100
 ```
 
-## ⚙️ 配置选项
+`/health` 检查 HTTP 存活，`/ready` 检查数据库连接。镜像和 Compose healthcheck 使用 `/ready`。Docker 的 `unhealthy` 状态本身不会触发 `restart: unless-stopped`；该策略用于进程退出后的重启。
 
-### 环境变量
+健康检查不代表浏览器或上游 OAuth 已验证。容器构建或浏览器依赖变更后，还需验证实际浏览器启动和登录流程。本次整改只做静态检查，尚未执行镜像构建或容器浏览器验收。
 
-编辑 `docker-compose.yml` 中的 environment 部分：
+## 远程访问与日志
 
-```yaml
-command: ["./openai-login-web", "-bind=0.0.0.0", "-headless=true", "-open-browser=false"]
-environment:
-  - HTTP_PROXY=http://...  # 代理（如果需要）
-  - HTTPS_PROXY=http://... # HTTPS 代理
-```
-
-### 端口映射
-
-修改 `docker-compose.yml` 中的 ports：
-
-```yaml
-ports:
-  - "127.0.0.1:8080:8080"  # 改成 "127.0.0.1:3000:8080" 使用其他本机端口
-```
-
-### 资源限制
-
-```yaml
-deploy:
-  resources:
-    limits:
-      cpus: '2'      # 最多使用 2 个 CPU 核心
-      memory: 2G     # 最多使用 2GB 内存
-```
-
-## 🔧 常用命令
-
-```bash
-# 启动服务
-docker-compose up -d
-
-# 停止服务
-docker-compose down
-
-# 重启服务
-docker-compose restart
-
-# 查看日志
-docker-compose logs -f
-
-# 查看容器状态
-docker-compose ps
-
-# 更新代码后重新构建
-docker-compose up -d --build
-
-# 进入容器调试
-docker exec -it openai-login-web bash
-
-# 清理旧镜像
-docker image prune -a
-```
-
-## 🌐 反向代理配置
-
-### Nginx
-
-```nginx
-server {
-    listen 80;
-    server_name openai-login.yourdomain.com;
-
-    location / {
-        proxy_pass http://localhost:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        
-        # 超时设置（登录可能需要较长时间）
-        proxy_connect_timeout 120s;
-        proxy_send_timeout 120s;
-        proxy_read_timeout 120s;
-    }
-}
-```
-
-### Traefik
-
-```yaml
-labels:
-  - "traefik.enable=true"
-  - "traefik.http.routers.openai-login.rule=Host(`openai-login.yourdomain.com`)"
-  - "traefik.http.services.openai-login.loadbalancer.server.port=8080"
-```
-
-## 🔒 安全建议
-
-### 1. 使用 HTTPS
-
-```bash
-# 使用 Certbot 获取免费 SSL 证书
-sudo apt-get install certbot python3-certbot-nginx
-sudo certbot --nginx -d openai-login.yourdomain.com
-```
-
-### 2. 限制访问 IP
-
-在 `docker-compose.yml` 中：
-
-```yaml
-ports:
-  - "127.0.0.1:8080:8080"  # 只允许本地访问
-```
-
-然后通过 Nginx 反向代理并设置访问控制。
-
-### 3. 添加基础认证
-
-Nginx 配置：
+远程访问通过带认证的 HTTPS 反向代理转发至 `127.0.0.1:8080`，不要直接公开管理端口。Nginx 需要保留 SSE 并设置足够的超时，例如：
 
 ```nginx
 location / {
     auth_basic "Restricted Access";
     auth_basic_user_file /etc/nginx/.htpasswd;
-    proxy_pass http://localhost:8080;
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_read_timeout 240s;
 }
 ```
 
-生成密码文件：
-```bash
-sudo apt-get install apache2-utils
-sudo htpasswd -c /etc/nginx/.htpasswd admin
-```
-
-## 📊 监控和日志
-
-### 查看实时日志
-
-```bash
-docker-compose logs -f --tail=100
-```
-
-### 日志持久化
-
-在 `docker-compose.yml` 中已配置：
-
-```yaml
-logging:
-  driver: "json-file"
-  options:
-    max-size: "10m"    # 单个日志文件最大 10MB
-    max-file: "3"      # 保留 3 个日志文件
-```
-
-### 查看容器资源使用
-
-```bash
-docker stats openai-login-web
-```
-
-## 🐛 故障排查
-
-### 容器无法启动
-
-```bash
-# 查看详细日志
-docker-compose logs
-
-# 检查容器状态
-docker-compose ps
-
-# 查看构建过程
-docker-compose build --no-cache
-```
-
-### 浏览器驱动问题
-
-```bash
-# 进入容器检查
-docker exec -it openai-login-web bash
-
-# 检查 Playwright 浏览器
-ls -la /ms-playwright/
-
-# 手动安装浏览器
-playwright install chromium
-```
-
-### 网络连接问题
-
-```bash
-# 测试容器网络
-docker exec -it openai-login-web curl https://auth.openai.com
-
-# 如果需要代理，在 docker-compose.yml 中添加：
-environment:
-  - HTTP_PROXY=http://proxy:port
-  - HTTPS_PROXY=http://proxy:port
-  - NO_PROXY=localhost,127.0.0.1
-```
-
-## 🔄 更新部署
-
-```bash
-# 1. 停止旧容器
-docker-compose down
-
-# 2. 拉取最新代码
-git pull
-
-# 或上传新代码
-scp -r openai-login user@your-server:/opt/
-
-# 3. 重新构建和启动
-docker-compose up -d --build
-
-# 4. 查看日志确认
-docker-compose logs -f
-```
-
-## 💾 备份和恢复
-
-### 导出镜像
-
-```bash
-docker save openai-login-web:latest | gzip > openai-login-web.tar.gz
-```
-
-### 导入镜像
-
-```bash
-docker load < openai-login-web.tar.gz
-```
-
-## 📈 性能优化
-
-### 多副本部署
-
-```yaml
-# docker-compose.yml
-services:
-  openai-login:
-    deploy:
-      replicas: 3  # 运行 3 个实例
-```
-
-### 使用负载均衡
-
-配合 Nginx 或 Traefik 实现负载均衡。
-
-## ✅ 部署完成检查清单
-
-- [ ] Docker 和 Docker Compose 已安装
-- [ ] 防火墙已开放 8080 端口（或你的自定义端口）
-- [ ] 容器成功启动（`docker-compose ps` 显示 Up）
-- [ ] 可以访问 Web 界面
-- [ ] 测试批量登录功能正常
-- [ ] 日志正常输出
-- [ ] （可选）配置了 HTTPS
-- [ ] （可选）配置了反向代理
-- [ ] （可选）配置了访问控制
-
-## 🎉 部署成功
-
-访问你的服务：
-```
-http://your-server-ip:8080
-```
-
-或通过域名：
-```
-https://openai-login.yourdomain.com
-```
-
-开始批量登录 OpenAI 账号吧！🚀
+Compose 日志采用 `json-file`，单文件上限 `10m`，保留 3 个文件。查看日志使用 `docker compose logs -f --tail=100`；停止使用 `docker compose stop`，恢复使用 `docker compose start`。普通更新不删除数据卷。

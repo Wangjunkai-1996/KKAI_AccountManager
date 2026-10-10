@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+*.env
+.*.env
+data
+bin
+release
+accounts.txt
+sub2api-accounts.json
+**/*.db
+**/*.db-*
+**/*.key
+**/*.pem

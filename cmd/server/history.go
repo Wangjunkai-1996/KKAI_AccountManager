@@ -96,7 +96,7 @@ func handleHistory() http.HandlerFunc {
 		var importsErr error
 		var sub2Statuses map[int64]sub2AccountStatus
 		if sub2Importer != nil && sub2Importer.configured() {
-			imports, sub2Statuses, importsErr = sub2Importer.syncAccountStatuses(r.Context())
+			imports, sub2Statuses, importsErr = sub2Importer.syncAccountStatuses(withSub2StatusCache(r.Context()))
 		}
 		var recoveries map[int64]store.AccountRecoveryTask
 		recoveryDestination := ""

@@ -49,6 +49,14 @@ func TestReadinessChecksDatabase(t *testing.T) {
 	if body["status"] != "ready" || body["database_ready"] != true {
 		t.Fatalf("unexpected readiness body: %#v", body)
 	}
+	if err := history.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recorder = httptest.NewRecorder()
+	handleReadiness(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("closed database readiness status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
 }
 
 func TestLoginHTTPStatusDeadline(t *testing.T) {

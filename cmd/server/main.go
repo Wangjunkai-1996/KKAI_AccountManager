@@ -134,26 +134,33 @@ type proxyCheckRequest struct {
 }
 
 func main() {
+	if err := runServer(); err != nil {
+		log.Printf("❌ %v", err)
+		os.Exit(1)
+	}
+}
+
+func runServer() error {
 	flag.Parse()
 	if *maxConcurrent < 1 || *maxConcurrent > 10 {
-		log.Fatal("❌ 最大并发数必须在 1 到 10 之间")
+		return errors.New("最大并发数必须在 1 到 10 之间")
 	}
 	if *rateLimit < 1 || *loginTimeout <= 0 {
-		log.Fatal("❌ 请求上限和登录总超时时间必须大于 0")
+		return errors.New("请求上限和登录总超时时间必须大于 0")
 	}
 	limiter = newRateLimiter(*rateLimit, 10*time.Minute)
 	loginSlots = make(chan struct{}, *maxConcurrent)
 	if err := login.ValidateHTTPProxy(*proxy); err != nil {
-		log.Fatalf("❌ 代理配置无效: %v", err)
+		return fmt.Errorf("代理配置无效: %w", err)
 	}
 	if err := login.ValidateHTTPProxy(*upstreamProxy); err != nil {
-		log.Fatalf("❌ 前置代理配置无效: %v", err)
+		return fmt.Errorf("前置代理配置无效: %w", err)
 	}
 	if strings.TrimSpace(*upstreamProxy) != "" && strings.TrimSpace(*proxy) == "" {
-		log.Fatal("❌ 使用前置代理时必须配置出口 HTTP 代理")
+		return errors.New("使用前置代理时必须配置出口 HTTP 代理")
 	}
 	if err := initLoginHistory(*historyDBPath, *historyKeyPath); err != nil {
-		log.Fatalf("❌ 初始化账号历史数据库失败: %v", err)
+		return fmt.Errorf("初始化账号历史数据库失败: %w", err)
 	}
 	defer func() {
 		if err := loginHistory.Close(); err != nil {
@@ -231,6 +238,9 @@ func main() {
 	}
 
 	server := newHTTPServer(addr, nil)
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
+	server.BaseContext = func(net.Listener) context.Context { return requestCtx }
 	errCh := make(chan error, 1)
 	go func() { errCh <- server.ListenAndServe() }()
 	signals := make(chan os.Signal, 1)
@@ -239,20 +249,24 @@ func main() {
 	select {
 	case sig := <-signals:
 		log.Printf("收到 %s，开始优雅停机", sig)
+		cancelRequests()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("⚠️ HTTP 服务优雅停机失败: %v", err)
-			// A client that keeps an SSE stream open must not prevent process
-			// shutdown forever after the grace period expires.
-			_ = server.Close()
-		}
+		shutdownErr := server.Shutdown(shutdownCtx)
 		cancel()
+		if shutdownErr != nil {
+			log.Printf("⚠️ HTTP 服务优雅停机失败: %v", shutdownErr)
+			// Request contexts were canceled above. Keep waiting for handlers to
+			// finish their durable writes before the deferred DB close runs.
+			if err := server.Shutdown(context.Background()); err != nil {
+				return fmt.Errorf("HTTP 服务停机失败: %w", err)
+			}
+		}
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("❌ 服务器停止: %v", err)
-			os.Exit(1)
+			return fmt.Errorf("服务器停止: %w", err)
 		}
 	}
+	return nil
 }
 
 // newHTTPServer keeps the timeout policy in one place. WriteTimeout is left

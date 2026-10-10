@@ -41,16 +41,17 @@ type sub2ImportService struct {
 // The history page polls frequently. Cache successful read-only detail
 // responses briefly so each refresh does not fan out one request per account.
 const sub2StatusCacheTTL = 10 * time.Second
+const sub2StatusCacheLimit = 1024
 
-type sub2StatusFreshContextKey struct{}
+type sub2StatusCacheContextKey struct{}
 
-func withSub2StatusFresh(ctx context.Context) context.Context {
-	return context.WithValue(ctx, sub2StatusFreshContextKey{}, true)
+func withSub2StatusCache(ctx context.Context) context.Context {
+	return context.WithValue(ctx, sub2StatusCacheContextKey{}, true)
 }
 
 func sub2StatusCacheEnabled(ctx context.Context) bool {
-	value, _ := ctx.Value(sub2StatusFreshContextKey{}).(bool)
-	return !value
+	value, _ := ctx.Value(sub2StatusCacheContextKey{}).(bool)
+	return value
 }
 
 type sub2DetailCacheEntry struct {
@@ -739,7 +740,14 @@ func (s *sub2ImportService) cachedSub2AccountDetail(ctx context.Context, id int6
 	if s.statusCache == nil {
 		s.statusCache = make(map[int64]sub2DetailCacheEntry)
 	}
-	s.statusCache[id] = sub2DetailCacheEntry{detail: detail, code: code, expiresAt: now.Add(sub2StatusCacheTTL)}
+	for cachedID, entry := range s.statusCache {
+		if !now.Before(entry.expiresAt) {
+			delete(s.statusCache, cachedID)
+		}
+	}
+	if len(s.statusCache) < sub2StatusCacheLimit {
+		s.statusCache[id] = sub2DetailCacheEntry{detail: detail, code: code, expiresAt: now.Add(sub2StatusCacheTTL)}
+	}
 	s.statusMu.Unlock()
 	return detail, code, nil
 }

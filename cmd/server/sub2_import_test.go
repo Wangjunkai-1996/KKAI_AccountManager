@@ -160,10 +160,10 @@ func TestSub2AccountStatusCachesBriefly(t *testing.T) {
 	}))
 	defer server.Close()
 	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
-	if got := service.sub2AccountStatus(context.Background(), 42, time.Now().UTC()); !got.Exists || got.Unknown {
+	if got := service.sub2AccountStatus(withSub2StatusCache(context.Background()), 42, time.Now().UTC()); !got.Exists || got.Unknown {
 		t.Fatalf("first status = %+v", got)
 	}
-	if got := service.sub2AccountStatus(context.Background(), 42, time.Now().UTC()); !got.Exists || got.Unknown {
+	if got := service.sub2AccountStatus(withSub2StatusCache(context.Background()), 42, time.Now().UTC()); !got.Exists || got.Unknown {
 		t.Fatalf("cached status = %+v", got)
 	}
 	if requests.Load() != 1 {
