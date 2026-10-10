@@ -4,6 +4,12 @@
 
 > 新对话请先读取 `DOCS_INDEX.md`、`NEW_CHAT_CONTEXT.md` 和 `SYS1_DEPLOYMENT.md`。当前 sys1 已部署 `openai-login.service`；服务健康不等于真实 OAuth 或账号恢复链路验收通过。
 
+## 当前发布：后续审查整改（2026-10-10）
+
+线上 `20261010T093908Z-lifecycle-migration-hardening`，源码 `f28a11e` 已推送。完成多目标恢复/检测/历史隔离与旧库升级、优雅停机、数据库 readiness、历史缓存、实时监控及 Docker 持久化/浏览器运行环境整改。回滚保留 `20261010T044103Z-destination-isolation`。
+
+09:55:39 UTC 延迟验收通过：active/running、无重启、health/ready/socket 正常、公网未认证401、巡检继续、严重错误聚合0；备份与回滚就绪。定向 Go/race/vet、脚本/Compose、Node 和 Linux 构建通过；未运行全仓套件、Docker 构建/容器浏览器或手动真实 OAuth。线上部分账号仍在等待/冷却或状态暂时未知。完整证据与精确命令见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。以下日期条目为历史发布记录。
+
 ## 浏览器 challenge 自动重试发布（2026-10-10）
 
 `20261009T155200Z-challenge-retry` 已上线，源码基线为 `b6809f0`，Linux amd64 二进制 SHA-256 为 `ed2e4565641acc794c4a6057244e1832a98f2a599f098cfdc3e2c530f56b72b5`。初始导航、邮箱/密码表单和 OAuth 回调阶段遇到 Cloudflare challenge 时，当前浏览器最多等待 25 秒；验证仍未通过则按 `RetryCount`、退避和 3 分钟总超时重新创建浏览器。账号删除/停用、地区限制和普通 4xx 仍立即停止。

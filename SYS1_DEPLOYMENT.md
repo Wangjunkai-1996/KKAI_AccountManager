@@ -1,5 +1,42 @@
 # sys1 线上部署说明
 
+## 后续审查整改发布（2026-10-10 17:51 上海时间）
+
+- `2026-10-10T09:51:43Z` 切换 release `20261010T093908Z-lifecycle-migration-hardening`，源码 `f28a11ec753ba34f7100b129dfc52a371263c7f0`，已推送 `origin/main`，Mac 干净工作区构建。Linux amd64 SHA-256：`3fe7edd98296f477761306a6af4962de8e289752c3c58728a3c9cbb7ade24e67`。
+- 恢复/检测批次持久化目标，latest/due/queued/历史/复检按目标隔离；旧任务仅在唯一 imported 绑定时推断目标，交付任务以交付记录为准，孤儿记录不阻断升级。同远端 ID 跨目标、旧 schema 重开升级、凭据和历史保留有回归覆盖。
+- HTTP 增加请求头/空闲超时、数据库 `/ready` 和 SIGINT/SIGTERM 收尾；监听失败返回非零退出码且执行资源清理。停机先取消请求，等待 handler 写入完成，再停止 worker 和关闭数据库；15 秒仅为首轮优雅等待，最终进程硬停止受 systemd 20 秒上限约束。
+- 历史页面 Sub2 详情缓存 10 秒，最多 1024 项并清理过期项；检测回调、监控和恢复读取实时状态，不让缓存遮住新 401。
+- Playwright 脚本统一模块版本，不再修改依赖清单；headless 使用 bundled Chromium。Docker 统一 Debian 路径，移除不兼容 Alpine 快捷镜像，修复 CMD 覆盖，限制宿主 loopback，数据库/密钥使用持久卷，探针使用 `/ready`，旧容器迁移有数据保护。Docker 改动只做静态验收，不作为本次 sys1 发布方式。
+- 隔离候选复制 110 个账号，自动恢复关闭、Sub2 未配置，显式交付/资料任务清空。候选 health、静态资源 hash、SQLite 完整性、Node/driver hash 和旧二进制读取新 schema 均通过；候选阶段未单独调用 `/ready`，生产阶段已验证。
+- 停服前后登录、导入、恢复、检测、交付、资料任务、复检在途数均为 0。SQLite 一致性备份 `/var/lib/openai-login/backups/accounts-before-20261010T093908Z-lifecycle-migration-hardening.db`，2,985,984 字节、0600、`integrity_check=ok`。
+- `2026-10-10T09:55:39Z` 延迟验收：active/running、`NRestarts=0`，实际二进制 PID 1550791；本机及入口 socket 的 health/readiness 正常，`database_ready=true`；公网未认证 HTTP401，有效 Nginx 路由仍为 `/run/tls/auth/login.sock`。巡检推进到 `09:54:46Z`，`enabled=true,running=true,last_error=""`；启动以来 panic/fatal/数据库锁/存储/监听/OAuth401/403/5xx 聚合均为 0。
+- 延迟快照 accounts=113、recovery tasks=188、deliveries=55、rechecks=114、repairs=0；巡检仍报告 10 个等待/冷却账号和 6 个状态暂时未知账号，不能将服务健康解释为所有账号已恢复。
+- 回滚版本 `20261010T044103Z-destination-isolation`，SHA-256 `109850dfe0798593af7312135fe191c0605696d6b9be3bf306d9efd5be0665d4`，旧 binary/Node/driver 和备份均核验保留。回滚只切版本，不覆盖业务数据库。
+- 正式 release 保留 `DEPLOYMENT.json`、`CANDIDATE_ACCEPTANCE.json`、`ACCEPTANCE.json`、`DELAYED_ACCEPTANCE.json`；隔离候选数据库/密钥和本轮远端临时上传文件已清理。未手动触发真实 OAuth/Challenge 或新账号 Sub2 交付，未构建 Docker 镜像/运行容器浏览器；未运行仓库完整测试套件。
+
+验证命令（均通过；远端脚本已清理，下列为执行记录）：
+
+```bash
+go test ./internal/store ./cmd/server ./internal/login -count=1 -timeout=180s
+go test -race ./internal/store ./cmd/server ./internal/login -count=1 -timeout=240s
+go vet ./internal/store ./cmd/server ./internal/login
+go test ./internal/store -run '^TestDestinationMigrationReopensLegacySchema$' -count=1 -timeout=30s -v
+go test -race ./internal/store -run '^TestDestinationMigrationReopensLegacySchema$' -count=1 -timeout=60s
+go test ./cmd/server -run 'TestSub2AccountStatusCachesBriefly|TestSub2MonitorAfterCompletedTaskChecksNewFailure' -count=1 -timeout=120s
+node --check cmd/server/client.js
+node cmd/server/client.test.cjs
+bash -n quick-docker.sh build-docker.sh fix-playwright.sh install-playwright.sh run.sh test.sh
+shellcheck quick-docker.sh build-docker.sh
+docker compose config --quiet
+git diff --check
+./build-linux.sh /tmp/openai-login-20261010T093908Z-lifecycle-migration-hardening
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-stage-lifecycle-migration-hardening.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-deploy-lifecycle-migration-hardening.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-verify-lifecycle-migration-hardening.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-cleanup-lifecycle-migration-hardening.py'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 -' < /tmp/auth-verify-lifecycle-migration-hardening.py
+```
+
 ## 多目标交付隔离修复发布（2026-10-10）
 
 - 切换时间约 `2026-10-10T05:03:34Z`，release `20261010T044103Z-destination-isolation`，源码提交 `da7289f5b84c0e61643254a84b212854b4577048`，Linux amd64 二进制 SHA-256：`109850dfe0798593af7312135fe191c0605696d6b9be3bf306d9efd5be0665d4`。回滚 release 为 `20261010T013500Z-retry-challenge-cleanup`；发布前备份 `/var/lib/openai-login/backups/accounts-before-20261010T044103Z-destination-isolation.db`，权限 `0600`，SQLite `integrity_check=ok`。
@@ -226,11 +263,11 @@ git diff --check
 
 当前部署基线（2026-10-10 UTC 发布后确认）：
 
-- 当前 release：`20261010T044103Z-destination-isolation`
-- 构建来源：本地 `main` 代码提交 `da7289f5b84c0e61643254a84b212854b4577048`，已推送 `origin/main`
-- 当前二进制 SHA-256：`109850dfe0798593af7312135fe191c0605696d6b9be3bf306d9efd5be0665d4`
-- 回滚 release：`20261010T013500Z-retry-challenge-cleanup`
-- 回滚二进制 SHA-256：`6cb8ffd46140e1c67624da2dbda794d5bfc847be920efd3dbdfb96f135a5a75c`
+- 当前 release：`20261010T093908Z-lifecycle-migration-hardening`
+- 构建来源：本地 `main` 代码提交 `f28a11ec753ba34f7100b129dfc52a371263c7f0`，已推送 `origin/main`
+- 当前二进制 SHA-256：`3fe7edd98296f477761306a6af4962de8e289752c3c58728a3c9cbb7ade24e67`
+- 回滚 release：`20261010T044103Z-destination-isolation`
+- 回滚二进制 SHA-256：`109850dfe0798593af7312135fe191c0605696d6b9be3bf306d9efd5be0665d4`
 - 当前服务应保持 `active (running)`，且 `NRestarts=0`
 - 当前服务端并发硬上限：10；页面选择的并发数由前端 worker 控制，实际不超过该上限。
 - 页面代理留空时默认走 sys1 IPv4 直连；`/etc/openai-login/proxy.env` 的 `OPENAI_LOGIN_PROXY` 已清空，旧代理仅保留为服务器上的 0600 配置备份。

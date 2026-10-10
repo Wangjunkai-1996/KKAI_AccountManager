@@ -4,11 +4,11 @@
 
 > 新对话先读取 `DOCS_INDEX.md`、本文和 `SYS1_DEPLOYMENT.md`。本文只记录项目状态，不保存账号密码、TOTP、代理凭据或 token。
 
-## 当前线上最终 release（2026-10-10）
+## 当前发布：后续审查整改（2026-10-10）
 
-当前线上为 `20261010T013500Z-retry-challenge-cleanup`，源码提交 `a61b7b8`，二进制 SHA-256：`6cb8ffd46140e1c67624da2dbda794d5bfc847be920efd3dbdfb96f135a5a75c`；回滚为 `20261010T001828Z-retry-policy-final`。邮箱/密码/MFA/Consent Challenge 提交进入外层重试，临时 Chromium 网络错误和超大 `Retry-After` 已修复；账号删除清理有 lease、凭据版本和 `operation_id` CAS。
+线上 `20261010T093908Z-lifecycle-migration-hardening`，源码 `f28a11e` 已推送。完成多目标恢复/检测/历史隔离与旧库升级、优雅停机、数据库 readiness、历史缓存、实时监控及 Docker 持久化/浏览器运行环境整改。回滚保留 `20261010T044103Z-destination-isolation`。
 
-延迟验收 `2026-10-10T02:16:03Z` 通过：新 release、socket、401 和自动恢复扫描均正常，启动以来错误聚合为 0。真实浏览器 Challenge 未执行（本机缺 Playwright driver）。详细发布记录见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。
+09:55:39 UTC 延迟验收通过：active/running、无重启、health/ready/socket 正常、公网未认证401、巡检继续、严重错误聚合0；备份与回滚就绪。定向 Go/race/vet、脚本/Compose、Node 和 Linux 构建通过；未运行全仓套件、Docker 构建/容器浏览器或手动真实 OAuth。线上部分账号仍在等待/冷却或状态暂时未知。完整证据与精确命令见 [SYS1_DEPLOYMENT.md](SYS1_DEPLOYMENT.md)。以下日期条目为历史发布记录。
 
 ## 浏览器 challenge 自动重试发布（2026-10-10）
 
