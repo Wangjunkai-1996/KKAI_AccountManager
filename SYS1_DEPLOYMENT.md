@@ -4,6 +4,14 @@
 
 > 这是 sys1 线上事实的唯一权威文档。新对话先读取 `DOCS_INDEX.md` 和 `NEW_CHAT_CONTEXT.md`，发生冲突时以本文的服务、端口、release、健康检查和验收结论为准。
 
+## 重试预算、恢复并发与 Challenge 最终发布（2026-10-10）
+
+- 当前 release：`20261010T001828Z-retry-policy-final`，源码提交 `319f13b428b7733a7521692171cf8be24d4b78f0`，Linux amd64 二进制 SHA-256：`54c1f86f5eafc21eca85b02af8d4235d15ee447b3b93812c2e15b179876ad672`。候选于 `2026-10-10T00:19:51Z` 完成隔离验收；上线前数据库备份为 `/var/lib/openai-login/backups/accounts-before-20261010T001828Z-retry-policy-final.db`。
+- 回滚 release：`20261009T155200Z-challenge-retry`。本次修复统一登录总尝试预算，代理 fallback 与浏览器重建共享预算；纳入 HTTP 408/429/5xx 和临时网络错误；保留并扣减 `Retry-After`；Challenge 最多等待 25 秒，耗尽后按剩余预算重试；确定性 OAuth/普通 4xx 不重试。恢复写回增加 checkpoint、`retry_count` 和 marker 轮次门禁，账号删除级联、取消检测、初始验证临时失败和 SSE 建连超时均有边界保护。
+- 本地验证通过：`go test ./cmd/server ./internal/login ./internal/store -count=1 -timeout=120s`、对应 `-race`（180 秒）、`go vet ./internal/login ./internal/store ./cmd/server`、`node --check cmd/server/client.js`、`node cmd/server/client.test.cjs`、`git diff --check`；未运行仓库完整套件。
+- 延迟验收（`2026-10-10T01:02:15Z`）：`openai-login.service` 为 `active/running`，`NRestarts=0`，当前 release 与回滚点可识别；本机及 `/srv/kkai/secrets/tls/kkrich-ltd/auth/login.sock` 的 `/health` 均为 `status=ok`，公网未认证请求返回 HTTP 401。`/api/account-recovery/settings` 返回 `enabled=true`、`running=true`、`last_error=""`，扫描从 `00:46:48Z` 推进至 `01:01:50Z`；启动以来 panic、fatal、database locked、存储、监听、OAuth 401/403/5xx 聚合均为 0。
+- 本轮临时二进制、部署脚本和候选数据库已清理；正式 release、回滚 release 与生产备份保留。未手动触发真实 OAuth，线上验收证明服务健康和扫描推进，不代表上游长期登录成功率。
+
 ## 浏览器 challenge 自动重试发布（2026-10-10）
 
 - 切换时间 `2026-10-09T16:04:39Z`，release `20261009T155200Z-challenge-retry`，源码 `b6809f0dd2ac00893319f392e3395e2477a860f6`，Linux amd64 二进制 SHA-256：`ed2e4565641acc794c4a6057244e1832a98f2a599f098cfdc3e2c530f56b72b5`。

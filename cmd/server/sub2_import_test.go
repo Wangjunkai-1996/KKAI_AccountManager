@@ -155,6 +155,10 @@ func TestDeleteDeletedAccountVerifiesAndDeletesRemoteBinding(t *testing.T) {
 	if err := history.UpdateSub2Import(ctx, task.ID, "imported", true, 42, ""); err != nil {
 		t.Fatal(err)
 	}
+	version, err := history.GetAccountCredentialVersion(ctx, accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var deleted atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -174,7 +178,7 @@ func TestDeleteDeletedAccountVerifiesAndDeletesRemoteBinding(t *testing.T) {
 	}))
 	defer server.Close()
 	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
-	if err := service.deleteDeletedAccount(ctx, accountID); err != nil {
+	if err := service.deleteDeletedAccount(ctx, accountID, version); err != nil {
 		t.Fatal(err)
 	}
 	if deleted.Load() != 1 {
@@ -193,6 +197,10 @@ func TestDeleteDeletedAccountSkipsChangedBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := history.UpdateSub2Import(ctx, task.ID, "imported", true, 42, ""); err != nil {
+		t.Fatal(err)
+	}
+	version, err := history.GetAccountCredentialVersion(ctx, accountID)
+	if err != nil {
 		t.Fatal(err)
 	}
 	var deleted atomic.Int32
@@ -218,11 +226,87 @@ func TestDeleteDeletedAccountSkipsChangedBinding(t *testing.T) {
 	}))
 	defer server.Close()
 	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
-	if err := service.deleteDeletedAccount(ctx, accountID); err == nil {
+	if err := service.deleteDeletedAccount(ctx, accountID, version); err == nil {
 		t.Fatal("changed binding deletion unexpectedly succeeded")
 	}
 	if deleted.Load() != 0 {
 		t.Fatalf("delete requests = %d, want 0", deleted.Load())
+	}
+}
+
+func TestDeleteDeletedAccountSkipsChangedCredentialVersion(t *testing.T) {
+	history, accountID := testOAuthStore(t)
+	ctx := context.Background()
+	task, _, err := history.CreateOrGetSub2Import(ctx, "test", accountID, "operation", "idempotency-version", []byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.UpdateSub2Import(ctx, task.ID, "imported", true, 42, ""); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected remote request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
+	if err := service.deleteDeletedAccount(ctx, accountID, 0); err == nil {
+		t.Fatal("credential version change unexpectedly allowed deletion")
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("remote requests = %d, want 0", requests.Load())
+	}
+}
+
+func TestDeleteDeletedAccountHoldsAccountLeaseAcrossRemoteDelete(t *testing.T) {
+	history, accountID := testOAuthStore(t)
+	ctx := context.Background()
+	task, _, err := history.CreateOrGetSub2Import(ctx, "test", accountID, "operation", "idempotency-lease", []byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.UpdateSub2Import(ctx, task.ID, "imported", true, 42, ""); err != nil {
+		t.Fatal(err)
+	}
+	version, err := history.GetAccountCredentialVersion(ctx, accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	getStarted := make(chan struct{})
+	allowGet := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case http.MethodGet + " /api/v1/admin/accounts/42":
+			close(getStarted)
+			<-allowGet
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
+				"id": 42, "platform": "openai", "type": "oauth",
+				"credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": "chatgpt-1"},
+				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID}},
+			}})
+		case http.MethodDelete + " /api/v1/admin/accounts/42":
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"message": "deleted"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
+	deleteDone := make(chan error, 1)
+	go func() { deleteDone <- service.deleteDeletedAccount(ctx, accountID, version) }()
+	select {
+	case <-getStarted:
+	case <-time.After(time.Second):
+		t.Fatal("remote verification did not start")
+	}
+	if _, _, err := history.BeginAttempt(ctx, store.Credentials{Email: "sub2@example.com", Password: "new-password"}); !errors.Is(err, store.ErrAccountBusy) {
+		t.Fatalf("login was allowed during destructive cleanup: %v", err)
+	}
+	close(allowGet)
+	if err := <-deleteDone; err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -151,6 +151,19 @@ func TestDetectAccessBlockUsesCloudflareResponseSignal(t *testing.T) {
 	}
 }
 
+func TestRetryableLoginErrorRecognizesTransientBrowserNetworkFailures(t *testing.T) {
+	for _, message := range []string{
+		"page.goto: net::ERR_CONNECTION_CLOSED",
+		"page.goto: net::ERR_TIMED_OUT",
+		"page.goto: net::ERR_PROXY_CONNECTION_FAILED",
+		"page.goto: net::ERR_NETWORK_CHANGED",
+	} {
+		if !retryableLoginError(errors.New(message)) {
+			t.Fatalf("retryableLoginError(%q) = false, want true", message)
+		}
+	}
+}
+
 func TestAuthHTTPStatusErrorClassification(t *testing.T) {
 	for _, tt := range []struct {
 		status    int
@@ -425,6 +438,26 @@ func TestHasCloudflareChallengeSignals(t *testing.T) {
 				t.Errorf("hasCloudflareChallengeSignals() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestAuthActionErrorPreservesChallengeStatusAndRetryAfter(t *testing.T) {
+	status := &authHTTPStatusError{Status: http.StatusForbidden, Cause: ErrCloudflareChallenge, RetryAfter: time.Minute}
+	statuses := make(chan error, 1)
+	statuses <- status
+	err := authActionError(nil, nil, statuses, errors.New("click failed"))
+	if !errors.Is(err, ErrCloudflareChallenge) || err != status || !retryableLoginError(err) {
+		t.Fatalf("action failure lost retryable challenge metadata: %v", err)
+	}
+	ordinary := &authHTTPStatusError{Status: http.StatusForbidden}
+	statuses <- ordinary
+	if err := authActionError(nil, nil, statuses, errors.New("click failed")); err != ordinary || retryableLoginError(err) {
+		t.Fatalf("ordinary 403 became a retryable challenge: %v", err)
+	}
+	deleted := &authHTTPStatusError{Status: http.StatusForbidden, Cause: ErrCloudflareChallenge, UpstreamCode: "account_deleted"}
+	statuses <- deleted
+	if err := authActionError(nil, nil, statuses, errors.New("click failed")); retryableLoginError(err) {
+		t.Fatalf("deleted account became a retryable challenge: %v", err)
 	}
 }
 

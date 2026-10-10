@@ -37,3 +37,28 @@ func TestLinkSub2AccountIsTerminalAndPreservesExistingTask(t *testing.T) {
 		t.Fatalf("missing account link error = %v", err)
 	}
 }
+
+func TestDeleteSub2ImportBindingRequiresOperationIdentity(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	a, err := s.UpsertCredentials(ctx, Credentials{Email: "delete-cas@example.test", Password: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	linked, err := s.LinkSub2Account(ctx, "current", a.ID, 42, "linked-first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSub2ImportBinding(ctx, "current", a.ID, 42, "linked-other"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetSub2Import(ctx, "current", a.ID); err != nil {
+		t.Fatalf("wrong operation removed binding: %v", err)
+	}
+	if err := s.DeleteSub2ImportBinding(ctx, "current", a.ID, 42, linked.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetSub2Import(ctx, "current", a.ID); !errors.Is(err, ErrSub2ImportNotFound) {
+		t.Fatalf("binding remains after matching delete: %v", err)
+	}
+}

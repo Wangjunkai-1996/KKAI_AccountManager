@@ -28,6 +28,7 @@ var ErrCloudflareChallenge = errors.New("auth.openai.com 被 Cloudflare challeng
 var ErrUnsupportedRegion = errors.New("OpenAI 拒绝当前网络出口：Country, region, or territory not supported")
 var ErrUnexpectedAuthPage = errors.New("OpenAI 登录流程未进入预期页面")
 var ErrAuthConnectionReset = errors.New("访问 auth.openai.com 时连接被重置")
+var ErrAuthTransientNetwork = errors.New("访问 auth.openai.com 时出现临时网络错误")
 
 // authRejectionError keeps callback/page errors without inventing an HTTP status.
 type authRejectionError struct {
@@ -342,9 +343,45 @@ func retryableLoginError(err error) bool {
 	if errors.Is(err, playwright.ErrTimeout) || errors.Is(err, playwright.ErrTargetClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) {
 		return true
 	}
+	if errors.Is(err, ErrAuthTransientNetwork) || isTransientBrowserError(err) {
+		return true
+	}
 	var networkErr net.Error
 	if errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary()) {
 		return true
+	}
+	return false
+}
+
+// isTransientBrowserError recognizes Chromium navigation errors that do not
+// implement net.Error when Playwright wraps them as plain text.
+func isTransientBrowserError(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, candidate := range []error{syscall.ECONNRESET, syscall.ECONNABORTED, syscall.ECONNREFUSED, syscall.ETIMEDOUT, syscall.EPIPE} {
+		if errors.Is(err, candidate) {
+			return true
+		}
+	}
+	text := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"net::err_connection_reset",
+		"net::err_connection_closed",
+		"net::err_connection_aborted",
+		"net::err_connection_refused",
+		"net::err_timed_out",
+		"net::err_network_changed",
+		"net::err_proxy_connection_failed",
+		"net::err_proxy_connection_refused",
+		"net::err_internet_disconnected",
+		"net::err_name_not_resolved",
+		"net::err_address_unreachable",
+		"net::err_network_access_denied",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
 	}
 	return false
 }
@@ -637,7 +674,7 @@ func (s *Service) loginAttempt(ctx context.Context, email, password, totpSecret 
 	}
 
 	if err := page.Click("button[type='submit'], button:has-text('Continue'), button:has-text('继续'), button:has-text('下一步')"); err != nil {
-		return nil, fmt.Errorf("点击继续按钮失败: %w", err)
+		return nil, authActionError(page, cloudflareChallengeCh, authStatusCh, fmt.Errorf("点击继续按钮失败: %w", err))
 	}
 
 	// 3. 输入密码
@@ -659,7 +696,7 @@ func (s *Service) loginAttempt(ctx context.Context, email, password, totpSecret 
 	}
 
 	if err := page.Click("button[type='submit'], button:has-text('Continue'), button:has-text('继续'), button:has-text('Log in'), button:has-text('登录')"); err != nil {
-		return nil, fmt.Errorf("点击登录按钮失败: %w", err)
+		return nil, authActionError(page, cloudflareChallengeCh, authStatusCh, fmt.Errorf("点击登录按钮失败: %w", err))
 	}
 
 	// 4. 处理可能延迟出现的 2FA，并捕获 OAuth 回调。
@@ -797,7 +834,7 @@ func waitOAuthCallbackContext(ctx context.Context, page playwright.Page, callbac
 					return "", errors.New("提交 TOTP 失败：未找到验证按钮")
 				}
 				if clickErr := button.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(10000)}); clickErr != nil {
-					return "", fmt.Errorf("提交 TOTP 失败: %w", clickErr)
+					return "", authActionError(page, challenges, authStatusCh, fmt.Errorf("提交 TOTP 失败: %w", clickErr))
 				}
 				mfaSubmitted = true
 				continue
@@ -807,7 +844,7 @@ func waitOAuthCallbackContext(ctx context.Context, page playwright.Page, callbac
 			}
 			emitProgress(ctx, "consent", "正在确认授权")
 			log.Printf("   ✅ 确认 Codex 授权...")
-			if err := clickCodexConsent(ctx, page, email); err != nil {
+			if err := clickCodexConsent(ctx, page, email, challenges, authStatusCh); err != nil {
 				return "", err
 			}
 			consentSubmitted = true
@@ -822,10 +859,20 @@ func waitChallengeRecovery(ctx context.Context, page playwright.Page, challenges
 	if terminal == nil {
 		terminal = cloudflareError()
 	}
+	var statusErr *authHTTPStatusError
+	if errors.As(terminal, &statusErr) && !statusErr.retryable() {
+		return terminal
+	}
 	if page == nil {
 		return terminal
 	}
 	if !isCloudflareChallenge(page) {
+		// A response-level challenge on a form submission can leave the old
+		// form visible. Keep its HTTP status and retry the whole browser attempt;
+		// only a bare signal may be stale after the page already recovered.
+		if statusErr != nil && errors.Is(terminal, ErrCloudflareChallenge) {
+			return terminal
+		}
 		if err := drainChallengeSignals(challenges, statuses); err != nil {
 			return authFailureWithPage(page, err)
 		}
@@ -904,19 +951,30 @@ func findAuthActionButton(page playwright.Page) (playwright.Locator, int, error)
 	return candidates[0], 0, nil
 }
 
-func clickCodexConsent(ctx context.Context, page playwright.Page, email string) error {
+func clickCodexConsent(ctx context.Context, page playwright.Page, email string, challenges <-chan struct{}, statuses <-chan error) error {
 	for attempt := 0; attempt < 3; attempt++ {
 		button, count, err := findAuthActionButton(page)
 		if err != nil {
-			return fmt.Errorf("%w：确认 Codex 授权失败（%s）: %v", ErrUnexpectedAuthPage, authPageSummary(page, email), err)
+			return authActionError(page, challenges, statuses, fmt.Errorf("%w：确认 Codex 授权失败（%s）: %w", ErrUnexpectedAuthPage, authPageSummary(page, email), err))
 		}
+		var clickErr error
 		if count > 0 {
-			if err := button.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(10000)}); err == nil {
+			clickErr = button.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(10000)})
+			if clickErr == nil {
 				return nil
 			}
+			if err := authActionError(page, challenges, statuses, nil); err != nil {
+				return err
+			}
 		}
-		body, _ := page.Locator("body").InnerText()
-		if !strings.Contains(body, "Route Error (403") && !hasCloudflareChallengeSignals(page.URL(), "", body) {
+		if err := authActionError(page, challenges, statuses, nil); err != nil {
+			return err
+		}
+		body, _ := page.Locator("body").InnerText(playwright.LocatorInnerTextOptions{Timeout: playwright.Float(challengeProbeTimeoutMS)})
+		if !strings.Contains(body, "Route Error (403") {
+			if clickErr != nil {
+				return fmt.Errorf("确认 Codex 授权失败: %w", clickErr)
+			}
 			break
 		}
 		if attempt == 2 {
@@ -932,7 +990,22 @@ func clickCodexConsent(ctx context.Context, page playwright.Page, email string) 
 			return ctx.Err()
 		}
 	}
-	return fmt.Errorf("%w：确认 Codex 授权失败（%s）", ErrUnexpectedAuthPage, authPageSummary(page, email))
+	return authActionError(page, challenges, statuses, fmt.Errorf("%w：确认 Codex 授权失败（%s）", ErrUnexpectedAuthPage, authPageSummary(page, email)))
+}
+
+// Preserve the response classification when a click also reports a browser
+// error. A submitted auth request may be challenged without replacing the form.
+func authActionError(page playwright.Page, challenges <-chan struct{}, statuses <-chan error, fallback error) error {
+	if rejection := accountRejectionOnPage(page); rejection != nil {
+		return rejection
+	}
+	if err := takeAuthFailure(challenges, statuses); err != nil {
+		return authFailureWithPage(page, err)
+	}
+	if page != nil && isCloudflareChallenge(page) {
+		return cloudflareError()
+	}
+	return fallback
 }
 
 // LoginWithProxy runs one login with a request-specific HTTP proxy.
@@ -1136,8 +1209,11 @@ func navigateAuthorize(ctx context.Context, page playwright.Page, authorizeURL s
 	}
 
 	if gotoErr != nil {
-		if strings.Contains(gotoErr.Error(), "net::ERR_CONNECTION_RESET") {
-			return ErrAuthConnectionReset
+		if isTransientBrowserError(gotoErr) {
+			if strings.Contains(strings.ToLower(gotoErr.Error()), "net::err_connection_reset") {
+				return ErrAuthConnectionReset
+			}
+			return ErrAuthTransientNetwork
 		}
 		return fmt.Errorf("访问登录页失败（请检查 HTTP 代理连通性）: %w", gotoErr)
 	}

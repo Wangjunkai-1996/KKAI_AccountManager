@@ -777,6 +777,11 @@ func (s *sub2RecoveryService) setState(id int64, state, message string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := s.store.UpdateAccountRecoveryTask(ctx, id, state, message); err != nil {
+		// Account deletion cascades the recovery task. Its worker is already
+		// obsolete; do not turn that expected race into a global storage pause.
+		if recoveryTaskGone(err) {
+			return false
+		}
 		s.pauseRecovery(id)
 		return false
 	}
@@ -801,10 +806,23 @@ func recoveryRetryDelay(failure *recoveryOperationError, previousFailures int) t
 	if delay > time.Hour {
 		delay = time.Hour
 	}
-	if retryAfter := time.Duration(failure.RetryAfterSeconds) * time.Second; retryAfter > delay {
+	if retryAfter := recoveryRetryAfterDuration(failure.RetryAfterSeconds); retryAfter > delay {
 		delay = retryAfter
 	}
 	return delay
+}
+
+func recoveryRetryAfterDuration(seconds int) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	maxSeconds := int64(maxDuration / time.Second)
+	value := int64(seconds)
+	if value >= maxSeconds {
+		return maxDuration
+	}
+	return time.Duration(value) * time.Second
 }
 
 func classifyRecoveryLoginError(err error) *recoveryOperationError {

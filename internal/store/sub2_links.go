@@ -35,10 +35,10 @@ func (s *Store) LinkSub2Account(ctx context.Context, destinationKey string, acco
 // DeleteSub2ImportBinding removes a confirmed remote binding after the remote
 // account has been deleted. The identity conditions keep a concurrent rebind
 // from being removed accidentally.
-func (s *Store) DeleteSub2ImportBinding(ctx context.Context, destinationKey string, accountID, sub2AccountID int64) error {
+func (s *Store) DeleteSub2ImportBinding(ctx context.Context, destinationKey string, accountID, sub2AccountID int64, operationID string) error {
 	if strings.TrimSpace(destinationKey) == "" || accountID <= 0 || sub2AccountID <= 0 {
 		return errors.New("invalid sub2 account binding")
 	}
-	_, err := s.db.ExecContext(ctx, "DELETE FROM sub2_imports WHERE destination_key=? AND account_id=? AND sub2_account_id=? AND state='imported'", destinationKey, accountID, sub2AccountID)
+	_, err := s.db.ExecContext(ctx, "DELETE FROM sub2_imports WHERE destination_key=? AND account_id=? AND sub2_account_id=? AND operation_id=? AND state='imported'", destinationKey, accountID, sub2AccountID, operationID)
 	return err
 }

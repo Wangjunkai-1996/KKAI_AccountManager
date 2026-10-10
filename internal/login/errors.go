@@ -138,6 +138,8 @@ func classifyLoginCode(err error) string {
 		return LoginErrorUnsupportedRegion
 	case errors.Is(err, ErrAuthConnectionReset):
 		return LoginErrorConnectionReset
+	case errors.Is(err, ErrAuthTransientNetwork):
+		return LoginErrorConnectionReset
 	case errors.Is(err, context.DeadlineExceeded):
 		return LoginErrorTimeout
 	case errors.Is(err, context.Canceled):
@@ -196,7 +198,7 @@ func classifyLoginStage(err error) string {
 		return LoginStageToken
 	case strings.Contains(text, "身份"), strings.Contains(text, "jwt"), strings.Contains(text, "identity"):
 		return LoginStageIdentity
-	case strings.Contains(text, "代理"), strings.Contains(text, "proxy"), errors.Is(err, ErrAuthConnectionReset):
+	case strings.Contains(text, "代理"), strings.Contains(text, "proxy"), errors.Is(err, ErrAuthConnectionReset), errors.Is(err, ErrAuthTransientNetwork):
 		return LoginStageProxy
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return LoginStageBrowser
@@ -234,6 +236,9 @@ func safeLoginMessage(err error) string {
 	}
 	if errors.Is(err, ErrAuthConnectionReset) {
 		return ErrAuthConnectionReset.Error()
+	}
+	if errors.Is(err, ErrAuthTransientNetwork) {
+		return "认证站暂时无法连接，请稍后重试"
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "登录请求超时"

@@ -236,11 +236,15 @@ func (s *accountCheckService) finish(id, accountID int64, result store.AccountCh
 	// before performing the destructive remote cleanup so that cancellation
 	// cannot turn a stale account_deleted result into a DELETE request.
 	deleteConfirmed := false
+	var deleteCredentialAttemptID int64
 	if !result.Canceled && result.Outcome == "account_deleted" && accountID > 0 && sub2Importer != nil && batch.State != "stopping" && batch.State != "stopped" {
 		if committedBatch, checks, readErr := s.store.GetAccountCheckBatch(ctx, batch.ID); readErr == nil && committedBatch.State != "stopping" && committedBatch.State != "stopped" {
 			for _, check := range checks {
 				if check.ID == id && check.State == "finished" && check.Outcome == "account_deleted" && check.Freshness == "current" {
 					deleteConfirmed = true
+					if check.CredentialAttemptID != nil {
+						deleteCredentialAttemptID = *check.CredentialAttemptID
+					}
 					break
 				}
 			}
@@ -248,7 +252,7 @@ func (s *accountCheckService) finish(id, accountID int64, result store.AccountCh
 	}
 	if deleteConfirmed {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := sub2Importer.deleteDeletedAccount(cleanupCtx, accountID); err != nil {
+		if err := sub2Importer.deleteDeletedAccount(cleanupCtx, accountID, deleteCredentialAttemptID); err != nil {
 			// The detection result is durable; a temporary Sub2 failure can be
 			// retried by a later explicit detection without changing its outcome.
 			log.Print("检测确认账号已删除，但清理 Sub2 账号失败")

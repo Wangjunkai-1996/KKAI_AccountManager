@@ -735,9 +735,21 @@ func (s *sub2ImportService) apiJSONStatus(ctx context.Context, method, path stri
 // deleteDeletedAccount removes the verified Sub2 binding when AUTH has
 // explicitly confirmed that the upstream account was deleted. A missing
 // remote account is already in the desired state and is therefore successful.
-func (s *sub2ImportService) deleteDeletedAccount(ctx context.Context, accountID int64) error {
+func (s *sub2ImportService) deleteDeletedAccount(ctx context.Context, accountID, expectedCredentialAttemptID int64) error {
 	if s == nil || !s.configured() || accountID <= 0 {
 		return nil
+	}
+	lease, err := s.store.AcquireAccountRecovery(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	defer lease.Release()
+	currentVersion, err := s.store.GetAccountCredentialVersion(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if currentVersion != expectedCredentialAttemptID {
+		return errors.New("检测使用的凭据版本已变化，跳过删除")
 	}
 	task, err := s.store.GetSub2Import(ctx, s.destinationKey, accountID)
 	if errors.Is(err, store.ErrSub2ImportNotFound) {
@@ -756,7 +768,7 @@ func (s *sub2ImportService) deleteDeletedAccount(ctx context.Context, accountID 
 	var detail map[string]any
 	status, err := s.apiJSONStatus(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(task.Sub2AccountID, 10), nil, &detail)
 	if status == http.StatusNotFound {
-		return s.store.DeleteSub2ImportBinding(ctx, s.destinationKey, accountID, task.Sub2AccountID)
+		return s.store.DeleteSub2ImportBinding(ctx, s.destinationKey, accountID, task.Sub2AccountID, task.OperationID)
 	}
 	if err != nil {
 		return err
@@ -776,12 +788,12 @@ func (s *sub2ImportService) deleteDeletedAccount(ctx context.Context, accountID 
 	}
 	status, err = s.apiJSONStatus(ctx, http.MethodDelete, "/admin/accounts/"+strconv.FormatInt(task.Sub2AccountID, 10), nil, nil)
 	if status == http.StatusNotFound {
-		return s.store.DeleteSub2ImportBinding(ctx, s.destinationKey, accountID, task.Sub2AccountID)
+		return s.store.DeleteSub2ImportBinding(ctx, s.destinationKey, accountID, task.Sub2AccountID, task.OperationID)
 	}
 	if err != nil {
 		return err
 	}
-	return s.store.DeleteSub2ImportBinding(ctx, s.destinationKey, accountID, task.Sub2AccountID)
+	return s.store.DeleteSub2ImportBinding(ctx, s.destinationKey, accountID, task.Sub2AccountID, task.OperationID)
 }
 
 func (s *sub2ImportService) reconcile(ctx context.Context, id int64) error {

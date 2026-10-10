@@ -184,6 +184,19 @@ func TestRecoveryRetryBackoff(t *testing.T) {
 	}
 }
 
+func TestRecoveryRetryAfterDurationDoesNotOverflow(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	if got := recoveryRetryAfterDuration(maxInt); got <= 0 {
+		t.Fatalf("large Retry-After wrapped to %s", got)
+	}
+	if got := recoveryRetryDelay(&recoveryOperationError{Code: "rate_limited", RetryAfterSeconds: maxInt}, 0); got < time.Hour {
+		t.Fatalf("large Retry-After shortened to %s", got)
+	}
+	if got := recoveryRetryAfterDuration(-1); got != 0 {
+		t.Fatalf("negative Retry-After = %s, want 0", got)
+	}
+}
+
 func TestRecoveryLoginHTTP4xxRequiresAction(t *testing.T) {
 	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, 499} {
 		failure := classifyRecoveryLoginInfo(login.LoginErrorInfo{Code: login.LoginErrorAuthHTTPStatus, HTTPStatus: status}, 0)

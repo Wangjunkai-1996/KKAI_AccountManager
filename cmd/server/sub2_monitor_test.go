@@ -101,6 +101,19 @@ func TestSub2RecoverySettingsRuntimeStatus(t *testing.T) {
 	}
 }
 
+func TestSub2RecoverySetStateIgnoresDeletedTask(t *testing.T) {
+	f := newRecoveryFixture(t, false)
+	if _, err := f.db.Exec(`DELETE FROM account_recovery_tasks WHERE id=?`, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if f.service.setState(f.task.ID, store.RecoveryValidating, "stale worker") {
+		t.Fatal("expected deleted task update to fail")
+	}
+	if f.service.paused.Load() {
+		t.Fatal("deleted recovery task must not pause the worker")
+	}
+}
+
 func TestSub2MonitorEnableScansChecksAndRecovers(t *testing.T) {
 	f := newMonitorFixture(t)
 	// Run only the independent monitor. Claiming checks/tasks below makes each

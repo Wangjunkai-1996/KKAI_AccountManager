@@ -1,12 +1,12 @@
 # KKAI_AUTH 文档索引
 
-更新时间：2026-10-09（Asia/Shanghai）
+更新时间：2026-10-10（Asia/Shanghai）
 
 这是新对话的入口文件。新对话不要先依赖旧聊天记录，按下面顺序读取当前文档。
 
-## 当前线上 release：浏览器 challenge 自动重试（2026-10-10）
+## 当前线上 release：重试预算、恢复并发与 Challenge 最终发布（2026-10-10）
 
-`20261009T155200Z-challenge-retry` 已上线，源码 `b6809f0`，Linux amd64 二进制 SHA-256：`ed2e4565641acc794c4a6057244e1832a98f2a599f098cfdc3e2c530f56b72b5`。challenge 会在当前浏览器等待最多 25 秒，未通过时按有限重试重新创建浏览器；账号删除/停用、地区限制和普通 4xx 仍终止。16:04:39 UTC 切换、16:06:16 UTC 延迟验收通过，active/running、巡检、路由、静态资源、数据库和回滚均核对通过；本轮未手动触发真实 OAuth。
+`20261010T001828Z-retry-policy-final` 已上线，源码 `319f13b`，Linux amd64 二进制 SHA-256：`54c1f86f5eafc21eca85b02af8d4235d15ee447b3b93812c2e15b179876ad672`。登录、代理 fallback、Challenge 和浏览器重建共享总重试预算；HTTP 408/429/5xx 与临时网络错误按剩余预算重试，确定性 OAuth/普通 4xx 终止。恢复写回增加 checkpoint、`retry_count`、marker 及取消/删除竞态门禁。`2026-10-10T01:02:15Z` 延迟验收通过，服务、socket、401、自动恢复扫描和错误聚合正常；回滚为 `20261009T155200Z-challenge-retry`。本轮未手动触发真实 OAuth。
 
 ## 八项审查修复（2026-10-09 13:44:42 上海时间）
 
