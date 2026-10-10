@@ -110,7 +110,7 @@ func (s *Store) FinishAttemptAndQueueDelivery(ctx context.Context, attemptID int
 		return AccountDelivery{}, err
 	}
 	now := time.Now().UnixMilli()
-	if _, err := tx.ExecContext(ctx, `UPDATE account_deliveries SET state='canceled',last_error='已有更新的登录结果，旧交付已取消',next_retry_at=NULL,manual_action='',updated_at=? WHERE account_id=? AND recovery_task_id=0 AND state NOT IN ('completed','canceled')`, now, accountID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE account_deliveries SET state='canceled',last_error='已有更新的登录结果，旧交付已取消',next_retry_at=NULL,manual_action='',updated_at=? WHERE account_id=? AND destination_key=? AND recovery_task_id=0 AND state NOT IN ('completed','canceled')`, now, accountID, destination); err != nil {
 		return AccountDelivery{}, err
 	}
 	insert, err := tx.ExecContext(ctx, `INSERT INTO account_deliveries(account_id,credential_version,destination_key,state,created_at,updated_at,options_json) VALUES(?,?,?,'queued',?,?,?)`, accountID, attemptID, destination, now, now, string(raw))
@@ -131,15 +131,26 @@ func (s *Store) GetAccountDelivery(ctx context.Context, id int64) (AccountDelive
 	return scanAccountDelivery(s.db.QueryRowContext(ctx, accountDeliverySelect+` WHERE id=?`, id))
 }
 
-func (s *Store) ListLatestAccountDeliveries(ctx context.Context) ([]AccountDelivery, error) {
-	return s.listAccountDeliveries(ctx, accountDeliverySelect+` WHERE id IN (SELECT MAX(id) FROM account_deliveries GROUP BY account_id) ORDER BY id DESC`)
+// An empty destination retains the latest delivery across all destinations for
+// history viewing when Sub2 is not configured.
+func (s *Store) ListLatestAccountDeliveries(ctx context.Context, destinations ...string) ([]AccountDelivery, error) {
+	destination := deliveryDestination(destinations)
+	return s.listAccountDeliveries(ctx, accountDeliverySelect+` WHERE id IN (SELECT MAX(id) FROM account_deliveries WHERE (?='' OR destination_key=?) GROUP BY account_id) ORDER BY id DESC`, destination, destination)
 }
 
-func (s *Store) ListDueAccountDeliveries(ctx context.Context, now time.Time, limit int) ([]AccountDelivery, error) {
+func (s *Store) ListDueAccountDeliveries(ctx context.Context, now time.Time, limit int, destinations ...string) ([]AccountDelivery, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	return s.listAccountDeliveries(ctx, accountDeliverySelect+` WHERE id IN (SELECT MAX(id) FROM account_deliveries GROUP BY account_id) AND recovery_task_id=0 AND state IN ('queued','checking','importing','retry_wait') AND manual_action='' AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY COALESCE(next_retry_at,created_at),id LIMIT ?`, now.UnixMilli(), limit)
+	destination := deliveryDestination(destinations)
+	return s.listAccountDeliveries(ctx, accountDeliverySelect+` WHERE id IN (SELECT MAX(id) FROM account_deliveries WHERE (?='' OR destination_key=?) GROUP BY account_id) AND recovery_task_id=0 AND state IN ('queued','checking','importing','retry_wait') AND manual_action='' AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY COALESCE(next_retry_at,created_at),id LIMIT ?`, destination, destination, now.UnixMilli(), limit)
+}
+
+func deliveryDestination(destinations []string) string {
+	if len(destinations) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(destinations[0])
 }
 
 func (s *Store) listAccountDeliveries(ctx context.Context, query string, args ...any) ([]AccountDelivery, error) {

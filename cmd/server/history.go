@@ -109,7 +109,11 @@ func handleHistory() http.HandlerFunc {
 			}
 		}
 		configured := sub2Importer != nil && sub2Importer.configured()
-		deliveries, deliveryErr := listDeliveryStatuses(r.Context(), loginHistory)
+		destination := ""
+		if configured {
+			destination = sub2Importer.destinationKey
+		}
+		deliveries, deliveryErr := listDeliveryStatuses(r.Context(), loginHistory, destination)
 		if deliveryErr != nil {
 			respondJSONStatus(w, http.StatusServiceUnavailable, LoginResponse{Message: "读取交付状态失败，请稍后刷新", Code: "delivery_read_failed"})
 			return
@@ -260,7 +264,7 @@ func runWithHistoryAccount(ctx context.Context, accountID int64, req LoginReques
 	if req.AutoDeliver {
 		requested := req.DeliveryOptions
 		if requested == nil && accountID > 0 {
-			deliveries, err := loginHistory.ListLatestAccountDeliveries(ctx)
+			deliveries, err := loginHistory.ListLatestAccountDeliveries(ctx, sub2Importer.destinationKey)
 			if err != nil {
 				return nil, err
 			}

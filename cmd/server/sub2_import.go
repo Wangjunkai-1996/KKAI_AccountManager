@@ -1042,7 +1042,7 @@ func (s *sub2ImportService) handleAction(w http.ResponseWriter, r *http.Request)
 		respondJSONStatus(w, http.StatusInternalServerError, LoginResponse{Message: "读取导入任务失败"})
 		return
 	}
-	_ = s.store.WakeAccountDelivery(r.Context(), task.AccountID)
+	_ = s.store.WakeAccountDelivery(r.Context(), task.AccountID, s.destinationKey)
 	respondJSON(w, map[string]any{"success": true, "import": task})
 }
 

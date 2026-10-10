@@ -102,14 +102,15 @@ func (s *Store) SaveDeliveryDefaults(ctx context.Context, destination string, o 
 	_, err = s.db.ExecContext(ctx, `INSERT INTO sub2_delivery_defaults(destination_key,options_json) VALUES(?,?) ON CONFLICT(destination_key) DO UPDATE SET options_json=excluded.options_json`, destination, string(raw))
 	return err
 }
-func (s *Store) WakeAccountDelivery(ctx context.Context, accountID int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE account_deliveries SET state='queued',next_retry_at=NULL,manual_action='',last_error='' WHERE account_id=? AND id=(SELECT MAX(id) FROM account_deliveries WHERE account_id=?) AND recovery_task_id=0 AND state IN ('retry_wait','requires_action')`, accountID, accountID)
+func (s *Store) WakeAccountDelivery(ctx context.Context, accountID int64, destinations ...string) error {
+	destination := deliveryDestination(destinations)
+	_, err := s.db.ExecContext(ctx, `UPDATE account_deliveries SET state='queued',next_retry_at=NULL,manual_action='',last_error='' WHERE account_id=? AND id=(SELECT MAX(id) FROM account_deliveries WHERE account_id=? AND (?='' OR destination_key=?)) AND recovery_task_id=0 AND state IN ('retry_wait','requires_action')`, accountID, accountID, destination, destination)
 	return err
 }
 
 func (s *Store) HasEarlierCompletedDelivery(ctx context.Context, accountID, deliveryID int64) (bool, error) {
 	var found bool
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM account_deliveries d JOIN account_recovery_tasks t ON t.id=d.recovery_task_id WHERE d.account_id=? AND d.id<? AND t.state='completed')`, accountID, deliveryID).Scan(&found)
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM account_deliveries d JOIN account_recovery_tasks t ON t.id=d.recovery_task_id WHERE d.account_id=? AND d.id<? AND d.destination_key=(SELECT destination_key FROM account_deliveries WHERE id=?) AND t.state='completed')`, accountID, deliveryID, deliveryID).Scan(&found)
 	return found, err
 }
 

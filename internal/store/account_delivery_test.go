@@ -68,6 +68,96 @@ func TestAccountDeliveryLoginAndIntentCommitAtomically(t *testing.T) {
 	}
 }
 
+func TestAccountDeliveryQueriesStayWithinDestination(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	account, attempt, err := s.BeginAttempt(ctx, Credentials{Email: "delivery-destinations@example.test", Password: "fixture-password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishAttempt(ctx, attempt.ID, true, &Result{AccessToken: "fixture-at", RefreshToken: "fixture-rt"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	attempt.Release()
+	a, err := s.QueueAccountDelivery(ctx, account.ID, "destination-a", DefaultDeliveryOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.QueueAccountDelivery(ctx, account.ID, "destination-b", DefaultDeliveryOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.ID >= b.ID {
+		t.Fatalf("fixture destinations were not ordered: a=%d b=%d", a.ID, b.ID)
+	}
+	due := time.Now().Add(time.Minute).Truncate(time.Millisecond)
+	if _, err := s.UpdateAccountDelivery(ctx, a.ID, "retry_wait", "暂时失败", "", &due, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateAccountDelivery(ctx, b.ID, "requires_action", "需要核对", "核对目标", nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := s.ListLatestAccountDeliveries(ctx, "destination-a")
+	if err != nil || len(latest) != 1 || latest[0].ID != a.ID {
+		t.Fatalf("destination-a latest=%+v err=%v", latest, err)
+	}
+	latest, err = s.ListLatestAccountDeliveries(ctx, "destination-b")
+	if err != nil || len(latest) != 1 || latest[0].ID != b.ID {
+		t.Fatalf("destination-b latest=%+v err=%v", latest, err)
+	}
+	latest, err = s.ListLatestAccountDeliveries(ctx)
+	if err != nil || len(latest) != 1 || latest[0].ID != b.ID {
+		t.Fatalf("unfiltered latest compatibility=%+v err=%v", latest, err)
+	}
+	dueA, err := s.ListDueAccountDeliveries(ctx, due, 10, "destination-a")
+	if err != nil || len(dueA) != 1 || dueA[0].ID != a.ID {
+		t.Fatalf("destination-a due=%+v err=%v", dueA, err)
+	}
+	dueB, err := s.ListDueAccountDeliveries(ctx, due, 10, "destination-b")
+	if err != nil || len(dueB) != 0 {
+		t.Fatalf("destination-b manual task selected=%+v err=%v", dueB, err)
+	}
+	if err := s.WakeAccountDelivery(ctx, account.ID, "destination-a"); err != nil {
+		t.Fatal(err)
+	}
+	a, err = s.GetAccountDelivery(ctx, a.ID)
+	if err != nil || a.State != "queued" || a.NextRetryAt != nil {
+		t.Fatalf("destination-a was not woken: %+v err=%v", a, err)
+	}
+	b, err = s.GetAccountDelivery(ctx, b.ID)
+	if err != nil || b.State != "requires_action" {
+		t.Fatalf("destination-b was changed by destination-a wake: %+v err=%v", b, err)
+	}
+}
+
+func TestNewLoginDoesNotCancelAnotherDestinationDelivery(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	account, attempt, err := s.BeginAttempt(ctx, Credentials{Email: "delivery-login-destinations@example.test", Password: "fixture-password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt.Release()
+	if _, err := s.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &Result{AccessToken: "fixture-at", RefreshToken: "fixture-rt"}, "destination-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.QueueAccountDelivery(ctx, account.ID, "destination-b", DefaultDeliveryOptions()); err != nil {
+		t.Fatal(err)
+	}
+	_, nextAttempt, err := s.BeginAttempt(ctx, Credentials{Email: "delivery-login-destinations@example.test", Password: "fixture-password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nextAttempt.Release()
+	if _, err := s.FinishAttemptAndQueueDelivery(ctx, nextAttempt.ID, &Result{AccessToken: "next-at", RefreshToken: "next-rt"}, "destination-a"); err != nil {
+		t.Fatal(err)
+	}
+	deliveries, err := s.ListLatestAccountDeliveries(ctx, "destination-b")
+	if err != nil || len(deliveries) != 1 || deliveries[0].State != "queued" {
+		t.Fatalf("destination-b delivery was canceled by destination-a login: %+v err=%v", deliveries, err)
+	}
+}
+
 func TestAccountDeliveryLatestRetryAndRestart(t *testing.T) {
 	s, dir := testStore(t)
 	if err := s.migrateAccountDeliveries(); err != nil {

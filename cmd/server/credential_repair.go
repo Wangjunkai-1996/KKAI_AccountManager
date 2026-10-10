@@ -241,7 +241,7 @@ func (s *sub2RecoveryService) loginCredentialRepair(ctx context.Context, repair 
 	var options store.DeliveryOptions
 	if s.configured() {
 		var requested *store.DeliveryOptions
-		deliveries, err := s.store.ListLatestAccountDeliveries(ctx)
+		deliveries, err := s.store.ListLatestAccountDeliveries(ctx, s.sub2.destinationKey)
 		if err != nil {
 			s.failCredentialRepair(repair, err)
 			return

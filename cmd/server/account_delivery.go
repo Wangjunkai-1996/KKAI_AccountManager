@@ -55,7 +55,7 @@ func (s *accountDeliveryService) runOnce() {
 		return
 	}
 	defer s.importer.workerMu.Unlock()
-	tasks, err := s.store.ListDueAccountDeliveries(s.ctx, time.Now(), 5)
+	tasks, err := s.store.ListDueAccountDeliveries(s.ctx, time.Now(), 5, s.importer.destinationKey)
 	if err != nil {
 		return
 	}
@@ -196,8 +196,8 @@ func (s *accountDeliveryService) process(ctx context.Context, task store.Account
 	s.recovery.notify()
 }
 
-func listDeliveryStatuses(ctx context.Context, history *store.Store) (map[int64]store.AccountDelivery, error) {
-	tasks, err := history.ListLatestAccountDeliveries(ctx)
+func listDeliveryStatuses(ctx context.Context, history *store.Store, destinations ...string) (map[int64]store.AccountDelivery, error) {
+	tasks, err := history.ListLatestAccountDeliveries(ctx, destinations...)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +256,7 @@ func (s *accountDeliveryService) handleAction(w http.ResponseWriter, r *http.Req
 		respondJSONStatus(w, 404, LoginResponse{Message: "交付任务不存在"})
 		return
 	}
-	latest, err := s.store.ListLatestAccountDeliveries(ctx)
+	latest, err := s.store.ListLatestAccountDeliveries(ctx, s.importer.destinationKey)
 	if err != nil {
 		respondJSONStatus(w, 500, LoginResponse{Message: "交付状态读取失败"})
 		return
@@ -290,7 +290,7 @@ func (s *accountDeliveryService) handleAction(w http.ResponseWriter, r *http.Req
 			respondJSONStatus(w, 409, LoginResponse{Message: "登录凭据版本已变化"})
 			return
 		}
-		err = s.store.WakeAccountDelivery(ctx, task.AccountID)
+		err = s.store.WakeAccountDelivery(ctx, task.AccountID, s.importer.destinationKey)
 	}
 	if err != nil {
 		respondJSONStatus(w, 409, LoginResponse{Message: classifyRecoveryError(err).Error()})
