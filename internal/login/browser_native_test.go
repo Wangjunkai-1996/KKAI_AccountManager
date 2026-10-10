@@ -59,6 +59,71 @@ func TestWaitForChromeCDPContextCancellation(t *testing.T) {
 	}
 }
 
+func TestNativeChromeStartupSmoke(t *testing.T) {
+	if os.Getenv("OPENAI_LOGIN_STARTUP_SMOKE") != "1" {
+		t.Skip("set OPENAI_LOGIN_STARTUP_SMOKE=1 to test native Chrome startup without network or account access")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	session, err := startNativeChrome(ctx, Config{Timeout: 15 * time.Second, Proxy: ""})
+	if err != nil {
+		t.Fatalf("native Chrome startup failed: %v", err)
+	}
+	defer session.close()
+	defer session.pw.Stop()
+	defer session.browser.Close()
+
+	contexts := session.browser.Contexts()
+	if len(contexts) == 0 || len(contexts[0].Pages()) == 0 {
+		t.Fatal("native Chrome did not expose an initial page")
+	}
+	value, err := contexts[0].Pages()[0].Evaluate("() => 1 + 1")
+	if err != nil {
+		t.Fatalf("native Chrome page evaluation failed: %v", err)
+	}
+	if fmt.Sprint(value) != "2" {
+		t.Fatalf("native Chrome page evaluation = %v, want 2", value)
+	}
+}
+
+func TestPlaywrightBrowserStartupSmoke(t *testing.T) {
+	if os.Getenv("OPENAI_LOGIN_STARTUP_SMOKE") != "1" {
+		t.Skip("set OPENAI_LOGIN_STARTUP_SMOKE=1 to test Playwright startup without network or account access")
+	}
+	executable, err := findSystemChrome()
+	if err != nil {
+		t.Fatalf("find system Chrome: %v", err)
+	}
+	for _, headless := range []bool{true, false} {
+		t.Run(fmt.Sprintf("headless=%t", headless), func(t *testing.T) {
+			pw, err := runPlaywright()
+			if err != nil {
+				t.Fatalf("Playwright driver startup failed: %v", err)
+			}
+			defer pw.Stop()
+			browser, err := pw.Chromium.Launch(browserLaunchOptions(Config{
+				Headless: headless,
+				Timeout:  15 * time.Second,
+			}, executable))
+			if err != nil {
+				t.Fatalf("Playwright browser startup failed: %v", err)
+			}
+			defer browser.Close()
+			page, err := browser.NewPage()
+			if err != nil {
+				t.Fatalf("Playwright page creation failed: %v", err)
+			}
+			value, err := page.Evaluate("() => 1 + 1")
+			if err != nil {
+				t.Fatalf("Playwright page evaluation failed: %v", err)
+			}
+			if fmt.Sprint(value) != "2" {
+				t.Fatalf("Playwright page evaluation = %v, want 2", value)
+			}
+		})
+	}
+}
+
 func TestNativeChromeFingerprint(t *testing.T) {
 	if os.Getenv("OPENAI_LOGIN_BROWSER_TEST") != "1" {
 		t.Skip("set OPENAI_LOGIN_BROWSER_TEST=1 to inspect the native Chrome environment")

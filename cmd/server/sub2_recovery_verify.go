@@ -43,8 +43,9 @@ func (e *recoveryOperationError) Error() string {
 		"request_rejected": "Sub2 拒绝恢复请求，请核对接口配置", "configuration": "恢复服务配置不完整，请检查配置",
 		"account_unavailable": "上游明确报告账号停用或删除，请人工处理", "login_required": "登录需要人工处理，请检查账号信息或验证要求",
 		"login_failed": "登录暂未完成，稍后自动重试", "identity_changed": "账号身份或绑定发生变化，请人工核对",
-		"challenge":    "认证站暂时要求浏览器验证，稍后自动重试",
-		"manual_pause": "账号已被人工暂停或禁用，保持原状态", "version_changed": "本地凭据版本已变化，请核对后继续",
+		"challenge":                  "认证站暂时要求浏览器验证，稍后自动重试",
+		"browser_runtime_permission": "浏览器运行环境权限不足，请联系管理员检查 Node 与驱动权限",
+		"manual_pause":               "账号已被人工暂停或禁用，保持原状态", "version_changed": "本地凭据版本已变化，请核对后继续",
 		"checkpoint_unconfirmed": "无法确认恢复检查点归属，请人工核对", "account_busy": "账号正在处理其他任务，稍后自动重试",
 	}
 	if message := messages[e.Code]; message != "" {

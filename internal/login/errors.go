@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -38,18 +40,19 @@ const (
 )
 
 const (
-	LoginErrorUnknown             = "login_failed"
-	LoginErrorCloudflareChallenge = "cloudflare_challenge"
-	LoginErrorUnsupportedRegion   = "unsupported_region"
-	LoginErrorConnectionReset     = "connection_reset"
-	LoginErrorTimeout             = "timeout"
-	LoginErrorCanceled            = "canceled"
-	LoginErrorAuthHTTPStatus      = "auth_http_status"
-	LoginErrorUnexpectedPage      = "unexpected_auth_page"
-	LoginErrorOAuth               = "oauth_error"
-	LoginErrorTokenExchange       = "token_exchange"
-	LoginErrorIdentity            = "identity_error"
-	LoginErrorConfiguration       = "invalid_configuration"
+	LoginErrorUnknown                  = "login_failed"
+	LoginErrorCloudflareChallenge      = "cloudflare_challenge"
+	LoginErrorUnsupportedRegion        = "unsupported_region"
+	LoginErrorConnectionReset          = "connection_reset"
+	LoginErrorTimeout                  = "timeout"
+	LoginErrorCanceled                 = "canceled"
+	LoginErrorAuthHTTPStatus           = "auth_http_status"
+	LoginErrorUnexpectedPage           = "unexpected_auth_page"
+	LoginErrorOAuth                    = "oauth_error"
+	LoginErrorTokenExchange            = "token_exchange"
+	LoginErrorIdentity                 = "identity_error"
+	LoginErrorConfiguration            = "invalid_configuration"
+	LoginErrorBrowserRuntimePermission = "browser_runtime_permission"
 )
 
 var (
@@ -67,6 +70,14 @@ var (
 func DescribeError(err error) LoginErrorInfo {
 	if err == nil {
 		return LoginErrorInfo{Stage: LoginStageUnknown, Code: LoginErrorUnknown, Message: ""}
+	}
+	var pathErr *os.PathError
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
+		errors.As(err, &pathErr) && pathErr.Op == "fork/exec" && errors.Is(pathErr, fs.ErrPermission) {
+		return LoginErrorInfo{
+			Stage: LoginStageBrowser, Code: LoginErrorBrowserRuntimePermission,
+			Message: "浏览器运行环境权限不足，请联系管理员检查 Node 与驱动权限",
+		}
 	}
 	info := LoginErrorInfo{
 		Stage:   classifyLoginStage(err),

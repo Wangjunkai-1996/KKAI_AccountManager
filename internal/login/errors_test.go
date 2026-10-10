@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 )
@@ -42,6 +44,34 @@ func TestDescribeErrorClassifiesSentinels(t *testing.T) {
 			info := DescribeError(tt.err)
 			if info.Stage != tt.stage || info.Code != tt.code {
 				t.Fatalf("DescribeError() = %#v, want stage=%q code=%q", info, tt.stage, tt.code)
+			}
+		})
+	}
+}
+
+func TestDescribeErrorBrowserRuntimePermission(t *testing.T) {
+	permissionErr := fmt.Errorf("playwright 启动失败: %w", &os.PathError{
+		Op: "fork/exec", Path: "/private/runtime/node", Err: fs.ErrPermission,
+	})
+	for _, tt := range []struct {
+		name, code    string
+		err           error
+		wantRetryable bool
+	}{
+		{"driver execute denied", LoginErrorBrowserRuntimePermission, permissionErr, false},
+		{"cancellation wins", LoginErrorCanceled, errors.Join(context.Canceled, permissionErr), false},
+		{"timeout wins", LoginErrorTimeout, errors.Join(context.DeadlineExceeded, permissionErr), true},
+		{"database open denied", LoginErrorUnknown, &os.PathError{Op: "open", Path: "/private/accounts.db", Err: fs.ErrPermission}, false},
+		{"plain permission", LoginErrorUnknown, fs.ErrPermission, false},
+		{"driver missing", LoginErrorUnknown, &os.PathError{Op: "fork/exec", Path: "/private/runtime/node", Err: fs.ErrNotExist}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			info := DescribeError(tt.err)
+			if info.Code != tt.code || info.Retryable != tt.wantRetryable || info.AccountStatus != "" || strings.Contains(info.Message, "/private/") {
+				t.Fatalf("DescribeError() = %#v, want safe %s retryable=%v", info, tt.code, tt.wantRetryable)
+			}
+			if tt.code == LoginErrorBrowserRuntimePermission && (info.Stage != LoginStageBrowser || info.Message != "浏览器运行环境权限不足，请联系管理员检查 Node 与驱动权限") {
+				t.Fatalf("runtime permission diagnosis = %#v", info)
 			}
 		})
 	}

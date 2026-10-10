@@ -1,5 +1,13 @@
 # sys1 线上部署说明
 
+## 浏览器启动故障恢复（2026-10-10 18:04 上海时间）
+
+- 17:51 发布复制旧 release 的 Node 时，仅核对内容 hash。旧文件是服务用户所有、`0700`；root 执行 `shutil.copy2` 后，新文件变成 root 所有且仍为 `0700`，`openai-login` 无法执行。Chrome 本身可以启动，但 Playwright driver 无法启动，登录在 browser 阶段约 0.5 秒失败。
+- `10:04:15 UTC` 以真实服务用户复现 Node `Permission denied`，将当前 release 的 Node 权限修正为 `0755`。内容 hash 不变，无需重启、切换二进制或修改业务数据库。证据保存在该 release 的 `INCIDENT_NODE_PERMISSION.json`。
+- 同服务用户、挂载命名空间、DISPLAY/XAUTHORITY 与 Node/driver 环境运行 `TestNativeChromeStartupSmoke`，1.05 秒通过。`10:05:54–10:06:01 UTC` 历史账号 279 使用 IPv4、`auto_deliver=false` 完成完整 OAuth，耗时 6,903ms，AT/RT 已保存；用户确认恢复可用。证据：`INCIDENT_BROWSER_SMOKE.txt`、`INCIDENT_LOGIN_ACCEPTANCE.json`。
+- 10:08 UTC 后复核 active/running、NRestarts=0、readiness 和巡检正常；修复后未再出现 browser/login_failed。回滚 release 的 Node 也由真实服务用户执行通过。
+- 上一轮 HTTP/数据库健康和 hash 检查不足以证明浏览器可用，原“验收通过”不应解读为端到端可用；下方发布门禁已补充真实用户 Node/driver/browser 检查。
+
 ## 后续审查整改发布（2026-10-10 17:51 上海时间）
 
 - `2026-10-10T09:51:43Z` 切换 release `20261010T093908Z-lifecycle-migration-hardening`，源码 `f28a11ec753ba34f7100b129dfc52a371263c7f0`，已推送 `origin/main`，Mac 干净工作区构建。Linux amd64 SHA-256：`3fe7edd98296f477761306a6af4962de8e289752c3c58728a3c9cbb7ade24e67`。
@@ -398,12 +406,22 @@ ssh sys1 'curl -fsS http://127.0.0.1:18082/health'
 
 ## 发布和回滚原则
 
-1. 在 Mac 构建 Linux amd64 二进制，并同时准备匹配的 Playwright driver、Node 和 Chrome 运行环境。
-2. 每次发布使用新的不可变目录 `/opt/openai-login/releases/<release-id>`。
-3. 发布前保留当前 `/opt/openai-login/current` 作为回滚点，不覆盖或删除旧 release。
-4. 切换 `current` 后执行 `systemctl daemon-reload`、重启服务和 `/health` 检查。
-5. 线上登录验收失败时，将 `current` 原子切回上一个已知版本，再重启并复查健康状态。
-6. 不把账号凭据、代理密码或 token 写入 release、日志或文档。
+1. 在 Mac 构建 Linux amd64 二进制和匹配源码的浏览器 smoke 测试二进制，准备匹配的 Playwright driver、Node 和 Chrome。
+2. 每次使用新的目录 `/opt/openai-login/releases/<release-id>`。root 复制可执行程序后明确设置 `node` 和 `openai-login-web` 为 `0755`；driver 目录及文件必须允许服务用户遍历、读取。hash 相同不代表权限正确，不能用 root 执行成功替代服务身份验证。
+3. 切换前，以 `openai-login.service` 实际 `User`，对候选与回滚 release **分别**运行 `verify-runtime.sh <release-absolute-path> <smoke-binary-absolute-path>`。必须保留服务实际 DISPLAY/XAUTHORITY/Chrome 配置；`PrivateTmp=yes` 时需进入其挂载命名空间才能访问 Xauthority。脚本强制验证 Node、driver、原生 Chrome 及 Playwright 有头/无头浏览器，测试空白页面不提交账号；任一项失败禁止切换。脚本只验收，不自动修改文件或发布。
+4. 隔离候选数据库、关闭自动恢复且不配置 Sub2，清除副本内显式交付/资料任务。验证 health、ready、静态资源、数据库完整性和回滚兼容；切换前完成已授权单账号真实登录验收，凭据只保存在隔离数据库。
+5. 保留现有 release；确认在途任务归零，停服后复查，并创建 SQLite 一致性备份。原子切换 `current`，启动服务，检查实际二进制、health、ready、有效路由、socket、公网认证与后台巡检。
+6. 切换后再次以新服务实际环境运行浏览器 smoke 和已授权单账号 OAuth，并在至少一轮巡检后延迟复核。登录失败、`browser_runtime_permission`、panic、数据库与存储错误必须进入日志聚合；仅统计 OAuth HTTP 401/403/5xx 会漏掉浏览器初始化故障。
+7. 登录验收失败时，原子切回已通过运行时验证的回滚 release，再重启并复查。回滚只切版本，不覆盖业务数据库；如果是已确认的单一运行环境权限错误，可保留证据后原地修复并完成相同验收。
+8. 不把账号凭据、代理密码、token 或浏览器任意错误正文写入发布记录。只保留固定错误分类与脱敏指标。
+
+本地构建 smoke（只编译，不启动浏览器）：
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c ./internal/login -o /tmp/kkai-auth-login-smoke.test
+```
+
+`verify-runtime.sh` 必须与 smoke 二进制一起上传。调用前以 `systemctl show -p User --value openai-login.service` 和当前进程 `/proc/<pid>/environ` 白名单确认用户及显示环境；生产配置文件中的秘密不打印、不复制进命令行。脚本会拒绝 root 代替非 root 服务用户验收、缺少必需测试的旧二进制及不可执行的 Node。
 
 本项目是独立的登录工具，不要把它误认为 Sub2API 主服务，也不要用 Sub2API 的 Compose 发布流程替代本服务的 systemd 发布方式。
 

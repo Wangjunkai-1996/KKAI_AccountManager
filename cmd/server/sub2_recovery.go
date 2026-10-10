@@ -793,7 +793,7 @@ func (s *sub2RecoveryService) fail(id int64, state, message string) { s.setState
 func recoveryRetryDelay(failure *recoveryOperationError, previousFailures int) time.Duration {
 	delay := time.Minute
 	switch failure.Code {
-	case "rate_limited", "probe_failed", "protocol_error", "login_failed":
+	case "rate_limited", "probe_failed", "protocol_error", "login_failed", login.LoginErrorBrowserRuntimePermission:
 		delay = 5 * time.Minute
 	case "upstream_error":
 		delay = 2 * time.Minute
@@ -854,6 +854,8 @@ func classifyRecoveryLoginInfo(info login.LoginErrorInfo, retryAfter int) *recov
 		return &recoveryOperationError{Code: "login_required", HTTPStatus: info.HTTPStatus, RequiresAction: true}
 	}
 	switch info.Code {
+	case login.LoginErrorBrowserRuntimePermission:
+		return &recoveryOperationError{Code: login.LoginErrorBrowserRuntimePermission}
 	case login.LoginErrorTimeout:
 		return &recoveryOperationError{Code: "timeout"}
 	case login.LoginErrorCanceled:

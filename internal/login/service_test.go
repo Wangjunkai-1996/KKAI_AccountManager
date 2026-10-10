@@ -92,7 +92,7 @@ func TestBrowserCompatibilityOptions(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			config := NewService(Config{BrowserCompatibility: tt.compat}).config
-			launch := browserLaunchOptions(config)
+			launch := browserLaunchOptions(config, "")
 			foundArg := false
 			for _, arg := range launch.Args {
 				if arg == compatBrowserArg {
@@ -121,15 +121,29 @@ func TestBrowserCompatibilityOptions(t *testing.T) {
 		})
 	}
 
-	proxyLaunch := browserLaunchOptions(NewService(Config{Proxy: "http://127.0.0.1:7897"}).config)
+	proxyLaunch := browserLaunchOptions(NewService(Config{Proxy: "http://127.0.0.1:7897"}).config, "")
 	for _, arg := range proxyLaunch.Args {
 		if arg == "--no-proxy-server" {
 			t.Fatal("proxy launch unexpectedly disables proxies")
 		}
 	}
-	headlessLaunch := browserLaunchOptions(NewService(Config{Headless: true}).config)
-	if headlessLaunch.Channel != nil {
-		t.Fatalf("headless launch channel = %q, want bundled Chromium", *headlessLaunch.Channel)
+}
+
+func TestBrowserLaunchOptionsSelectInstalledBrowserRegardlessOfHeadless(t *testing.T) {
+	for _, headless := range []bool{false, true} {
+		for _, executable := range []string{"", "/installed/chrome"} {
+			launch := browserLaunchOptions(NewService(Config{Headless: headless}).config, executable)
+			if launch.Headless == nil || *launch.Headless != headless {
+				t.Fatalf("launch for headless=%v executable=%q: %+v", headless, executable, launch)
+			}
+			if executable == "" {
+				if launch.ExecutablePath != nil || launch.Channel != nil {
+					t.Fatalf("without system Chrome, want bundled Chromium; got %+v", launch)
+				}
+			} else if launch.ExecutablePath == nil || *launch.ExecutablePath != executable || launch.Channel == nil || *launch.Channel != "chrome" {
+				t.Fatalf("headless=%v ignored installed Chrome %q", headless, executable)
+			}
+		}
 	}
 }
 

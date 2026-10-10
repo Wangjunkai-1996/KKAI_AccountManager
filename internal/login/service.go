@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -155,16 +156,17 @@ func NewService(config Config) *Service {
 	return &Service{config: config}
 }
 
-func browserLaunchOptions(config Config) playwright.BrowserTypeLaunchOptions {
+func browserLaunchOptions(config Config, executable string) playwright.BrowserTypeLaunchOptions {
 	options := playwright.BrowserTypeLaunchOptions{
 		Headless: playwright.Bool(config.Headless),
 		Timeout:  playwright.Float(float64(config.Timeout.Milliseconds())),
 		Args:     []string{"--disable-dev-shm-usage", "--no-sandbox", "--disable-setuid-sandbox"},
 	}
-	// The bundled Playwright Chromium is available in containers and CI. Use
-	// the installed Chrome channel only for headed desktop sessions.
-	if !config.Headless {
+	// Headless changes rendering, not which browser is installed. Containers
+	// without system Chrome use Playwright's bundled Chromium by default.
+	if executable != "" {
 		options.Channel = playwright.String("chrome")
+		options.ExecutablePath = playwright.String(executable)
 	}
 	if strings.TrimSpace(config.Proxy) == "" {
 		options.Args = append(options.Args, "--no-proxy-server")
@@ -513,8 +515,12 @@ func (s *Service) loginAttempt(ctx context.Context, email, password, totpSecret 
 	defer stopLaunchCancellation()
 
 	if browser == nil {
+		executable, findErr := findSystemChrome()
+		if findErr != nil && strings.TrimSpace(os.Getenv("OPENAI_LOGIN_CHROME_PATH")) != "" {
+			return nil, findErr
+		}
 		// 浏览器选项
-		launchOptions := browserLaunchOptions(s.config)
+		launchOptions := browserLaunchOptions(s.config, executable)
 
 		if s.config.Proxy != "" {
 			proxyURL, err := parseHTTPProxy(s.config.Proxy)
