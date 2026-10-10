@@ -49,6 +49,12 @@ func withSub2StatusCache(ctx context.Context) context.Context {
 	return context.WithValue(ctx, sub2StatusCacheContextKey{}, true)
 }
 
+// Monitoring and recovery decisions must observe the current remote state;
+// only the frequently polled history view opts into the short cache.
+func withSub2StatusFresh(ctx context.Context) context.Context {
+	return context.WithValue(ctx, sub2StatusCacheContextKey{}, false)
+}
+
 func sub2StatusCacheEnabled(ctx context.Context) bool {
 	value, _ := ctx.Value(sub2StatusCacheContextKey{}).(bool)
 	return value

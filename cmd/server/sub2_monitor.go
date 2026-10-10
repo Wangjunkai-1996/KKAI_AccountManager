@@ -165,7 +165,7 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 	}()
 	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
 	defer cancel()
-	_, statuses, err := s.sub2.syncAccountStatuses(ctx)
+	_, statuses, err := s.sub2.syncAccountStatuses(withSub2StatusFresh(ctx))
 	if err != nil {
 		lastError = "Sub2 状态同步失败，下次扫描重试"
 		return
