@@ -26,10 +26,12 @@ docker rm openai-login 2>/dev/null || true
 # 启动新容器
 docker run -d \
   --name openai-login \
-  -p 8080:8080 \
-  -e HEADLESS=true \
+  -p 127.0.0.1:8080:8080 \
   --restart unless-stopped \
-  openai-login-web:latest
+  --health-cmd='wget -qO- http://127.0.0.1:8080/ready || exit 1' \
+  --health-interval=30s --health-timeout=5s --health-start-period=15s --health-retries=3 \
+  openai-login-web:latest \
+  -bind=0.0.0.0 -headless=true -open-browser=false
 
 echo "✅ 服务启动成功！"
 echo ""

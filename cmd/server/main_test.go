@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,46 @@ import (
 	"testing"
 	"time"
 )
+
+func TestHTTPServerTimeoutPolicy(t *testing.T) {
+	server := newHTTPServer("127.0.0.1:0", http.NewServeMux())
+	if server.ReadHeaderTimeout != 10*time.Second {
+		t.Fatalf("ReadHeaderTimeout = %s, want 10s", server.ReadHeaderTimeout)
+	}
+	if server.IdleTimeout != 120*time.Second {
+		t.Fatalf("IdleTimeout = %s, want 120s", server.IdleTimeout)
+	}
+	if server.WriteTimeout != 0 {
+		t.Fatalf("WriteTimeout = %s, want zero for SSE", server.WriteTimeout)
+	}
+}
+
+func TestReadinessChecksDatabase(t *testing.T) {
+	oldHistory, oldImporter := loginHistory, sub2Importer
+	t.Cleanup(func() { loginHistory, sub2Importer = oldHistory, oldImporter })
+	loginHistory = nil
+	sub2Importer = nil
+	recorder := httptest.NewRecorder()
+	handleReadiness(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("uninitialized readiness status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+
+	history, _ := testOAuthStore(t)
+	loginHistory = history
+	recorder = httptest.NewRecorder()
+	handleReadiness(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("ready status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["status"] != "ready" || body["database_ready"] != true {
+		t.Fatalf("unexpected readiness body: %#v", body)
+	}
+}
 
 func TestLoginHTTPStatusDeadline(t *testing.T) {
 	if got := loginHTTPStatus(context.DeadlineExceeded); got != http.StatusGatewayTimeout {

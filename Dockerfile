@@ -24,6 +24,7 @@ RUN apt-get update && \
     libcairo2 \
     libasound2 \
     libatspi2.0-0 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # 设置工作目录
@@ -48,4 +49,7 @@ RUN go build -o openai-login-web ./cmd/server
 EXPOSE 8080
 
 # 启动服务
-CMD ["./openai-login-web"]
+CMD ["./openai-login-web", "-bind=0.0.0.0", "-headless=true", "-open-browser=false"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/ready || exit 1

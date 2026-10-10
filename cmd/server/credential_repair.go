@@ -175,7 +175,11 @@ func (s *sub2RecoveryService) processCredentialRepair(repair store.CredentialRep
 		s.failCredentialRepair(repair, err)
 		return
 	}
-	task, taskErr := s.store.GetLatestAccountRecoveryTask(ctx, repair.AccountID)
+	destination := ""
+	if s.sub2 != nil {
+		destination = s.sub2.destinationKey
+	}
+	task, taskErr := s.store.GetLatestAccountRecoveryTaskForDestination(ctx, repair.AccountID, destination)
 	if taskErr != nil && !errors.Is(taskErr, store.ErrAccountRecoveryNotFound) {
 		s.failCredentialRepair(repair, taskErr)
 		return

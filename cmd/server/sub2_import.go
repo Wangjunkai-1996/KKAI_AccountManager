@@ -28,6 +28,35 @@ type sub2ImportService struct {
 	destinationKey string
 	client         *http.Client
 	workerMu       sync.Mutex
+	lifecycleOnce  sync.Once
+	startOnce      sync.Once
+	stopOnce       sync.Once
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	statusMu       sync.Mutex
+	statusCache    map[int64]sub2DetailCacheEntry
+}
+
+// The history page polls frequently. Cache successful read-only detail
+// responses briefly so each refresh does not fan out one request per account.
+const sub2StatusCacheTTL = 10 * time.Second
+
+type sub2StatusFreshContextKey struct{}
+
+func withSub2StatusFresh(ctx context.Context) context.Context {
+	return context.WithValue(ctx, sub2StatusFreshContextKey{}, true)
+}
+
+func sub2StatusCacheEnabled(ctx context.Context) bool {
+	value, _ := ctx.Value(sub2StatusFreshContextKey{}).(bool)
+	return !value
+}
+
+type sub2DetailCacheEntry struct {
+	detail    map[string]any
+	code      int
+	expiresAt time.Time
 }
 
 var sub2Importer *sub2ImportService
@@ -57,7 +86,17 @@ func newSub2ImportService(history *store.Store) *sub2ImportService {
 				return http.ErrUseLastResponse
 			},
 		},
+		statusCache: make(map[int64]sub2DetailCacheEntry),
 	}
+}
+
+func (s *sub2ImportService) initLifecycle() {
+	if s == nil {
+		return
+	}
+	s.lifecycleOnce.Do(func() {
+		s.ctx, s.cancel = context.WithCancel(context.Background())
+	})
 }
 
 func normalizeSub2BaseURL(raw string) (string, error) {
@@ -86,13 +125,36 @@ func (s *sub2ImportService) Start() {
 	if s == nil || s.store == nil {
 		return
 	}
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			s.runOnce(context.Background())
-		}
-	}()
+	s.initLifecycle()
+	s.startOnce.Do(func() {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-s.ctx.Done():
+					return
+				case <-ticker.C:
+					s.runOnce(s.ctx)
+				}
+			}
+		}()
+	})
+}
+
+// Stop cancels the importer worker and waits for an in-flight request to
+// observe the cancellation. It is safe to call more than once.
+func (s *sub2ImportService) Stop() {
+	if s == nil {
+		return
+	}
+	s.initLifecycle()
+	s.stopOnce.Do(func() {
+		s.cancel()
+		s.wg.Wait()
+	})
 }
 
 type sub2DataImportRequest struct {
@@ -591,7 +653,13 @@ send:
 func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, checkedAt time.Time, accounts ...store.Account) sub2AccountStatus {
 	status := sub2AccountStatus{Sub2AccountID: id, CheckedAt: checkedAt}
 	var detail map[string]any
-	code, err := s.apiJSONStatus(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(id, 10), nil, &detail)
+	var code int
+	var err error
+	if sub2StatusCacheEnabled(ctx) {
+		detail, code, err = s.cachedSub2AccountDetail(ctx, id)
+	} else {
+		code, err = s.apiJSONStatus(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(id, 10), nil, &detail)
+	}
 	if err != nil {
 		if code == http.StatusNotFound {
 			status.Exists = false
@@ -645,6 +713,35 @@ func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, che
 		status.EffectiveSchedulable = &effective
 	}
 	return status
+}
+
+func (s *sub2ImportService) cachedSub2AccountDetail(ctx context.Context, id int64) (map[string]any, int, error) {
+	if s == nil {
+		return nil, 0, errors.New("Sub2 服务未初始化")
+	}
+	now := time.Now()
+	s.statusMu.Lock()
+	if entry, ok := s.statusCache[id]; ok && now.Before(entry.expiresAt) {
+		detail, code := entry.detail, entry.code
+		s.statusMu.Unlock()
+		return detail, code, nil
+	} else if ok {
+		delete(s.statusCache, id)
+	}
+	s.statusMu.Unlock()
+
+	var detail map[string]any
+	code, err := s.apiJSONStatus(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(id, 10), nil, &detail)
+	if err != nil {
+		return nil, code, err
+	}
+	s.statusMu.Lock()
+	if s.statusCache == nil {
+		s.statusCache = make(map[int64]sub2DetailCacheEntry)
+	}
+	s.statusCache[id] = sub2DetailCacheEntry{detail: detail, code: code, expiresAt: now.Add(sub2StatusCacheTTL)}
+	s.statusMu.Unlock()
+	return detail, code, nil
 }
 
 // remoteStatusTime accepts the RFC3339 timestamps emitted by Sub2 and keeps a
@@ -930,7 +1027,7 @@ func (s *sub2ImportService) handleImport(w http.ResponseWriter, r *http.Request)
 		if err != nil {
 			continue
 		}
-		if _, active, checkErr := s.store.GetActiveAccountRecoveryTask(r.Context(), accountID); checkErr != nil || active {
+		if _, active, checkErr := s.store.GetActiveAccountRecoveryTaskForDestination(r.Context(), accountID, s.destinationKey); checkErr != nil || active {
 			lease.Release()
 			continue
 		}

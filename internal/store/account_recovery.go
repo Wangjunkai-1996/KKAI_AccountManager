@@ -46,6 +46,7 @@ type AccountRecoveryTask struct {
 	ResultCredentialAttemptID int64      `json:"result_credential_attempt_id,omitempty"`
 	Resumable                 bool       `json:"resumable"`
 	Sub2AccountID             int64      `json:"sub2_account_id"`
+	DestinationKey            string     `json:"-"`
 	OriginalSchedulable       bool       `json:"original_schedulable"`
 	Purpose                   string     `json:"purpose"`
 	DeliveryID                int64      `json:"delivery_id,omitempty"`
@@ -91,6 +92,7 @@ CREATE TABLE IF NOT EXISTS account_recovery_tasks (
  original_schedulable INTEGER NOT NULL DEFAULT 0 CHECK(original_schedulable IN (0,1)),
  purpose TEXT NOT NULL DEFAULT 'recovery',
  delivery_id INTEGER NOT NULL DEFAULT 0,
+ destination_key TEXT NOT NULL DEFAULT '',
  state TEXT NOT NULL,
  last_error TEXT NOT NULL DEFAULT '',
  failure_stage TEXT NOT NULL DEFAULT '',
@@ -141,12 +143,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS account_recovery_one_active ON account_recover
 		{"next_retry_at", "INTEGER"},
 		{"retry_count", "INTEGER NOT NULL DEFAULT 0"},
 		{"manual_action", "TEXT NOT NULL DEFAULT ''"},
+		{"destination_key", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if !columns[column.name] {
 			if _, err := s.db.Exec(`ALTER TABLE account_recovery_tasks ADD COLUMN ` + column.name + ` ` + column.definition); err != nil {
 				return err
 			}
 		}
+	}
+	// Recover ownership for rows created before destination-aware recovery.
+	// Delivery rows are exact; ordinary tasks use a sole imported binding.
+	if _, err := s.db.Exec(`UPDATE account_recovery_tasks SET destination_key=COALESCE((SELECT MIN(i.destination_key) FROM sub2_imports i WHERE i.account_id=account_recovery_tasks.account_id AND i.sub2_account_id=account_recovery_tasks.sub2_account_id AND i.state='imported' HAVING COUNT(DISTINCT i.destination_key)=1),'') WHERE destination_key='' AND delivery_id=0`); err != nil {
+		return err
 	}
 	_, err = s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS account_recovery_delivery ON account_recovery_tasks(delivery_id) WHERE delivery_id>0`)
 	if err != nil {
@@ -175,13 +183,20 @@ func (s *Store) RecoverAccountRecoveryTasks(ctx context.Context) error {
 	return err
 }
 
-const accountRecoverySelect = `SELECT t.id,t.account_id,COALESCE(a.email,''),t.check_id,t.source_credential_attempt_id,t.result_credential_attempt_id,t.sub2_account_id,t.original_schedulable,t.purpose,t.delivery_id,t.state,t.last_error,t.failure_stage,t.error_code,t.retry_action,t.next_retry_at,t.retry_count,t.manual_action,t.created_at,t.updated_at,COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=t.account_id AND status='success'),0) FROM account_recovery_tasks t LEFT JOIN accounts a ON a.id=t.account_id`
+const accountRecoverySelect = `SELECT t.id,t.account_id,COALESCE(a.email,''),t.check_id,t.source_credential_attempt_id,t.result_credential_attempt_id,t.sub2_account_id,t.original_schedulable,t.purpose,t.delivery_id,t.destination_key,t.state,t.last_error,t.failure_stage,t.error_code,t.retry_action,t.next_retry_at,t.retry_count,t.manual_action,t.created_at,t.updated_at,COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=t.account_id AND status='success'),0) FROM account_recovery_tasks t LEFT JOIN accounts a ON a.id=t.account_id`
+
+func recoveryDestination(destinations []string) string {
+	if len(destinations) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(destinations[0])
+}
 
 func scanAccountRecoveryTask(row scanner) (AccountRecoveryTask, error) {
 	var task AccountRecoveryTask
 	var original, created, updated, currentVersion int64
 	var nextRetry sql.NullInt64
-	if err := row.Scan(&task.ID, &task.AccountID, &task.AccountEmail, &task.CheckID, &task.SourceCredentialAttemptID, &task.ResultCredentialAttemptID, &task.Sub2AccountID, &original, &task.Purpose, &task.DeliveryID, &task.State, &task.LastError, &task.FailureStage, &task.ErrorCode, &task.RetryAction, &nextRetry, &task.RetryCount, &task.ManualAction, &created, &updated, &currentVersion); err != nil {
+	if err := row.Scan(&task.ID, &task.AccountID, &task.AccountEmail, &task.CheckID, &task.SourceCredentialAttemptID, &task.ResultCredentialAttemptID, &task.Sub2AccountID, &original, &task.Purpose, &task.DeliveryID, &task.DestinationKey, &task.State, &task.LastError, &task.FailureStage, &task.ErrorCode, &task.RetryAction, &nextRetry, &task.RetryCount, &task.ManualAction, &created, &updated, &currentVersion); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return AccountRecoveryTask{}, ErrAccountRecoveryNotFound
 		}
@@ -201,15 +216,23 @@ func scanAccountRecoveryTask(row scanner) (AccountRecoveryTask, error) {
 
 // CreateOrGetAccountRecoveryTask creates one active recovery task per account.
 // When an active task already exists, it is returned with created=false.
-func (s *Store) CreateOrGetAccountRecoveryTask(ctx context.Context, accountID, checkID, sub2AccountID int64, originalSchedulable bool) (AccountRecoveryTask, bool, error) {
+func (s *Store) CreateOrGetAccountRecoveryTask(ctx context.Context, accountID, checkID, sub2AccountID int64, originalSchedulable bool, destinations ...string) (AccountRecoveryTask, bool, error) {
 	if accountID <= 0 || sub2AccountID <= 0 {
 		return AccountRecoveryTask{}, false, errors.New("account and sub2 account are required")
 	}
+	destination := recoveryDestination(destinations)
 	now := time.Now().UnixMilli()
-	result, err := s.db.ExecContext(ctx, `INSERT INTO account_recovery_tasks(account_id,check_id,source_credential_attempt_id,sub2_account_id,original_schedulable,state,created_at,updated_at) SELECT ?,?,COALESCE((SELECT credential_attempt_id FROM account_checks WHERE id=? AND account_id=accounts.id),(SELECT MAX(id) FROM login_attempts WHERE account_id=accounts.id AND status='success'),0),?,?,?,?,? FROM accounts WHERE id=? ON CONFLICT DO NOTHING`, accountID, checkID, checkID, sub2AccountID, boolInt(originalSchedulable), RecoveryQueued, now, now, accountID)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO account_recovery_tasks(account_id,check_id,source_credential_attempt_id,sub2_account_id,original_schedulable,destination_key,state,created_at,updated_at) SELECT ?,?,COALESCE((SELECT credential_attempt_id FROM account_checks WHERE id=? AND account_id=accounts.id),(SELECT MAX(id) FROM login_attempts WHERE account_id=accounts.id AND status='success'),0),?,?,?,?,?,? FROM accounts WHERE id=? ON CONFLICT DO NOTHING`, accountID, checkID, checkID, sub2AccountID, boolInt(originalSchedulable), destination, RecoveryQueued, now, now, accountID)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
-			task, _, getErr := s.GetActiveAccountRecoveryTask(ctx, accountID)
+			task, found, getErr := s.getActiveAccountRecoveryTask(ctx, accountID, destination)
+			if getErr == nil && !found && destination != "" {
+				if _, globalFound, globalErr := s.getActiveAccountRecoveryTask(ctx, accountID); globalErr != nil {
+					return AccountRecoveryTask{}, false, globalErr
+				} else if globalFound {
+					return AccountRecoveryTask{}, false, ErrAccountBusy
+				}
+			}
 			return task, false, getErr
 		}
 		return AccountRecoveryTask{}, false, fmt.Errorf("create account recovery task: %w", err)
@@ -226,7 +249,14 @@ func (s *Store) CreateOrGetAccountRecoveryTask(ctx context.Context, accountID, c
 		if !exists {
 			return AccountRecoveryTask{}, false, ErrAccountNotFound
 		}
-		task, _, getErr := s.GetActiveAccountRecoveryTask(ctx, accountID)
+		task, found, getErr := s.getActiveAccountRecoveryTask(ctx, accountID, destination)
+		if getErr == nil && !found && destination != "" {
+			if _, globalFound, globalErr := s.getActiveAccountRecoveryTask(ctx, accountID); globalErr != nil {
+				return AccountRecoveryTask{}, false, globalErr
+			} else if globalFound {
+				return AccountRecoveryTask{}, false, ErrAccountBusy
+			}
+		}
 		return task, false, getErr
 	}
 	id, err := result.LastInsertId()
@@ -269,6 +299,16 @@ func (s *Store) CreateAccountDeliveryRecoveryTask(ctx context.Context, deliveryI
 	if current != credentialVersion {
 		return AccountRecoveryTask{}, false, ErrAccountRecoveryVersionChanged
 	}
+	var destination string
+	if err := tx.QueryRowContext(ctx, `SELECT destination_key FROM account_deliveries WHERE id=? AND account_id=?`, deliveryID, accountID).Scan(&destination); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Older callers created delivery recovery rows before the delivery
+			// table carried its destination. Keep the legacy path readable.
+			destination = ""
+		} else {
+			return AccountRecoveryTask{}, false, err
+		}
+	}
 	var active bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM account_recovery_tasks WHERE account_id=? AND state IN ('queued','validating','disabling_schedule','logging_in','login_succeeded','identity_verified','refreshing_credentials','applying_credentials','credentials_applied','enabling_schedule'))`, accountID).Scan(&active); err != nil {
 		return AccountRecoveryTask{}, false, err
@@ -277,7 +317,7 @@ func (s *Store) CreateAccountDeliveryRecoveryTask(ctx context.Context, deliveryI
 		return AccountRecoveryTask{}, false, ErrAccountBusy
 	}
 	now := time.Now().UnixMilli()
-	result, err := tx.ExecContext(ctx, `INSERT INTO account_recovery_tasks(account_id,source_credential_attempt_id,result_credential_attempt_id,sub2_account_id,original_schedulable,purpose,delivery_id,state,created_at,updated_at) VALUES(?,?,?,?,?,'delivery',?,'queued',?,?)`, accountID, credentialVersion, credentialVersion, sub2ID, boolInt(originalSchedulable), deliveryID, now, now)
+	result, err := tx.ExecContext(ctx, `INSERT INTO account_recovery_tasks(account_id,source_credential_attempt_id,result_credential_attempt_id,sub2_account_id,original_schedulable,purpose,delivery_id,destination_key,state,created_at,updated_at) VALUES(?,?,?,?,?,'delivery',?,?, 'queued',?,?)`, accountID, credentialVersion, credentialVersion, sub2ID, boolInt(originalSchedulable), deliveryID, destination, now, now)
 	if err != nil {
 		return AccountRecoveryTask{}, false, err
 	}
@@ -299,11 +339,39 @@ func (s *Store) GetAccountRecoveryTaskByID(ctx context.Context, id int64) (Accou
 	return scanAccountRecoveryTask(s.db.QueryRowContext(ctx, accountRecoverySelect+` WHERE t.id=?`, id))
 }
 
+func (s *Store) GetAccountRecoveryTaskByIDForDestination(ctx context.Context, id int64, destination string) (AccountRecoveryTask, error) {
+	if id <= 0 {
+		return AccountRecoveryTask{}, ErrAccountRecoveryNotFound
+	}
+	if strings.TrimSpace(destination) == "" {
+		return s.GetAccountRecoveryTaskByID(ctx, id)
+	}
+	return scanAccountRecoveryTask(s.db.QueryRowContext(ctx, accountRecoverySelect+` WHERE t.id=? AND (t.destination_key=? OR (t.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=t.account_id AND legacy_dest.sub2_account_id=t.sub2_account_id AND legacy_dest.state='imported')=1 AND EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=t.account_id AND i.sub2_account_id=t.sub2_account_id AND i.state='imported')))`, id, destination, destination))
+}
+
 func (s *Store) GetActiveAccountRecoveryTask(ctx context.Context, accountID int64) (AccountRecoveryTask, bool, error) {
+	return s.getActiveAccountRecoveryTask(ctx, accountID)
+}
+
+// getActiveAccountRecoveryTask optionally limits the result to the Sub2
+// destination that owns the persisted binding. Recovery tasks predate the
+// destination-aware schema, so the binding is the durable ownership link.
+func (s *Store) GetActiveAccountRecoveryTaskForDestination(ctx context.Context, accountID int64, destination string) (AccountRecoveryTask, bool, error) {
+	return s.getActiveAccountRecoveryTask(ctx, accountID, destination)
+}
+
+func (s *Store) getActiveAccountRecoveryTask(ctx context.Context, accountID int64, destinations ...string) (AccountRecoveryTask, bool, error) {
 	if accountID <= 0 {
 		return AccountRecoveryTask{}, false, ErrAccountRecoveryNotFound
 	}
-	task, err := scanAccountRecoveryTask(s.db.QueryRowContext(ctx, accountRecoverySelect+` WHERE t.account_id=? AND t.state IN ('queued','validating','disabling_schedule','logging_in','login_succeeded','identity_verified','refreshing_credentials','applying_credentials','credentials_applied','enabling_schedule') ORDER BY t.id DESC LIMIT 1`, accountID))
+	query := accountRecoverySelect + ` WHERE t.account_id=? AND t.state IN ('queued','validating','disabling_schedule','logging_in','login_succeeded','identity_verified','refreshing_credentials','applying_credentials','credentials_applied','enabling_schedule')`
+	args := []any{accountID}
+	if destination := recoveryDestination(destinations); destination != "" {
+		query += ` AND (t.destination_key=? OR (t.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=t.account_id AND legacy_dest.sub2_account_id=t.sub2_account_id AND legacy_dest.state='imported')=1 AND EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=t.account_id AND i.sub2_account_id=t.sub2_account_id AND i.state='imported')))`
+		args = append(args, destination, destination)
+	}
+	query += ` ORDER BY t.id DESC LIMIT 1`
+	task, err := scanAccountRecoveryTask(s.db.QueryRowContext(ctx, query, args...))
 	if errors.Is(err, ErrAccountRecoveryNotFound) {
 		return AccountRecoveryTask{}, false, nil
 	}
@@ -313,10 +381,25 @@ func (s *Store) GetActiveAccountRecoveryTask(ctx context.Context, accountID int6
 // GetLatestAccountRecoveryTask returns the most recent task, including a
 // terminal task. It is used by the status endpoint after a worker completes.
 func (s *Store) GetLatestAccountRecoveryTask(ctx context.Context, accountID int64) (AccountRecoveryTask, error) {
+	return s.getLatestAccountRecoveryTask(ctx, accountID)
+}
+
+func (s *Store) GetLatestAccountRecoveryTaskForDestination(ctx context.Context, accountID int64, destination string) (AccountRecoveryTask, error) {
+	return s.getLatestAccountRecoveryTask(ctx, accountID, destination)
+}
+
+func (s *Store) getLatestAccountRecoveryTask(ctx context.Context, accountID int64, destinations ...string) (AccountRecoveryTask, error) {
 	if accountID <= 0 {
 		return AccountRecoveryTask{}, ErrAccountRecoveryNotFound
 	}
-	return scanAccountRecoveryTask(s.db.QueryRowContext(ctx, accountRecoverySelect+` WHERE t.account_id=? ORDER BY t.id DESC LIMIT 1`, accountID))
+	query := accountRecoverySelect + ` WHERE t.account_id=?`
+	args := []any{accountID}
+	if destination := recoveryDestination(destinations); destination != "" {
+		query += ` AND (t.destination_key=? OR (t.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=t.account_id AND legacy_dest.sub2_account_id=t.sub2_account_id AND legacy_dest.state='imported')=1 AND EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=t.account_id AND i.sub2_account_id=t.sub2_account_id AND i.state='imported')))`
+		args = append(args, destination, destination)
+	}
+	query += ` ORDER BY t.id DESC LIMIT 1`
+	return scanAccountRecoveryTask(s.db.QueryRowContext(ctx, query, args...))
 }
 
 // ClaimAccountRecoveryTask atomically claims a queued task for validation.
@@ -431,10 +514,26 @@ func (s *Store) RecordAccountRecoveryFailure(ctx context.Context, id int64, fail
 // ListDueAccountRecoveryTasks never selects superseded tasks or tasks needing
 // a person. Requeue still checks versions and exclusivity in its transaction.
 func (s *Store) ListDueAccountRecoveryTasks(ctx context.Context, now time.Time, limit int) ([]AccountRecoveryTask, error) {
+	return s.listDueAccountRecoveryTasks(ctx, now, limit)
+}
+
+func (s *Store) ListDueAccountRecoveryTasksForDestination(ctx context.Context, now time.Time, limit int, destination string) ([]AccountRecoveryTask, error) {
+	return s.listDueAccountRecoveryTasks(ctx, now, limit, destination)
+}
+
+func (s *Store) listDueAccountRecoveryTasks(ctx context.Context, now time.Time, limit int, destinations ...string) ([]AccountRecoveryTask, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, accountRecoverySelect+` WHERE t.state IN ('failed','unknown') AND t.retry_action IN ('resume','relogin') AND t.manual_action='' AND t.next_retry_at<=? AND t.id=(SELECT MAX(latest.id) FROM account_recovery_tasks latest WHERE latest.account_id=t.account_id) AND NOT EXISTS(SELECT 1 FROM account_recovery_tasks active WHERE active.account_id=t.account_id AND active.state IN ('queued','validating','disabling_schedule','logging_in','login_succeeded','identity_verified','refreshing_credentials','applying_credentials','credentials_applied','enabling_schedule')) ORDER BY t.next_retry_at,t.id LIMIT ?`, now.UnixMilli(), limit)
+	query := accountRecoverySelect + ` WHERE t.state IN ('failed','unknown') AND t.retry_action IN ('resume','relogin') AND t.manual_action='' AND t.next_retry_at<=? AND t.id=(SELECT MAX(latest.id) FROM account_recovery_tasks latest WHERE latest.account_id=t.account_id`
+	args := []any{now.UnixMilli()}
+	if destination := recoveryDestination(destinations); destination != "" {
+		query += ` AND (latest.destination_key=? OR (latest.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=latest.account_id AND legacy_dest.sub2_account_id=latest.sub2_account_id AND legacy_dest.state='imported')=1 AND EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=latest.account_id AND i.sub2_account_id=latest.sub2_account_id AND i.state='imported')))`
+		args = append(args, destination, destination)
+	}
+	query += `) AND NOT EXISTS(SELECT 1 FROM account_recovery_tasks active WHERE active.account_id=t.account_id AND active.state IN ('queued','validating','disabling_schedule','logging_in','login_succeeded','identity_verified','refreshing_credentials','applying_credentials','credentials_applied','enabling_schedule')) ORDER BY t.next_retry_at,t.id LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -451,6 +550,14 @@ func (s *Store) ListDueAccountRecoveryTasks(ctx context.Context, now time.Time, 
 }
 
 func (s *Store) ListAccountRecoveryTasks(ctx context.Context, state string, limit int) ([]AccountRecoveryTask, error) {
+	return s.listAccountRecoveryTasks(ctx, state, limit)
+}
+
+func (s *Store) ListAccountRecoveryTasksForDestination(ctx context.Context, state string, limit int, destination string) ([]AccountRecoveryTask, error) {
+	return s.listAccountRecoveryTasks(ctx, state, limit, destination)
+}
+
+func (s *Store) listAccountRecoveryTasks(ctx context.Context, state string, limit int, destinations ...string) ([]AccountRecoveryTask, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
@@ -462,6 +569,14 @@ func (s *Store) ListAccountRecoveryTasks(ctx context.Context, state string, limi
 		}
 		query += ` WHERE t.state=?`
 		args = append(args, state)
+	}
+	if destination := recoveryDestination(destinations); destination != "" {
+		if strings.Contains(query, " WHERE ") {
+			query += ` AND (t.destination_key=? OR (t.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=t.account_id AND legacy_dest.sub2_account_id=t.sub2_account_id AND legacy_dest.state='imported')=1 AND EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=t.account_id AND i.sub2_account_id=t.sub2_account_id AND i.state='imported')))`
+		} else {
+			query += ` WHERE (t.destination_key=? OR (t.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=t.account_id AND legacy_dest.sub2_account_id=t.sub2_account_id AND legacy_dest.state='imported')=1 AND EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=t.account_id AND i.sub2_account_id=t.sub2_account_id AND i.state='imported')))`
+		}
+		args = append(args, destination, destination)
 	}
 	if state == RecoveryQueued {
 		query += ` ORDER BY t.id ASC LIMIT ?`
@@ -489,7 +604,22 @@ func (s *Store) ListAccountRecoveryTasks(ctx context.Context, state string, limi
 // A global task limit would hide older accounts behind one frequently retried
 // account, so select exactly one latest task for every account.
 func (s *Store) ListLatestAccountRecoveryTasks(ctx context.Context) ([]AccountRecoveryTask, error) {
-	rows, err := s.db.QueryContext(ctx, accountRecoverySelect+` WHERE t.id IN (SELECT MAX(id) FROM account_recovery_tasks GROUP BY account_id) ORDER BY t.id DESC`)
+	return s.listLatestAccountRecoveryTasks(ctx)
+}
+
+func (s *Store) ListLatestAccountRecoveryTasksForDestination(ctx context.Context, destination string) ([]AccountRecoveryTask, error) {
+	return s.listLatestAccountRecoveryTasks(ctx, destination)
+}
+
+func (s *Store) listLatestAccountRecoveryTasks(ctx context.Context, destinations ...string) ([]AccountRecoveryTask, error) {
+	query := accountRecoverySelect + ` WHERE t.id IN (SELECT MAX(id) FROM account_recovery_tasks latest WHERE latest.account_id=t.account_id`
+	args := make([]any, 0, 1)
+	if destination := recoveryDestination(destinations); destination != "" {
+		query += ` AND (latest.destination_key=? OR (latest.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=latest.account_id AND legacy_dest.sub2_account_id=latest.sub2_account_id AND legacy_dest.state='imported')=1 AND EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=latest.account_id AND i.sub2_account_id=latest.sub2_account_id AND i.state='imported')))`
+		args = append(args, destination, destination)
+	}
+	query += `) ORDER BY t.id DESC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -508,14 +638,22 @@ func (s *Store) ListLatestAccountRecoveryTasks(ctx context.Context) ([]AccountRe
 // ListAccountRecoveryHistory returns the newest recovery tasks for one account.
 // The extra row lets callers indicate that older history exists without
 // exposing an unbounded list to the browser.
-func (s *Store) ListAccountRecoveryHistory(ctx context.Context, accountID int64, limit int) ([]AccountRecoveryTask, bool, error) {
+func (s *Store) ListAccountRecoveryHistory(ctx context.Context, accountID int64, limit int, destinations ...string) ([]AccountRecoveryTask, bool, error) {
 	if accountID <= 0 {
 		return nil, false, ErrAccountRecoveryNotFound
 	}
 	if limit <= 0 || limit > 100 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, accountRecoverySelect+` WHERE t.account_id=? AND t.purpose!='delivery' ORDER BY t.id DESC LIMIT ?`, accountID, limit+1)
+	query := accountRecoverySelect + ` WHERE t.account_id=? AND t.purpose!='delivery'`
+	args := []any{accountID}
+	if destination := recoveryDestination(destinations); destination != "" {
+		query += ` AND (t.destination_key=? OR (t.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=t.account_id AND legacy_dest.sub2_account_id=t.sub2_account_id AND legacy_dest.state='imported')=1 AND EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=t.account_id AND i.sub2_account_id=t.sub2_account_id AND i.state='imported')))`
+		args = append(args, destination, destination)
+	}
+	query += ` ORDER BY t.id DESC LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, false, err
 	}

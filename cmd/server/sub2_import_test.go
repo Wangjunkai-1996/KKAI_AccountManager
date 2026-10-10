@@ -43,6 +43,24 @@ func testOAuthStore(t *testing.T) (*store.Store, int64) {
 	return s, account.ID
 }
 
+func TestSub2ImportServiceStartStop(t *testing.T) {
+	history, _ := testOAuthStore(t)
+	service := &sub2ImportService{store: history}
+	service.Start()
+	done := make(chan struct{})
+	go func() {
+		service.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("sub2 importer did not stop promptly")
+	}
+	// Stop is intentionally idempotent so shutdown paths can be composed.
+	service.Stop()
+}
+
 func TestSub2ImportPostsAndReconcilesUnGroupedAccount(t *testing.T) {
 	history, accountID := testOAuthStore(t)
 	var importedName string
@@ -129,6 +147,27 @@ func TestListSub2AccountStatusesReadsDetailAndDistinguishesMissing(t *testing.T)
 	missing := statuses[accountID+1]
 	if missing.Exists || missing.Unknown || missing.Stale || missing.Error == "" {
 		t.Fatalf("missing status = %+v", missing)
+	}
+}
+
+func TestSub2AccountStatusCachesBriefly(t *testing.T) {
+	history, _ := testOAuthStore(t)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"id":42,"status":"active","schedulable":true}}`))
+	}))
+	defer server.Close()
+	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
+	if got := service.sub2AccountStatus(context.Background(), 42, time.Now().UTC()); !got.Exists || got.Unknown {
+		t.Fatalf("first status = %+v", got)
+	}
+	if got := service.sub2AccountStatus(context.Background(), 42, time.Now().UTC()); !got.Exists || got.Unknown {
+		t.Fatalf("cached status = %+v", got)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("detail requests = %d, want 1 within cache TTL", requests.Load())
 	}
 }
 

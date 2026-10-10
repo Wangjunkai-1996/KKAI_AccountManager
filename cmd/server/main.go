@@ -15,11 +15,13 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/login"
@@ -153,8 +155,14 @@ func main() {
 	if err := initLoginHistory(*historyDBPath, *historyKeyPath); err != nil {
 		log.Fatalf("❌ 初始化账号历史数据库失败: %v", err)
 	}
+	defer func() {
+		if err := loginHistory.Close(); err != nil {
+			log.Printf("⚠️ 关闭账号历史数据库失败: %v", err)
+		}
+	}()
 	sub2Importer = newSub2ImportService(loginHistory)
 	sub2Importer.Start()
+	defer sub2Importer.Stop()
 	accountChecker = newAccountCheckService(loginHistory, *proxy, *upstreamProxy)
 
 	// 创建登录服务
@@ -202,6 +210,7 @@ func main() {
 	http.HandleFunc("/api/account-recovery", corsMiddleware(recoveryService.handleCollection))
 	http.HandleFunc("/api/account-recovery/", corsMiddleware(recoveryService.handleAction))
 	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/ready", handleReadiness)
 
 	addr := net.JoinHostPort(*bindAddress, *port)
 	pageURL := "http://" + addr
@@ -221,8 +230,39 @@ func main() {
 		}()
 	}
 
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatalf("❌ 服务器启动失败: %v", err)
+	server := newHTTPServer(addr, nil)
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.ListenAndServe() }()
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	select {
+	case sig := <-signals:
+		log.Printf("收到 %s，开始优雅停机", sig)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("⚠️ HTTP 服务优雅停机失败: %v", err)
+			// A client that keeps an SSE stream open must not prevent process
+			// shutdown forever after the grace period expires.
+			_ = server.Close()
+		}
+		cancel()
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("❌ 服务器停止: %v", err)
+			os.Exit(1)
+		}
+	}
+}
+
+// newHTTPServer keeps the timeout policy in one place. WriteTimeout is left
+// unset because the login progress endpoint is a long-lived SSE stream.
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 }
 
@@ -541,6 +581,34 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":          "ok",
 		"time":            time.Now().Format(time.RFC3339),
 		"max_concurrent":  *maxConcurrent,
+		"sub2_configured": sub2Importer != nil && sub2Importer.configured(),
+	})
+}
+
+func handleReadiness(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondJSONStatus(w, http.StatusMethodNotAllowed, LoginResponse{Message: "Method not allowed"})
+		return
+	}
+	if loginHistory == nil {
+		respondJSONStatus(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"status": "not_ready", "database_ready": false,
+		})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	err := loginHistory.Ping(ctx)
+	cancel()
+	if err != nil {
+		respondJSONStatus(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"status": "not_ready", "database_ready": false,
+			"sub2_configured": sub2Importer != nil && sub2Importer.configured(),
+		})
+		return
+	}
+	respondJSON(w, map[string]interface{}{
+		"status":          "ready",
+		"database_ready":  true,
 		"sub2_configured": sub2Importer != nil && sub2Importer.configured(),
 	})
 }

@@ -98,9 +98,13 @@ func handleHistory() http.HandlerFunc {
 		if sub2Importer != nil && sub2Importer.configured() {
 			imports, sub2Statuses, importsErr = sub2Importer.syncAccountStatuses(r.Context())
 		}
-		checks, checksErr := loginHistory.ListAccountCheckSummaries(r.Context())
 		var recoveries map[int64]store.AccountRecoveryTask
-		if tasks, recoveryErr := loginHistory.ListLatestAccountRecoveryTasks(r.Context()); recoveryErr == nil {
+		recoveryDestination := ""
+		if sub2Importer != nil && sub2Importer.configured() {
+			recoveryDestination = sub2Importer.destinationKey
+		}
+		checks, checksErr := loginHistory.ListAccountCheckSummaries(r.Context(), recoveryDestination)
+		if tasks, recoveryErr := loginHistory.ListLatestAccountRecoveryTasksForDestination(r.Context(), recoveryDestination); recoveryErr == nil {
 			recoveries = make(map[int64]store.AccountRecoveryTask)
 			for _, task := range tasks {
 				if _, exists := recoveries[task.AccountID]; !exists {
@@ -118,7 +122,7 @@ func handleHistory() http.HandlerFunc {
 			respondJSONStatus(w, http.StatusServiceUnavailable, LoginResponse{Message: "读取交付状态失败，请稍后刷新", Code: "delivery_read_failed"})
 			return
 		}
-		rechecks, recheckErr := loginHistory.ListAccountRecoveryRechecks(r.Context())
+		rechecks, recheckErr := loginHistory.ListAccountRecoveryRechecksForDestination(r.Context(), recoveryDestination)
 		repairs, repairErr := loginHistory.ListCredentialRepairs(r.Context())
 		if recheckErr != nil || repairErr != nil {
 			respondJSONStatus(w, http.StatusServiceUnavailable, LoginResponse{Message: "读取后台处理状态失败，请稍后刷新"})
@@ -164,8 +168,12 @@ func handleHistoryDelete() http.HandlerFunc {
 				respondJSONStatus(w, http.StatusInternalServerError, LoginResponse{Message: "读取登录历史失败", Code: "history_read_failed"})
 				return
 			}
-			checks, checksErr := loginHistory.ListAccountChecks(r.Context(), account.ID, 20)
-			recoveryHistory, recoveryHistoryTruncated, recoveryHistoryErr := loginHistory.ListAccountRecoveryHistory(r.Context(), account.ID, 100)
+			destination := ""
+			if sub2Importer != nil && sub2Importer.configured() {
+				destination = sub2Importer.destinationKey
+			}
+			checks, checksErr := loginHistory.ListAccountChecks(r.Context(), account.ID, 20, destination)
+			recoveryHistory, recoveryHistoryTruncated, recoveryHistoryErr := loginHistory.ListAccountRecoveryHistory(r.Context(), account.ID, 100, destination)
 			respondJSON(w, historyDetailResponse{Success: true, Account: account, Attempts: attempts,
 				RecoveryHistory: recoveryHistory, RecoveryHistoryAvailable: recoveryHistoryErr == nil,
 				RecoveryHistoryTruncated: recoveryHistoryTruncated, Checks: checks, ChecksAvailable: checksErr == nil})

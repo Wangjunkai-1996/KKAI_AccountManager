@@ -152,7 +152,7 @@ sudo timedatectl set-ntp true
 
 ```bash
 # 重新安装 Playwright 浏览器
-go run github.com/playwright-community/playwright-go/cmd/playwright@latest install --with-deps chromium
+go run github.com/mxschmitt/playwright-go/cmd/playwright@v0.6201.1 install --with-deps chromium
 
 # 检查浏览器是否安装成功
 ls ~/.cache/ms-playwright/chromium-*/chrome-linux/chrome

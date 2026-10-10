@@ -158,9 +158,13 @@ func NewService(config Config) *Service {
 func browserLaunchOptions(config Config) playwright.BrowserTypeLaunchOptions {
 	options := playwright.BrowserTypeLaunchOptions{
 		Headless: playwright.Bool(config.Headless),
-		Channel:  playwright.String("chrome"),
 		Timeout:  playwright.Float(float64(config.Timeout.Milliseconds())),
 		Args:     []string{"--disable-dev-shm-usage", "--no-sandbox", "--disable-setuid-sandbox"},
+	}
+	// The bundled Playwright Chromium is available in containers and CI. Use
+	// the installed Chrome channel only for headed desktop sessions.
+	if !config.Headless {
+		options.Channel = playwright.String("chrome")
 	}
 	if strings.TrimSpace(config.Proxy) == "" {
 		options.Args = append(options.Args, "--no-proxy-server")

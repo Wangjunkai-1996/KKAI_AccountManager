@@ -237,7 +237,7 @@ func (s *accountCheckService) finish(id, accountID int64, result store.AccountCh
 	// cannot turn a stale account_deleted result into a DELETE request.
 	deleteConfirmed := false
 	var deleteCredentialAttemptID int64
-	if !result.Canceled && result.Outcome == "account_deleted" && accountID > 0 && sub2Importer != nil && batch.State != "stopping" && batch.State != "stopped" {
+	if !result.Canceled && result.Outcome == "account_deleted" && accountID > 0 && sub2Importer != nil && (batch.DestinationKey == "" || batch.DestinationKey == sub2Importer.destinationKey) && batch.State != "stopping" && batch.State != "stopped" {
 		if committedBatch, checks, readErr := s.store.GetAccountCheckBatch(ctx, batch.ID); readErr == nil && committedBatch.State != "stopping" && committedBatch.State != "stopped" {
 			for _, check := range checks {
 				if check.ID == id && check.State == "finished" && check.Outcome == "account_deleted" && check.Freshness == "current" {
@@ -363,7 +363,11 @@ func (s *accountCheckService) handleCollection(w http.ResponseWriter, r *http.Re
 		checkAPIError(w, 400, "reserved_request_key", "请求标识不能使用 recovery- 前缀")
 		return
 	}
-	input := store.AccountCheckInput{RequestKey: req.RequestKey, AccountIDs: req.AccountIDs, Concurrency: req.Concurrency, ProxyMode: req.ProxyMode}
+	destination := ""
+	if sub2Importer != nil && sub2Importer.configured() {
+		destination = sub2Importer.destinationKey
+	}
+	input := store.AccountCheckInput{RequestKey: req.RequestKey, AccountIDs: req.AccountIDs, Concurrency: req.Concurrency, ProxyMode: req.ProxyMode, DestinationKey: destination}
 	if previous, found, err := s.store.LookupAccountCheckBatch(r.Context(), input); err != nil {
 		s.respondError(w, r, err)
 		return

@@ -366,6 +366,15 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// Ping verifies that the backing database is still reachable. It is used by
+// the readiness endpoint; liveness does not depend on this check.
+func (s *Store) Ping(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return errors.New("store is not initialized")
+	}
+	return s.db.PingContext(ctx)
+}
+
 // RecoverInterrupted makes crashes visible in account history instead of
 // leaving an account permanently in the running state.
 func (s *Store) RecoverInterrupted(ctx context.Context) error {

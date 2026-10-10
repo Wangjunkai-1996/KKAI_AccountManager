@@ -127,6 +127,10 @@ func TestBrowserCompatibilityOptions(t *testing.T) {
 			t.Fatal("proxy launch unexpectedly disables proxies")
 		}
 	}
+	headlessLaunch := browserLaunchOptions(NewService(Config{Headless: true}).config)
+	if headlessLaunch.Channel != nil {
+		t.Fatalf("headless launch channel = %q, want bundled Chromium", *headlessLaunch.Channel)
+	}
 }
 
 func TestNewServiceRetryCountCanBeExplicitlyDisabled(t *testing.T) {

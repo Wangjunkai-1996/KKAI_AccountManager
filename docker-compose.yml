@@ -1,16 +1,14 @@
-version: '3.8'
-
 services:
   openai-login:
     build: .
     container_name: openai-login-web
+    # Keep the management UI private by default; put an authenticated reverse
+    # proxy in front of it when remote access is required.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     env_file:
       - .sub2api.env
-    environment:
-      - HEADLESS=true
-      - PORT=8080
+    command: ["./openai-login-web", "-bind=0.0.0.0", "-headless=true", "-open-browser=false"]
     restart: unless-stopped
     # 如果需要使用代理
     # environment:
@@ -31,3 +29,9 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

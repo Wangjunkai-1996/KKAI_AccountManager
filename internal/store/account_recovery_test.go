@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestAccountRecoveryTaskLifecycle(t *testing.T) {
@@ -514,5 +515,160 @@ func TestRecoveryLatestPerAccountAndFIFOQueue(t *testing.T) {
 	latest, err := s.ListLatestAccountRecoveryTasks(ctx)
 	if err != nil || len(latest) != 2 || latest[0].ID != second.ID || latest[1].ID != first.ID {
 		t.Fatalf("latest tasks lost older account: %+v err=%v", latest, err)
+	}
+}
+
+func TestRecoveryQueriesStayWithinDestination(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	account, err := s.UpsertCredentials(ctx, Credentials{Email: "recovery-destination@example.test", Password: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LinkSub2Account(ctx, "alpha", account.ID, 101, "linked-alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LinkSub2Account(ctx, "beta", account.ID, 202, "linked-beta"); err != nil {
+		t.Fatal(err)
+	}
+	alpha, created, err := s.CreateOrGetAccountRecoveryTask(ctx, account.ID, 11, 101, true, "alpha")
+	if err != nil || !created {
+		t.Fatalf("alpha task = %+v,%v,%v", alpha, created, err)
+	}
+	alphaDue := time.Now().Add(-time.Second)
+	if _, err := s.RecordAccountRecoveryFailure(ctx, alpha.ID, RecoveryFailure{State: RecoveryFailed, Code: "alpha", Message: "retry", RetryAction: "resume", NextRetryAt: &alphaDue}); err != nil {
+		t.Fatal(err)
+	}
+	beta, created, err := s.CreateOrGetAccountRecoveryTask(ctx, account.ID, 12, 202, true, "beta")
+	if err != nil || !created {
+		t.Fatalf("beta task = %+v,%v,%v", beta, created, err)
+	}
+	betaDue := time.Now().Add(-time.Second)
+	if _, err := s.RecordAccountRecoveryFailure(ctx, beta.ID, RecoveryFailure{State: RecoveryFailed, Code: "beta", Message: "retry", RetryAction: "resume", NextRetryAt: &betaDue}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.GetLatestAccountRecoveryTaskForDestination(ctx, account.ID, "alpha"); err != nil || got.ID != alpha.ID {
+		t.Fatalf("alpha latest = %+v,%v", got, err)
+	}
+	if got, err := s.GetLatestAccountRecoveryTaskForDestination(ctx, account.ID, "beta"); err != nil || got.ID != beta.ID {
+		t.Fatalf("beta latest = %+v,%v", got, err)
+	}
+	latest, err := s.ListLatestAccountRecoveryTasksForDestination(ctx, "alpha")
+	if err != nil || len(latest) != 1 || latest[0].ID != alpha.ID {
+		t.Fatalf("alpha list = %+v,%v", latest, err)
+	}
+	if tasks, err := s.ListAccountRecoveryTasksForDestination(ctx, RecoveryQueued, 10, "alpha"); err != nil || len(tasks) != 0 {
+		t.Fatalf("alpha queue leaked beta task = %+v,%v", tasks, err)
+	}
+	due, err := s.ListDueAccountRecoveryTasksForDestination(ctx, time.Now(), 10, "alpha")
+	if err != nil || len(due) != 1 || due[0].ID != alpha.ID {
+		t.Fatalf("alpha due = %+v,%v", due, err)
+	}
+	due, err = s.ListDueAccountRecoveryTasksForDestination(ctx, time.Now(), 10, "beta")
+	if err != nil || len(due) != 1 || due[0].ID != beta.ID {
+		t.Fatalf("beta due = %+v,%v", due, err)
+	}
+	// Explicit destination ownership remains isolated even when two targets
+	// happen to reuse the same remote account identifier.
+	other, err := s.UpsertCredentials(ctx, Credentials{Email: "recovery-destination-same-id@example.test", Password: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LinkSub2Account(ctx, "alpha", other.ID, 303, "linked-alpha-same"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LinkSub2Account(ctx, "beta", other.ID, 303, "linked-beta-same"); err != nil {
+		t.Fatal(err)
+	}
+	alphaSame, _, err := s.CreateOrGetAccountRecoveryTask(ctx, other.ID, 21, 303, true, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateAccountRecoveryTask(ctx, alphaSame.ID, RecoveryCompleted, ""); err != nil {
+		t.Fatal(err)
+	}
+	betaSame, _, err := s.CreateOrGetAccountRecoveryTask(ctx, other.ID, 22, 303, true, "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.GetLatestAccountRecoveryTaskForDestination(ctx, other.ID, "alpha"); err != nil || got.ID != alphaSame.ID {
+		t.Fatalf("same remote id alpha latest = %+v,%v", got, err)
+	}
+	if got, err := s.GetLatestAccountRecoveryTaskForDestination(ctx, other.ID, "beta"); err != nil || got.ID != betaSame.ID {
+		t.Fatalf("same remote id beta latest = %+v,%v", got, err)
+	}
+}
+
+func TestLegacyRecoveryMigrationLeavesAmbiguousDestinationEmpty(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	account, err := s.UpsertCredentials(ctx, Credentials{Email: "legacy-destination@example.test", Password: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LinkSub2Account(ctx, "alpha", account.ID, 404, "linked-alpha-legacy"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LinkSub2Account(ctx, "beta", account.ID, 404, "linked-beta-legacy"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO account_recovery_tasks(account_id,sub2_account_id,destination_key,state,created_at,updated_at) VALUES(?,?, '', 'completed', ?, ?)`, account.ID, 404, time.Now().UnixMilli(), time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrateAccountRecoveryTasks(); err != nil {
+		t.Fatal(err)
+	}
+	var destination string
+	if err := s.db.QueryRowContext(ctx, `SELECT destination_key FROM account_recovery_tasks WHERE id=?`, taskID).Scan(&destination); err != nil {
+		t.Fatal(err)
+	}
+	if destination != "" {
+		t.Fatalf("ambiguous legacy destination = %q, want empty", destination)
+	}
+}
+
+func TestLegacyDeliveryRecoveryMigrationUsesDeliveryDestination(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	account, err := s.UpsertCredentials(ctx, Credentials{Email: "legacy-delivery-destination@example.test", Password: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LinkSub2Account(ctx, "alpha", account.ID, 505, "linked-alpha-delivery"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO account_deliveries(account_id,credential_version,destination_key,state,created_at,updated_at,options_json) VALUES(?,?,?,?,?,?,?)`, account.ID, 1, "beta", "queued", time.Now().UnixMilli(), time.Now().UnixMilli(), `{"group_ids":[],"priority":1,"concurrency":3}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskResult, err := s.db.ExecContext(ctx, `INSERT INTO account_recovery_tasks(account_id,sub2_account_id,delivery_id,destination_key,state,created_at,updated_at) VALUES(?,?,?, '', 'completed', ?, ?)`, account.ID, 505, deliveryID, time.Now().UnixMilli(), time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := taskResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrateAccountRecoveryTasks(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrateAccountDeliveries(); err != nil {
+		t.Fatal(err)
+	}
+	var destination string
+	if err := s.db.QueryRowContext(ctx, `SELECT destination_key FROM account_recovery_tasks WHERE id=?`, taskID).Scan(&destination); err != nil {
+		t.Fatal(err)
+	}
+	if destination != "beta" {
+		t.Fatalf("delivery destination = %q, want beta", destination)
 	}
 }

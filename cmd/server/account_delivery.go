@@ -108,7 +108,7 @@ func (s *accountDeliveryService) process(ctx context.Context, task store.Account
 	defer lease.Release()
 	// A crash can occur after the recovery task commits but before its link does.
 	// Reattach that exact task even when its automatic re-login advanced version.
-	prior, priorErr := s.store.GetLatestAccountRecoveryTask(ctx, task.AccountID)
+	prior, priorErr := s.store.GetLatestAccountRecoveryTaskForDestination(ctx, task.AccountID, task.DestinationKey)
 	if priorErr == nil && prior.DeliveryID == task.ID && prior.Purpose == "delivery" {
 		s.update(task, "verifying", "", "", nil, prior.ID)
 		return
@@ -126,7 +126,7 @@ func (s *accountDeliveryService) process(ctx context.Context, task store.Account
 		s.update(task, "canceled", "已有更新的登录结果，旧交付已取消", "", nil, 0)
 		return
 	}
-	if _, active, err := s.store.GetActiveAccountRecoveryTask(ctx, task.AccountID); err != nil || active {
+	if _, active, err := s.store.GetActiveAccountRecoveryTaskForDestination(ctx, task.AccountID, task.DestinationKey); err != nil || active {
 		s.failed(task, &recoveryOperationError{Code: "account_busy"})
 		return
 	}
@@ -204,7 +204,7 @@ func listDeliveryStatuses(ctx context.Context, history *store.Store, destination
 	result := make(map[int64]store.AccountDelivery, len(tasks))
 	for _, task := range tasks {
 		if task.RecoveryTaskID > 0 {
-			recovery, err := history.GetAccountRecoveryTaskByID(ctx, task.RecoveryTaskID)
+			recovery, err := history.GetAccountRecoveryTaskByIDForDestination(ctx, task.RecoveryTaskID, task.DestinationKey)
 			if err != nil {
 				return nil, err
 			}

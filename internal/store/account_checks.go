@@ -33,6 +33,9 @@ type AccountCheckInput struct {
 	Concurrency int
 	ProxyMode   string
 	Proxy       string
+	// DestinationKey binds eligibility and recovery to one Sub2 target.
+	// Empty preserves the legacy behavior for direct store callers.
+	DestinationKey string
 }
 type AccountCheckCounts struct {
 	Total       int `json:"total"`
@@ -57,6 +60,7 @@ type AccountCheckBatch struct {
 	Concurrency     int                `json:"concurrency"`
 	ProxyMode       string             `json:"proxy_mode"`
 	RouteLabel      string             `json:"route_label"`
+	DestinationKey  string             `json:"-"`
 	CreatedAt       int64              `json:"created_at"`
 	FinishedAt      *int64             `json:"finished_at"`
 	Counts          AccountCheckCounts `json:"counts"`
@@ -127,6 +131,7 @@ CREATE TABLE IF NOT EXISTS account_check_batches (
  state TEXT NOT NULL CHECK(state IN ('active','stopping','completed','stopped')),
  stop_reason TEXT NOT NULL DEFAULT '', model TEXT NOT NULL, protocol_version INTEGER NOT NULL,
  concurrency INTEGER NOT NULL CHECK(concurrency IN (1,2)),
+ destination_key TEXT NOT NULL DEFAULT '',
  proxy_mode TEXT NOT NULL CHECK(proxy_mode IN ('default','direct')), route_label TEXT NOT NULL,
  proxy_cipher BLOB, created_at INTEGER NOT NULL, finished_at INTEGER
 );
@@ -151,17 +156,42 @@ CREATE INDEX IF NOT EXISTS login_attempts_account_success_id ON login_attempts(a
 	if err != nil {
 		return fmt.Errorf("migrate account checks: %w", err)
 	}
+	rows, err := s.db.Query(`PRAGMA table_info(account_check_batches)`)
+	if err != nil {
+		return err
+	}
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, kind string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if !columns["destination_key"] {
+		if _, err := s.db.Exec(`ALTER TABLE account_check_batches ADD COLUMN destination_key TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-const checkBatchSelect = `SELECT b.id,b.state,b.stop_reason,b.model,b.protocol_version,b.concurrency,b.proxy_mode,b.route_label,b.created_at,b.finished_at,
+const checkBatchSelect = `SELECT b.id,b.state,b.stop_reason,b.model,b.protocol_version,b.concurrency,b.proxy_mode,b.route_label,b.created_at,b.finished_at,b.destination_key,
  COUNT(c.id),COALESCE(SUM(c.state='queued'),0),COALESCE(SUM(c.state='running'),0),COALESCE(SUM(c.state='finished'),0),COALESCE(SUM(c.state='skipped'),0),COALESCE(SUM(c.state='canceled'),0),COALESCE(SUM(c.state='interrupted'),0),COALESCE(SUM(c.state='finished' AND c.outcome='ok'),0),COALESCE(SUM(c.state='finished' AND c.outcome!='ok'),0),COALESCE(SUM(c.failure_stage='precheck'),0),COALESCE(SUM(c.request_attempted=1),0)
  FROM account_check_batches b LEFT JOIN account_checks c ON c.batch_id=b.id`
 
 func scanCheckBatch(row scanner) (AccountCheckBatch, error) {
 	var b AccountCheckBatch
 	var finished sql.NullInt64
-	err := row.Scan(&b.ID, &b.State, &b.StopReason, &b.Model, &b.ProtocolVersion, &b.Concurrency, &b.ProxyMode, &b.RouteLabel, &b.CreatedAt, &finished, &b.Counts.Total, &b.Counts.Queued, &b.Counts.Running, &b.Counts.Finished, &b.Counts.Skipped, &b.Counts.Canceled, &b.Counts.Interrupted, &b.Counts.OK, &b.Counts.Abnormal, &b.Counts.Precheck, &b.Counts.Attempted)
+	err := row.Scan(&b.ID, &b.State, &b.StopReason, &b.Model, &b.ProtocolVersion, &b.Concurrency, &b.ProxyMode, &b.RouteLabel, &b.CreatedAt, &finished, &b.DestinationKey, &b.Counts.Total, &b.Counts.Queued, &b.Counts.Running, &b.Counts.Finished, &b.Counts.Skipped, &b.Counts.Canceled, &b.Counts.Interrupted, &b.Counts.OK, &b.Counts.Abnormal, &b.Counts.Precheck, &b.Counts.Attempted)
 	b.FinishedAt = nullableInt64(finished)
 	b.Counts.Settled = b.Counts.Total - b.Counts.Queued - b.Counts.Running
 	if errors.Is(err, sql.ErrNoRows) {
@@ -257,7 +287,8 @@ func normalizedCheckInput(input AccountCheckInput) ([]int64, string, error) {
 		IDs         []int64
 		Concurrency int
 		ProxyMode   string
-	}{ids, input.Concurrency, input.ProxyMode})
+		Destination string
+	}{ids, input.Concurrency, input.ProxyMode, strings.TrimSpace(input.DestinationKey)})
 	hash := sha256.Sum256(encoded)
 	return ids, hex.EncodeToString(hash[:]), nil
 }
@@ -319,9 +350,10 @@ func (s *Store) CreateAccountCheckBatch(ctx context.Context, input AccountCheckI
 		return AccountCheckBatch{}, false, err
 	}
 	invalid := make([]int64, 0)
+	destination := strings.TrimSpace(input.DestinationKey)
 	for _, id := range ids {
 		var eligible bool
-		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM accounts a JOIN sub2_imports i ON i.account_id=a.id WHERE a.id=? AND i.state='imported' AND i.sub2_account_id>0)`, id).Scan(&eligible); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM accounts a JOIN sub2_imports i ON i.account_id=a.id WHERE a.id=? AND i.state='imported' AND i.sub2_account_id>0 AND (?='' OR i.destination_key=?))`, id, destination, destination).Scan(&eligible); err != nil {
 			return AccountCheckBatch{}, false, err
 		}
 		if !eligible {
@@ -349,7 +381,7 @@ func (s *Store) CreateAccountCheckBatch(ctx context.Context, input AccountCheckI
 	}
 	id := hex.EncodeToString(random)
 	now := time.Now().UnixMilli()
-	_, err = tx.ExecContext(ctx, `INSERT INTO account_check_batches(id,request_key,request_hash,state,model,protocol_version,concurrency,proxy_mode,route_label,proxy_cipher,created_at) VALUES(?,?,?,'active',?,1,?,?,?,?,?)`, id, input.RequestKey, hash, AccountCheckModel, input.Concurrency, input.ProxyMode, route, cipher, now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO account_check_batches(id,request_key,request_hash,state,model,protocol_version,concurrency,destination_key,proxy_mode,route_label,proxy_cipher,created_at) VALUES(?,?,?,'active',?,1,?,?,?,?,?,?)`, id, input.RequestKey, hash, AccountCheckModel, input.Concurrency, destination, input.ProxyMode, route, cipher, now)
 	if err != nil {
 		return AccountCheckBatch{}, false, err
 	}
@@ -390,7 +422,8 @@ func (s *Store) claimAccountCheck(ctx context.Context) (*AccountCheckWork, bool,
 	var id int64
 	var batchID string
 	var accountID sql.NullInt64
-	err = tx.QueryRowContext(ctx, `SELECT c.id,c.batch_id,c.account_id FROM account_checks c JOIN account_check_batches b ON b.id=c.batch_id WHERE c.state='queued' AND b.state='active' AND (SELECT COUNT(*) FROM account_checks r WHERE r.batch_id=b.id AND r.state='running')<b.concurrency ORDER BY c.id LIMIT 1`).Scan(&id, &batchID, &accountID)
+	var destination string
+	err = tx.QueryRowContext(ctx, `SELECT c.id,c.batch_id,c.account_id,b.destination_key FROM account_checks c JOIN account_check_batches b ON b.id=c.batch_id WHERE c.state='queued' AND b.state='active' AND (SELECT COUNT(*) FROM account_checks r WHERE r.batch_id=b.id AND r.state='running')<b.concurrency ORDER BY c.id LIMIT 1`).Scan(&id, &batchID, &accountID, &destination)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -406,7 +439,7 @@ func (s *Store) claimAccountCheck(ctx context.Context) (*AccountCheckWork, bool,
 	if !accountID.Valid {
 		skip = "account_removed"
 	} else {
-		err = tx.QueryRowContext(ctx, `SELECT a.access_token_cipher,COALESCE(a.chatgpt_account_id,''),a.status,COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=a.id AND status='success'),0),EXISTS(SELECT 1 FROM sub2_imports i WHERE i.account_id=a.id AND i.state='imported' AND i.sub2_account_id>0) FROM accounts a WHERE a.id=?`, accountID.Int64).Scan(&accessCipher, &chatGPTID, &status, &version, &eligible)
+		err = tx.QueryRowContext(ctx, `SELECT a.access_token_cipher,COALESCE(a.chatgpt_account_id,''),a.status,COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=a.id AND status='success'),0),EXISTS(SELECT 1 FROM sub2_imports i WHERE i.account_id=a.id AND i.state='imported' AND i.sub2_account_id>0 AND (?='' OR i.destination_key=?)) FROM accounts a WHERE a.id=?`, destination, destination, accountID.Int64).Scan(&accessCipher, &chatGPTID, &status, &version, &eligible)
 		if err != nil {
 			return nil, false, err
 		}
@@ -612,7 +645,7 @@ func (s *Store) ListAccountCheckBatches(ctx context.Context, activeOnly bool, li
 	}
 	return batches, rows.Err()
 }
-func (s *Store) ListAccountChecks(ctx context.Context, accountID int64, limit int) ([]AccountCheck, error) {
+func (s *Store) ListAccountChecks(ctx context.Context, accountID int64, limit int, destinations ...string) ([]AccountCheck, error) {
 	if limit < 1 || limit > 20 {
 		limit = 20
 	}
@@ -621,16 +654,24 @@ func (s *Store) ListAccountChecks(ctx context.Context, accountID int64, limit in
 		return nil, err
 	}
 	defer tx.Rollback()
-	return readChecks(ctx, tx, ` WHERE c.account_id=? ORDER BY c.id DESC LIMIT ?`, accountID, limit)
+	destination := ""
+	if len(destinations) > 0 {
+		destination = strings.TrimSpace(destinations[0])
+	}
+	return readChecks(ctx, tx, ` WHERE c.account_id=? AND (?='' OR b.destination_key=? OR (b.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=c.account_id AND legacy_dest.state='imported' AND legacy_dest.sub2_account_id>0)=1 AND EXISTS(SELECT 1 FROM sub2_imports legacy_match WHERE legacy_match.account_id=c.account_id AND legacy_match.destination_key=? AND legacy_match.state='imported' AND legacy_match.sub2_account_id>0))) ORDER BY c.id DESC LIMIT ?`, accountID, destination, destination, destination, limit)
 }
-func (s *Store) ListAccountCheckSummaries(ctx context.Context) (map[int64]AccountCheckSummary, error) {
+func (s *Store) ListAccountCheckSummaries(ctx context.Context, destinations ...string) (map[int64]AccountCheckSummary, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
 	summaries := make(map[int64]AccountCheckSummary)
-	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.status,EXISTS(SELECT 1 FROM sub2_imports i WHERE i.account_id=a.id AND i.state='imported' AND i.sub2_account_id>0) FROM accounts a`)
+	destination := ""
+	if len(destinations) > 0 {
+		destination = strings.TrimSpace(destinations[0])
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.status,EXISTS(SELECT 1 FROM sub2_imports i WHERE i.account_id=a.id AND i.state='imported' AND i.sub2_account_id>0 AND (?='' OR i.destination_key=?)) FROM accounts a`, destination, destination)
 	if err != nil {
 		return nil, err
 	}
@@ -656,7 +697,7 @@ func (s *Store) ListAccountCheckSummaries(ctx context.Context) (map[int64]Accoun
 	if err != nil {
 		return nil, err
 	}
-	items, err := readChecks(ctx, tx, ` WHERE c.id IN (SELECT MAX(id) FROM account_checks WHERE account_id IS NOT NULL GROUP BY account_id) OR c.id IN (SELECT MAX(id) FROM account_checks WHERE account_id IS NOT NULL AND state='finished' GROUP BY account_id)`)
+	items, err := readChecks(ctx, tx, ` WHERE c.id IN (SELECT MAX(filtered.id) FROM account_checks filtered JOIN account_check_batches filtered_batch ON filtered_batch.id=filtered.batch_id WHERE filtered.account_id IS NOT NULL AND (?='' OR filtered_batch.destination_key=? OR (filtered_batch.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=filtered.account_id AND legacy_dest.state='imported' AND legacy_dest.sub2_account_id>0)=1 AND EXISTS(SELECT 1 FROM sub2_imports legacy_match WHERE legacy_match.account_id=filtered.account_id AND legacy_match.destination_key=? AND legacy_match.state='imported' AND legacy_match.sub2_account_id>0))) GROUP BY filtered.account_id) OR c.id IN (SELECT MAX(filtered.id) FROM account_checks filtered JOIN account_check_batches filtered_batch ON filtered_batch.id=filtered.batch_id WHERE filtered.account_id IS NOT NULL AND filtered.state='finished' AND (?='' OR filtered_batch.destination_key=? OR (filtered_batch.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=filtered.account_id AND legacy_dest.state='imported' AND legacy_dest.sub2_account_id>0)=1 AND EXISTS(SELECT 1 FROM sub2_imports legacy_match WHERE legacy_match.account_id=filtered.account_id AND legacy_match.destination_key=? AND legacy_match.state='imported' AND legacy_match.sub2_account_id>0))) GROUP BY filtered.account_id)`, destination, destination, destination, destination, destination, destination)
 	if err != nil {
 		return nil, err
 	}

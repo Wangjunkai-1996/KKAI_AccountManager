@@ -39,8 +39,8 @@ docker-compose up -d
 # 5. 查看日志
 docker-compose logs -f
 
-# 6. 访问服务
-# http://your-server-ip:8080
+# 6. 默认仅本机访问；远程访问请配置带认证的反向代理
+# http://127.0.0.1:8080
 ```
 
 ### 方式二：使用构建脚本
@@ -63,10 +63,10 @@ docker build -t openai-login-web:latest .
 # 2. 运行容器
 docker run -d \
   --name openai-login \
-  -p 8080:8080 \
-  -e HEADLESS=true \
+  -p 127.0.0.1:8080:8080 \
   --restart unless-stopped \
-  openai-login-web:latest
+  openai-login-web:latest \
+  -bind=0.0.0.0 -headless=true -open-browser=false
 
 # 3. 查看日志
 docker logs -f openai-login
@@ -79,9 +79,8 @@ docker logs -f openai-login
 编辑 `docker-compose.yml` 中的 environment 部分：
 
 ```yaml
+command: ["./openai-login-web", "-bind=0.0.0.0", "-headless=true", "-open-browser=false"]
 environment:
-  - HEADLESS=true          # 无头模式
-  - PORT=8080              # 端口
   - HTTP_PROXY=http://...  # 代理（如果需要）
   - HTTPS_PROXY=http://... # HTTPS 代理
 ```
@@ -92,7 +91,7 @@ environment:
 
 ```yaml
 ports:
-  - "8080:8080"  # 改成 "3000:8080" 将服务暴露到 3000 端口
+  - "127.0.0.1:8080:8080"  # 改成 "127.0.0.1:3000:8080" 使用其他本机端口
 ```
 
 ### 资源限制

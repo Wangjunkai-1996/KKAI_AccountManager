@@ -165,12 +165,12 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 	}()
 	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
 	defer cancel()
-	_, statuses, err := s.sub2.syncAccountStatuses(ctx)
+	_, statuses, err := s.sub2.syncAccountStatuses(withSub2StatusFresh(ctx))
 	if err != nil {
 		lastError = "Sub2 状态同步失败，下次扫描重试"
 		return
 	}
-	checks, err := s.store.ListAccountCheckSummaries(ctx)
+	checks, err := s.store.ListAccountCheckSummaries(ctx, s.sub2.destinationKey)
 	if err != nil {
 		lastError = "读取检测记录失败"
 		return
@@ -267,10 +267,10 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 }
 
 func (s *sub2RecoveryService) automaticRecoveryAllowed(ctx context.Context, id int64) (bool, error) {
-	if _, active, err := s.store.GetActiveAccountRecoveryTask(ctx, id); err != nil || active {
+	if _, active, err := s.store.GetActiveAccountRecoveryTaskForDestination(ctx, id, s.sub2.destinationKey); err != nil || active {
 		return false, err
 	}
-	previous, err := s.store.GetLatestAccountRecoveryTask(ctx, id)
+	previous, err := s.store.GetLatestAccountRecoveryTaskForDestination(ctx, id, s.sub2.destinationKey)
 	if errors.Is(err, store.ErrAccountRecoveryNotFound) {
 		return true, nil
 	}
@@ -298,7 +298,7 @@ func (s *sub2RecoveryService) retryDueRecoveries() {
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
 	defer cancel()
-	tasks, err := s.store.ListLatestAccountRecoveryTasks(ctx)
+	tasks, err := s.store.ListLatestAccountRecoveryTasksForDestination(ctx, s.sub2.destinationKey)
 	if err != nil {
 		s.pauseRecovery(0)
 		return
@@ -412,7 +412,7 @@ func (s *sub2RecoveryService) queueRecoveryChecks(ctx context.Context, ids []int
 	if _, err := rand.Read(key[:]); err != nil {
 		return store.AccountCheckBatch{}, err
 	}
-	input := store.AccountCheckInput{RequestKey: prefix + hex.EncodeToString(key[:]), AccountIDs: ids, Concurrency: 2, ProxyMode: "direct"}
+	input := store.AccountCheckInput{RequestKey: prefix + hex.EncodeToString(key[:]), AccountIDs: ids, Concurrency: 2, ProxyMode: "direct", DestinationKey: s.sub2.destinationKey}
 	if checker.proxy != "" {
 		if checker.upstreamProxy != "" {
 			return store.AccountCheckBatch{}, errors.New("检测暂不支持前置代理")

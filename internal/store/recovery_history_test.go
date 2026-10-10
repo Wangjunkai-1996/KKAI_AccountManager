@@ -80,3 +80,36 @@ func TestRecoveryHistoryCountsCompletedTasksAndBoundsAccountHistory(t *testing.T
 		t.Fatalf("other history = %+v, %v, %v", otherHistory, truncated, err)
 	}
 }
+
+func TestRecoveryHistoryFiltersDestination(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	account, err := s.UpsertCredentials(ctx, Credentials{Email: "history-destination@example.test", Password: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LinkSub2Account(ctx, "alpha", account.ID, 101, "linked-alpha-history"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LinkSub2Account(ctx, "beta", account.ID, 202, "linked-beta-history"); err != nil {
+		t.Fatal(err)
+	}
+	alpha, _, err := s.CreateOrGetAccountRecoveryTask(ctx, account.ID, 1, 101, true, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateAccountRecoveryTask(ctx, alpha.ID, RecoveryCompleted, ""); err != nil {
+		t.Fatal(err)
+	}
+	beta, _, err := s.CreateOrGetAccountRecoveryTask(ctx, account.ID, 2, 202, true, "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateAccountRecoveryTask(ctx, beta.ID, RecoveryCompleted, ""); err != nil {
+		t.Fatal(err)
+	}
+	history, _, err := s.ListAccountRecoveryHistory(ctx, account.ID, 100, "alpha")
+	if err != nil || len(history) != 1 || history[0].ID != alpha.ID {
+		t.Fatalf("alpha history = %+v, err=%v", history, err)
+	}
+}

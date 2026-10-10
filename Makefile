@@ -14,7 +14,7 @@ deps:
 	@echo "📦 安装 Go 依赖..."
 	$(GO) mod download
 	@echo "🌐 安装 Playwright 浏览器..."
-	$(GO) run github.com/playwright-community/playwright-go/cmd/playwright@latest install chromium
+	$(GO) run github.com/mxschmitt/playwright-go/cmd/playwright@v0.6201.1 install chromium
 	@echo "✅ 依赖安装完成"
 
 # 构建

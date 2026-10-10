@@ -152,7 +152,7 @@ func (s *sub2RecoveryService) worker() {
 		var tasks []store.AccountRecoveryTask
 		var err error
 		if s.configured() {
-			tasks, err = s.store.ListAccountRecoveryTasks(ctx, store.RecoveryQueued, 1)
+			tasks, err = s.store.ListAccountRecoveryTasksForDestination(ctx, store.RecoveryQueued, 1, s.sub2.destinationKey)
 		}
 		cancel()
 		if err != nil {
@@ -236,14 +236,14 @@ func (s *sub2RecoveryService) handleCollection(w http.ResponseWriter, r *http.Re
 				recoveryAPIError(w, http.StatusBadRequest, "invalid_task_id", "恢复任务 ID 无效")
 				return
 			}
-			task, err = s.store.GetAccountRecoveryTaskByID(r.Context(), id)
+			task, err = s.store.GetAccountRecoveryTaskByIDForDestination(r.Context(), id, s.sub2.destinationKey)
 		} else {
 			id, parseErr := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("account_id")), 10, 64)
 			if parseErr != nil || id <= 0 {
 				recoveryAPIError(w, http.StatusBadRequest, "invalid_account_id", "account_id 必须是正整数")
 				return
 			}
-			task, err = s.store.GetLatestAccountRecoveryTask(r.Context(), id)
+			task, err = s.store.GetLatestAccountRecoveryTaskForDestination(r.Context(), id, s.sub2.destinationKey)
 		}
 		if errors.Is(err, store.ErrAccountRecoveryNotFound) {
 			recoveryAPIError(w, http.StatusNotFound, "recovery_not_found", "恢复任务不存在")
@@ -309,7 +309,7 @@ func (s *sub2RecoveryService) handleAction(w http.ResponseWriter, r *http.Reques
 		recoveryAPIError(w, http.StatusBadRequest, "invalid_task_id", "恢复任务 ID 无效")
 		return
 	}
-	task, err := s.store.GetAccountRecoveryTaskByID(r.Context(), id)
+	task, err := s.store.GetAccountRecoveryTaskByIDForDestination(r.Context(), id, s.sub2.destinationKey)
 	if errors.Is(err, store.ErrAccountRecoveryNotFound) {
 		recoveryAPIError(w, http.StatusNotFound, "recovery_not_found", "恢复任务不存在")
 		return
@@ -326,7 +326,7 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, auto
 	if err != nil {
 		return store.AccountRecoveryTask{}, false, err
 	}
-	if task, found, err := s.store.GetActiveAccountRecoveryTask(ctx, accountID); err != nil {
+	if task, found, err := s.store.GetActiveAccountRecoveryTaskForDestination(ctx, accountID, s.sub2.destinationKey); err != nil {
 		return task, false, err
 	} else if found {
 		return task, false, nil
@@ -345,7 +345,7 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, auto
 	if recoveryAccountDisabled(detail) {
 		return store.AccountRecoveryTask{}, false, errors.New("Sub2 账号已被禁用，请先在 Sub2 启用后恢复")
 	}
-	previous, previousErr := s.store.GetLatestAccountRecoveryTask(ctx, accountID)
+	previous, previousErr := s.store.GetLatestAccountRecoveryTaskForDestination(ctx, accountID, s.sub2.destinationKey)
 	if previousErr != nil && !errors.Is(previousErr, store.ErrAccountRecoveryNotFound) {
 		return previous, false, previousErr
 	}
@@ -367,7 +367,7 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, auto
 			// Another enqueue may have won the same failed/unknown task between
 			// validation and the CAS update. Reuse its active task instead of
 			// turning an expected loser into an HTTP 500.
-			if active, found, readErr := s.store.GetActiveAccountRecoveryTask(ctx, accountID); readErr == nil && found {
+			if active, found, readErr := s.store.GetActiveAccountRecoveryTaskForDestination(ctx, accountID, s.sub2.destinationKey); readErr == nil && found {
 				return active, false, nil
 			}
 		}
@@ -402,7 +402,7 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, auto
 		}
 
 	}
-	task, created, err := s.store.CreateOrGetAccountRecoveryTask(ctx, accountID, checkID, binding.Sub2AccountID, original)
+	task, created, err := s.store.CreateOrGetAccountRecoveryTask(ctx, accountID, checkID, binding.Sub2AccountID, original, s.sub2.destinationKey)
 	if err == nil && created {
 		s.notify()
 	}
@@ -713,7 +713,7 @@ func acquireRecoveryLoginSlot(ctx context.Context) (func(), error) {
 }
 
 func (s *sub2RecoveryService) validateCandidate(ctx context.Context, accountID int64) (int64, error) {
-	checks, err := s.store.ListAccountChecks(ctx, accountID, 20)
+	checks, err := s.store.ListAccountChecks(ctx, accountID, 20, s.sub2.destinationKey)
 	if err != nil || len(checks) == 0 {
 		return 0, errRecoveryNotCandidate
 	}

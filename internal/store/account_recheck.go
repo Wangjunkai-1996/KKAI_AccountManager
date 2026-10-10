@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -73,7 +74,23 @@ func scanAccountRecoveryRecheck(row scanner) (AccountRecoveryRecheck, error) {
 }
 
 func (s *Store) ListAccountRecoveryRechecks(ctx context.Context) (map[int64]AccountRecoveryRecheck, error) {
-	rows, err := s.db.QueryContext(ctx, accountRecheckSelect+` WHERE t.id=(SELECT MAX(id) FROM account_recovery_tasks WHERE account_id=t.account_id)`)
+	return s.listAccountRecoveryRechecks(ctx)
+}
+
+func (s *Store) ListAccountRecoveryRechecksForDestination(ctx context.Context, destination string) (map[int64]AccountRecoveryRecheck, error) {
+	return s.listAccountRecoveryRechecks(ctx, destination)
+}
+
+func (s *Store) listAccountRecoveryRechecks(ctx context.Context, destinations ...string) (map[int64]AccountRecoveryRecheck, error) {
+	query := accountRecheckSelect + ` WHERE t.id=(SELECT MAX(latest.id) FROM account_recovery_tasks latest WHERE latest.account_id=t.account_id`
+	args := make([]any, 0, 2)
+	if len(destinations) > 0 && strings.TrimSpace(destinations[0]) != "" {
+		destination := strings.TrimSpace(destinations[0])
+		query += ` AND (latest.destination_key=? OR (latest.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=latest.account_id AND legacy_dest.sub2_account_id=latest.sub2_account_id AND legacy_dest.state='imported')=1 AND EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=latest.account_id AND i.sub2_account_id=latest.sub2_account_id AND i.state='imported')))`
+		args = append(args, destination, destination)
+	}
+	query += `)`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -102,12 +119,28 @@ func (s *Store) RetryAccountRecoveryRecheck(ctx context.Context, accountID int64
 }
 
 func (s *Store) ClaimAccountRecoveryRecheck(ctx context.Context, now time.Time) (*AccountRecoveryRecheck, error) {
+	return s.claimAccountRecoveryRecheck(ctx, now)
+}
+
+func (s *Store) ClaimAccountRecoveryRecheckForDestination(ctx context.Context, now time.Time, destination string) (*AccountRecoveryRecheck, error) {
+	return s.claimAccountRecoveryRecheck(ctx, now, destination)
+}
+
+func (s *Store) claimAccountRecoveryRecheck(ctx context.Context, now time.Time, destinations ...string) (*AccountRecoveryRecheck, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	recheck, err := scanAccountRecoveryRecheck(tx.QueryRowContext(ctx, accountRecheckSelect+` WHERE r.state='pending' AND r.next_check_at<=? AND t.state='completed' AND t.id=(SELECT MAX(id) FROM account_recovery_tasks WHERE account_id=t.account_id) ORDER BY r.next_check_at LIMIT 1`, now.UnixMilli()))
+	query := accountRecheckSelect + ` WHERE r.state='pending' AND r.next_check_at<=? AND t.state='completed' AND t.id=(SELECT MAX(id) FROM account_recovery_tasks latest WHERE latest.account_id=t.account_id`
+	args := []any{now.UnixMilli()}
+	if len(destinations) > 0 && strings.TrimSpace(destinations[0]) != "" {
+		destination := strings.TrimSpace(destinations[0])
+		query += ` AND (latest.destination_key=? OR (latest.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=latest.account_id AND legacy_dest.sub2_account_id=latest.sub2_account_id AND legacy_dest.state='imported')=1 AND EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=latest.account_id AND i.sub2_account_id=latest.sub2_account_id AND i.state='imported')))`
+		args = append(args, destination, destination)
+	}
+	query += `) ORDER BY r.next_check_at LIMIT 1`
+	recheck, err := scanAccountRecoveryRecheck(tx.QueryRowContext(ctx, query, args...))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -180,14 +213,14 @@ func (s *Store) QueueAccountRecoveryFromRecheck(ctx context.Context, parentID in
 		return AccountRecoveryTask{}, err
 	}
 	var latest int64
-	if err := tx.QueryRowContext(ctx, `SELECT MAX(id) FROM account_recovery_tasks WHERE account_id=?`, parent.AccountID).Scan(&latest); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(id) FROM account_recovery_tasks WHERE account_id=? AND destination_key=?`, parent.AccountID, parent.DestinationKey).Scan(&latest); err != nil {
 		return AccountRecoveryTask{}, err
 	}
 	if latest != parent.ID {
 		return AccountRecoveryTask{}, ErrAccountBusy
 	}
 	now := time.Now().UnixMilli()
-	result, err := tx.ExecContext(ctx, `INSERT INTO account_recovery_tasks(account_id,source_credential_attempt_id,sub2_account_id,original_schedulable,state,failure_stage,error_code,retry_action,created_at,updated_at) VALUES (?,?,?,1,'queued','delayed_recheck','credential_invalid','relogin',?,?)`, parent.AccountID, parent.ResultCredentialAttemptID, parent.Sub2AccountID, now, now)
+	result, err := tx.ExecContext(ctx, `INSERT INTO account_recovery_tasks(account_id,source_credential_attempt_id,sub2_account_id,original_schedulable,destination_key,state,failure_stage,error_code,retry_action,created_at,updated_at) VALUES (?,?,?,1,?,'queued','delayed_recheck','credential_invalid','relogin',?,?)`, parent.AccountID, parent.ResultCredentialAttemptID, parent.Sub2AccountID, parent.DestinationKey, now, now)
 	if err != nil {
 		return AccountRecoveryTask{}, err
 	}

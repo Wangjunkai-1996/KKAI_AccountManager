@@ -44,7 +44,7 @@ echo ""
 echo "3️⃣  检查 Playwright 浏览器..."
 if [ ! -d "$HOME/Library/Caches/ms-playwright" ]; then
     echo "   正在安装 Chromium 浏览器（首次安装需要几分钟）..."
-    go run github.com/playwright-community/playwright-go/cmd/playwright@latest install chromium
+    go run github.com/mxschmitt/playwright-go/cmd/playwright@v0.6201.1 install chromium
     echo "✅ 浏览器安装完成"
 else
     echo "✅ 浏览器已安装"

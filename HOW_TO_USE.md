@@ -46,7 +46,7 @@ chmod +x run.sh
 
 # 方法 2：手动命令
 go mod download
-go run github.com/playwright-community/playwright-go/cmd/playwright@latest install chromium
+go run github.com/mxschmitt/playwright-go/cmd/playwright@v0.6201.1 install chromium
 go build -o bin/openai-login ./cmd/main.go
 ./bin/openai-login -input accounts.txt -output result.json
 ```
@@ -163,7 +163,7 @@ brew install go
 
 ```bash
 # 手动安装 Playwright 浏览器
-go run github.com/playwright-community/playwright-go/cmd/playwright@latest install chromium
+go run github.com/mxschmitt/playwright-go/cmd/playwright@v0.6201.1 install chromium
 ```
 
 ### Q3: TOTP 验证码错误？

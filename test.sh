@@ -16,18 +16,16 @@ fi
 go version
 echo ""
 
-# 2. 初始化模块
-echo "2️⃣  初始化 Go 模块..."
-go mod init github.com/Wei-Shaw/sub2api/tools/openai-login 2>/dev/null || true
-go mod tidy
-echo "✅ 模块初始化完成"
+# 2. 校验模块
+echo "2️⃣  校验 Go 模块..."
+go mod download
+echo "✅ 模块依赖已就绪"
 echo ""
 
-# 3. 下载依赖
-echo "3️⃣  下载依赖..."
-go get github.com/playwright-community/playwright-go@v0.4501.1
-go mod tidy
-echo "✅ 依赖下载完成"
+# 3. 检查依赖
+echo "3️⃣  检查依赖版本..."
+go list -m github.com/mxschmitt/playwright-go
+echo "✅ 依赖版本与 go.mod 一致"
 echo ""
 
 # 4. 编译检查
@@ -44,7 +42,7 @@ echo ""
 # 5. 安装 Playwright 浏览器
 echo "5️⃣  安装 Playwright 浏览器..."
 echo "   (这可能需要几分钟...)"
-go run github.com/playwright-community/playwright-go/cmd/playwright@latest install chromium
+go run github.com/mxschmitt/playwright-go/cmd/playwright@v0.6201.1 install chromium
 echo "✅ 浏览器安装完成"
 echo ""
 

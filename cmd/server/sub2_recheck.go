@@ -13,7 +13,7 @@ import (
 // queue is empty. Closing the page or restarting does not discard the probe.
 func (s *sub2RecoveryService) processNextRecheck() bool {
 	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-	check, err := s.store.ClaimAccountRecoveryRecheck(ctx, time.Now())
+	check, err := s.store.ClaimAccountRecoveryRecheckForDestination(ctx, time.Now(), s.sub2.destinationKey)
 	cancel()
 	if err != nil {
 		s.pauseRecovery(0)
@@ -99,7 +99,7 @@ func (s *sub2RecoveryService) processRecheck(check store.AccountRecoveryRecheck)
 }
 
 func (s *sub2RecoveryService) validateRecheckOwnership(ctx context.Context, task store.AccountRecoveryTask) error {
-	latest, err := s.store.GetLatestAccountRecoveryTask(ctx, task.AccountID)
+	latest, err := s.store.GetLatestAccountRecoveryTaskForDestination(ctx, task.AccountID, s.sub2.destinationKey)
 	if err != nil {
 		return err
 	}
