@@ -32,7 +32,7 @@ func TestAccountDeliveryDeletedGroupRetry(t *testing.T) {
 	defer recovery.Stop()
 	delivery := newAccountDeliveryService(history, importer, recovery)
 	defer delivery.Stop()
-	task, err := history.QueueAccountDelivery(ctx, accountID, "fixture", store.DeliveryOptions{GroupIDs: []int64{7}, Priority: 1, Concurrency: 3})
+	task, err := history.QueueAccountDelivery(ctx, accountID, "fixture", store.DeliveryOptions{GroupIDs: []int64{7}, Priority: 1, Concurrency: 3, Merchant: "测试号商", Deadline: "2026-12-31"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestAccountDeliveryDeletedGroupRetry(t *testing.T) {
 		t.Fatalf("missing initial group failure: %+v %v", task, err)
 	}
 	response := httptest.NewRecorder()
-	importer.handleImport(response, httptest.NewRequest(http.MethodPost, "/api/sub2/import", strings.NewReader(fmt.Sprintf(`{"account_ids":[%d],"delivery_options":{"group_ids":[8],"priority":1,"concurrency":3}}`, accountID))))
+	importer.handleImport(response, httptest.NewRequest(http.MethodPost, "/api/sub2/import", strings.NewReader(fmt.Sprintf(`{"account_ids":[%d],"delivery_options":{"group_ids":[8],"priority":1,"concurrency":3,"merchant":"测试号商","deadline":"2026-12-31"}}`, accountID))))
 	if response.Code != http.StatusOK {
 		t.Fatalf("resubmit rejected: %d %s", response.Code, response.Body.String())
 	}
@@ -70,7 +70,7 @@ func TestAccountDeliveryPauseStopsBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = f.store.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &store.Result{AccessToken: "second-at", RefreshToken: "second-rt", ChatGPTAccountID: "second-workspace"}, "fixture")
+	_, err = f.store.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &store.Result{AccessToken: "second-at", RefreshToken: "second-rt", ChatGPTAccountID: "second-workspace"}, "fixture", store.DeliveryOptions{Priority: 1, Concurrency: 3, Merchant: "测试号商", Deadline: "2026-12-31"})
 	attempt.Release()
 	if err != nil {
 		t.Fatal(err)

@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func TestDeliveryOptionsNamePrefixValidation(t *testing.T) {
+func TestDeliveryOptionsNameFieldsValidation(t *testing.T) {
 	for _, tc := range []struct {
 		name, input, want string
 		invalid           bool
@@ -25,10 +25,35 @@ func TestDeliveryOptionsNamePrefixValidation(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			options := DefaultDeliveryOptions()
-			options.NamePrefix = tc.input
+			options.Merchant = tc.input
 			err := options.Validate()
-			if (err != nil) != tc.invalid || err == nil && options.NamePrefix != tc.want {
-				t.Fatalf("prefix=%q err=%v", options.NamePrefix, err)
+			if (err != nil) != tc.invalid || err == nil && options.Merchant != tc.want {
+				t.Fatalf("merchant=%q err=%v", options.Merchant, err)
+			}
+		})
+	}
+}
+
+func TestDeliveryOptionsValidateForImportRequiresNameFields(t *testing.T) {
+	base := DeliveryOptions{Priority: 1, Concurrency: 3, Merchant: "号商", Deadline: "2026-12-31"}
+	if err := base.ValidateForImport(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		merchant string
+		deadline string
+	}{
+		{"missing_merchant", "", base.Deadline},
+		{"missing_deadline", base.Merchant, ""},
+		{"blank_merchant", "  ", base.Deadline},
+		{"blank_deadline", base.Merchant, "  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := base
+			options.Merchant, options.Deadline = tc.merchant, tc.deadline
+			if err := options.ValidateForImport(); err == nil {
+				t.Fatal("expected required field validation error")
 			}
 		})
 	}

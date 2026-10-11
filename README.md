@@ -32,8 +32,8 @@
 
 ## 账号交付参数与自动续跑
 
-- 批量登录采用紧凑双栏布局，桌面端开始按钮固定在卡片底部，表单与结果独立滚动；手机端自然单列。账号前缀与登录并发并排，HTTP 代理和处理模式位于“网络与处理方式”折叠区。
-- 批量登录提供可选“账号前缀”输入框，新建 Sub2 账号命名为 `前缀_MMDDHHmm_邮箱`（北京时间）；留空使用 `AUTH`，支持中文，最多 32 个字符。前缀随批次和重试保存；“交付参数”中可保存为平台默认。关闭自动交付后同页手动导入默认沿用该批前缀，也可在确认时修改。已有 Sub2 账号保留原名。
+- 批量登录采用紧凑双栏布局，桌面端开始按钮固定在卡片底部，表单与结果独立滚动；手机端自然单列。登录并发位于批量输入区，HTTP 代理和处理模式位于“网络与处理方式”折叠区。
+- 开始自动交付或手动导入 Sub2 时会弹出交付参数框，填写号商和截止时间；新建 Sub2 账号命名为 `号商 | 截止时间 | 邮箱`。号商和截止时间会随本批及重试保存，也可以保存为平台默认；已有 Sub2 账号保留原名。
 - 批量登录和历史账号导入可以选择 Sub2 的 OpenAI 分组、优先级和并发；“保存为平台默认”保存在服务器，后续批次复用。每批参数独立冻结，重试不会套用后来修改的默认值。
 - 所选参数仅用于新建账号。已经存在的 Sub2 账号保留分组、优先级和并发；新建账号通过 Sub2 检测后才加入所选分组并启用。导入已受理/创建已确认不等于交付完成。
 - 恢复或交付成功后可用，后台在完成后约 30 秒、30 分钟再次实际检查 Sub2；到期后若恢复队列繁忙仍需排队；临时错误自动退避，明确凭据失效按自动恢复开关重新处理。复检不增加复活次数。
@@ -112,7 +112,7 @@ make build
 
 可用 `-history-db`、`-history-key` 或环境变量 `OPENAI_LOGIN_DB`、`OPENAI_LOGIN_KEY` 指定稳定的数据目录。线上服务应把它们指向服务用户可写、release 目录之外的路径，例如 `/var/lib/openai-login/data/accounts.db` 和 `/var/lib/openai-login/data/accounts.key`。
 
-认证成功的历史账号可以在页面中导入到 Sub2，并选择分组、优先级、并发和账号前缀。启用此功能前，在 AUTH 服务进程环境中设置 `SUB2API_BASE_URL`（Sub2 站点根地址）和 `SUB2API_ADMIN_API_KEY`（Sub2 管理员 API Key）；可选的 `AUTH_INSTANCE_ID` 用于区分多个 AUTH 实例。管理密钥只由后端读取，浏览器提交本地账号 ID 和交付参数。导入和恢复任务调用 Sub2 现有管理接口，不要求修改 Sub2 源码。新建 Sub2 账号名称使用 `前缀_MMDDHHmm_email`（按服务端 Asia/Shanghai 时间生成），前缀留空使用 `AUTH`；名称不会替代来源标记或身份核对。
+认证成功的历史账号可以在页面中导入到 Sub2，并选择分组、优先级、并发、号商和截止时间。启用此功能前，在 AUTH 服务进程环境中设置 `SUB2API_BASE_URL`（Sub2 站点根地址）和 `SUB2API_ADMIN_API_KEY`（Sub2 管理员 API Key）；可选的 `AUTH_INSTANCE_ID` 用于区分多个 AUTH 实例。管理密钥只由后端读取，浏览器提交本地账号 ID 和交付参数。导入和恢复任务调用 Sub2 现有管理接口，不要求修改 Sub2 源码。新建 Sub2 账号名称使用 `号商 | 截止时间 | 邮箱`；名称不会替代来源标记或身份核对。
 
 账号历史刷新时读取 Sub2 当前状态；可见页面在任务进行中每 5 秒更新，自动恢复开启且空闲时每 60 秒更新，关闭且空闲时每 5 分钟更新。没有导入绑定时，按 Sub2 凭据中的邮箱精确匹配，并核对已有的 ChatGPT 账号 ID；唯一匹配后保存本地关联，支持从其他工具导入、使用自定义名称的账号，不会重复创建 Sub2 账号或改变其分组。匹配歧义、身份冲突和网络异常显示具体原因；只有已关联账号明确返回 404 才显示已删除。状态同步保留 Sub2 原始 `schedulable` 与 `effective_schedulable` 字段，并显示当前实际可调度性；未来的限流窗口、上游过载窗口和临时暂停截止时间/原因也会在历史行中展示。
 
@@ -263,7 +263,7 @@ curl -X POST http://your-sub2api:8080/api/v1/admin/accounts/import \
   "proxies": [],
   "accounts": [
     {
-      "name": "AUTH_10011530_user@example.com",
+      "name": "示例号商 | 2026-12-31 | user@example.com",
       "platform": "openai",
       "type": "oauth",
       "credentials": {
@@ -277,7 +277,7 @@ curl -X POST http://your-sub2api:8080/api/v1/admin/accounts/import \
       },
       "extra": {
         "email": "user@example.com",
-        "display_name": "AUTH_10011530_user@example.com",
+        "display_name": "示例号商 | 2026-12-31 | user@example.com",
         "openai_passthrough": false,
         "recovery": {
           "email": "user@example.com",

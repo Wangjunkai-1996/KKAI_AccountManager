@@ -27,7 +27,7 @@ func newDeliveryFixture(t *testing.T) (*recoveryFixture, *accountDeliveryService
 	}
 	delivery, err := f.store.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &store.Result{
 		AccessToken: "delivery-at", RefreshToken: "delivery-rt", ChatGPTAccountID: "new-delivery-workspace", PlanType: "plus", ExpiresAt: 2100000000,
-	}, "fixture")
+	}, "fixture", store.DeliveryOptions{Priority: 1, Concurrency: 3, Merchant: "测试号商", Deadline: "2026-12-31"})
 	attempt.Release()
 	if err != nil {
 		t.Fatal(err)
@@ -275,7 +275,7 @@ func TestAccountDeliveryImportUncertainOutcomeOnlyReconciles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	delivery, err := history.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &store.Result{AccessToken: "delivery-at", RefreshToken: "delivery-rt", ChatGPTAccountID: "workspace"}, "fixture")
+	delivery, err := history.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &store.Result{AccessToken: "delivery-at", RefreshToken: "delivery-rt", ChatGPTAccountID: "workspace"}, "fixture", store.DeliveryOptions{Priority: 1, Concurrency: 3, Merchant: "测试号商", Deadline: "2026-12-31"})
 	attempt.Release()
 	if err != nil {
 		t.Fatal(err)

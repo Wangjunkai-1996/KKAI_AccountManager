@@ -16,16 +16,21 @@ type DeliveryOptions struct {
 	GroupIDs    []int64 `json:"group_ids"`
 	Priority    int     `json:"priority"`
 	Concurrency int     `json:"concurrency"`
-	NamePrefix  string  `json:"name_prefix,omitempty"`
+	Merchant    string  `json:"merchant,omitempty"`
+	Deadline    string  `json:"deadline,omitempty"`
 }
 
 func DefaultDeliveryOptions() DeliveryOptions {
 	return DeliveryOptions{GroupIDs: []int64{}, Priority: 1, Concurrency: 3}
 }
 func (o *DeliveryOptions) Validate() error {
-	o.NamePrefix = strings.TrimSpace(o.NamePrefix)
-	if utf8.RuneCountInString(o.NamePrefix) > 32 || strings.ContainsFunc(o.NamePrefix, unicode.IsControl) {
-		return errors.New("账号前缀最多 32 个字符，不能包含控制字符")
+	o.Merchant = strings.TrimSpace(o.Merchant)
+	o.Deadline = strings.TrimSpace(o.Deadline)
+	if utf8.RuneCountInString(o.Merchant) > 32 || strings.ContainsFunc(o.Merchant, unicode.IsControl) {
+		return errors.New("号商最多 32 个字符，不能包含控制字符")
+	}
+	if utf8.RuneCountInString(o.Deadline) > 64 || strings.ContainsFunc(o.Deadline, unicode.IsControl) {
+		return errors.New("截止时间最多 64 个字符，不能包含控制字符")
 	}
 	if o.Priority < 0 || int64(o.Priority) > 2147483647 || o.Concurrency < 1 || o.Concurrency > 10000 || len(o.GroupIDs) > 100 {
 		return errors.New("优先级应为非负整数，并发应为 1–10000，分组最多 100 个")
@@ -43,6 +48,22 @@ func (o *DeliveryOptions) Validate() error {
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	o.GroupIDs = ids
+	return nil
+}
+
+// ValidateForImport applies the fields required to create a new Sub2 account.
+// Defaults remain permissive so old persisted delivery snapshots can still be
+// read and retried without changing their durable state.
+func (o *DeliveryOptions) ValidateForImport() error {
+	if err := o.Validate(); err != nil {
+		return err
+	}
+	if o.Merchant == "" {
+		return errors.New("号商不能为空")
+	}
+	if o.Deadline == "" {
+		return errors.New("截止时间不能为空")
+	}
 	return nil
 }
 func (s *Store) migrateDeliveryOptions() error {

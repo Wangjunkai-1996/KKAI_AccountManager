@@ -46,7 +46,7 @@ func TestAccountDeliveryBusyBatchDoesNotStarveFollowingTask(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		busy, err := f.store.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &store.Result{AccessToken: "fixture-at", RefreshToken: "fixture-rt"}, "fixture")
+		busy, err := f.store.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &store.Result{AccessToken: "fixture-at", RefreshToken: "fixture-rt"}, "fixture", store.DeliveryOptions{Priority: 1, Concurrency: 3, Merchant: "测试号商", Deadline: "2026-12-31"})
 		attempt.Release()
 		if err != nil {
 			t.Fatal(err)

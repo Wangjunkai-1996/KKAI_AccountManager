@@ -74,9 +74,8 @@ const retryFailedBtn = document.getElementById('retryFailedBtn');
 const importSub2Btn = document.getElementById('importSub2Btn');
 const autoDeliverToggle = document.getElementById('autoDeliverToggle');
 const autoDeliverHint = document.getElementById('autoDeliverHint');
-const accountNamePrefix = document.getElementById('accountNamePrefix');
-const accountNamePrefixHint = document.getElementById('accountNamePrefixHint');
-const deliveryNamePrefix = document.getElementById('deliveryNamePrefix');
+const deliveryMerchant = document.getElementById('deliveryMerchant');
+const deliveryDeadline = document.getElementById('deliveryDeadline');
 const deliveryOptionsDialog = document.getElementById('deliveryOptionsDialog');
 const deliveryOptionsForm = document.getElementById('deliveryOptionsForm');
 const deliveryOptionsBtn = document.getElementById('deliveryOptionsBtn');
@@ -220,7 +219,6 @@ let historyRechecks = new Map();
 let historyRepairs = new Map();
 let deliverySettings = null;
 let deliveryBatchOptions = null;
-let accountNamePrefixEdited = false;
 let deliverySettingsRequest = null;
 let pendingDeliveryOptions = null;
 let deliveryOptionsSaving = false;
@@ -604,10 +602,13 @@ startBtn.addEventListener('click', async () => {
             return;
         }
         const autoDeliver = autoDeliveryConfigured === true && Boolean(autoDeliverToggle?.checked);
-        if (autoDeliver && !await prepareDeliveryBatch()) return;
+        let autoDeliveryOptions = null;
+        if (autoDeliver) {
+            if (!await prepareDeliveryBatch()) return;
+            autoDeliveryOptions = await chooseDeliveryOptions('开始处理前，请填写本批导入 Sub2 所需的号商和截止时间。');
+            if (!autoDeliveryOptions) return;
+        }
         if (processing || historyBatchRunning) return;
-        if (!validateAccountNamePrefix()) return;
-        const namePrefix = normalizeNamePrefix(accountNamePrefix.value);
 
         accounts = report.accounts.map((account, index) => ({
             id: index,
@@ -618,8 +619,7 @@ startBtn.addEventListener('click', async () => {
             message: '等待处理',
             result: null,
             autoDeliver,
-            namePrefix,
-            deliveryOptions: autoDeliver ? copyDeliveryOptions({ ...deliveryBatchOptions, name_prefix: namePrefix }) : null
+            deliveryOptions: autoDeliver ? copyDeliveryOptions(autoDeliveryOptions) : null
         }));
 
         results = [];
@@ -857,44 +857,35 @@ function renderAutoDeliverySetting() {
         : autoDeliverToggle.checked ? '已受理的交付任务在后台继续，关闭页面不受影响。'
         : '本次仅登录并保存账号；之后可手动导入 Sub2。';
     deliveryOptionsBtn.disabled = processing || historyBatchRunning || autoDeliveryConfigured !== true;
-    accountNamePrefix.disabled = processing || historyBatchRunning;
 }
 
 function copyDeliveryOptions(options) {
-    const prefix = normalizeNamePrefix(options.name_prefix);
-    return { group_ids: [...(options.group_ids || [])], priority: Number(options.priority), concurrency: Number(options.concurrency), ...(prefix ? { name_prefix: prefix } : {}) };
+    options = options || {};
+    const merchant = normalizeDeliveryValue(options.merchant);
+    const deadline = normalizeDeliveryValue(options.deadline);
+    return {
+        group_ids: [...(options.group_ids || [])], priority: Number(options.priority), concurrency: Number(options.concurrency),
+        ...(merchant ? { merchant } : {}), ...(deadline ? { deadline } : {})
+    };
 }
 
-function normalizeNamePrefix(value) {
+function normalizeDeliveryValue(value) {
     // Match the server's Unicode whitespace trimming, including U+0085.
     return String(value ?? '').replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
 }
 
-function namePrefixError(value) {
-    const prefix = normalizeNamePrefix(value);
-    return Array.from(prefix).length > 32 ? '账号前缀最多 32 个字符。'
-        : /[\u0000-\u001f\u007f-\u009f]/.test(prefix) ? '账号前缀不能包含控制字符。' : '';
+function deliveryValueError(value, label, maxLength) {
+    if (!value) return `${label}不能为空。`;
+    if (Array.from(value).length > maxLength) return `${label}最多 ${maxLength} 个字符。`;
+    return /[\u0000-\u001f\u007f-\u009f]/.test(value) ? `${label}不能包含控制字符。` : '';
 }
-
-function validateAccountNamePrefix() {
-    const error = namePrefixError(accountNamePrefix.value);
-    accountNamePrefixHint.textContent = error || '留空使用 AUTH，最多 32 个字符。';
-    accountNamePrefix.setAttribute('aria-invalid', String(Boolean(error)));
-    if (error) accountNamePrefix.focus();
-    return !error;
-}
-
-accountNamePrefix.addEventListener('input', () => {
-    accountNamePrefixEdited = true;
-    if (deliveryBatchOptions) deliveryBatchOptions = copyDeliveryOptions({ ...deliveryBatchOptions, name_prefix: accountNamePrefix.value });
-    validateAccountNamePrefix();
-    renderDeliveryOptionsSummary();
-});
 
 function renderDeliveryOptionsSummary() {
     if (!deliveryBatchOptions) return;
     const names = deliveryBatchOptions.group_ids.map(id => deliverySettings?.groups?.find(group => Number(group.id) === id)?.name || `分组 #${id}`);
-    deliveryOptionsSummary.textContent = `${names.length ? names.join('、') : '未分组'} · 优先级 ${deliveryBatchOptions.priority} · 账号并发 ${deliveryBatchOptions.concurrency} · 前缀 ${deliveryBatchOptions.name_prefix || 'AUTH'}`;
+    const batch = deliveryBatchOptions.merchant && deliveryBatchOptions.deadline
+        ? ` · ${deliveryBatchOptions.merchant} | ${deliveryBatchOptions.deadline}` : '';
+    deliveryOptionsSummary.textContent = `${names.length ? names.join('、') : '未分组'} · 优先级 ${deliveryBatchOptions.priority} · 账号并发 ${deliveryBatchOptions.concurrency}${batch}`;
 }
 
 async function loadDeliverySettings() {
@@ -907,8 +898,6 @@ async function loadDeliverySettings() {
             deliverySettings = payload;
             if (!deliveryBatchOptions) {
                 deliveryBatchOptions = copyDeliveryOptions(payload.defaults);
-                if (accountNamePrefixEdited) deliveryBatchOptions = copyDeliveryOptions({ ...deliveryBatchOptions, name_prefix: accountNamePrefix.value });
-                else accountNamePrefix.value = deliveryBatchOptions.name_prefix || '';
             }
             renderDeliveryOptionsSummary();
             return true;
@@ -943,14 +932,15 @@ function closeDeliveryOptions(options = null) {
     resolve(options);
 }
 
-function chooseDeliveryOptions(message = '为接下来的登录批次设置交付参数；已经开始的任务不受影响。', importBatch = false, batchNamePrefix) {
+function chooseDeliveryOptions(message = '为接下来的登录批次设置交付参数；已经开始的任务不受影响。', importBatch = false) {
     if (pendingDeliveryOptions) return Promise.resolve(null);
     deliveryOptionsMessage.textContent = message;
     deliveryOptionsStatus.textContent = '正在读取 Sub2 分组…';
     deliveryOptionsStatus.classList.remove('error');
     deliveryOptionsApply.textContent = importBatch ? '按此配置导入' : '用于接下来的批次';
     deliveryOptionsApply.disabled = true;
-    deliveryNamePrefix.disabled = true;
+    deliveryMerchant.disabled = true;
+    deliveryDeadline.disabled = true;
     deliverySaveDefault.checked = false;
     deliveryGroups.innerHTML = '';
     const promise = new Promise(resolve => { pendingDeliveryOptions = { resolve, trigger: document.activeElement }; });
@@ -970,11 +960,13 @@ function chooseDeliveryOptions(message = '为接下来的登录批次设置交�
         document.getElementById('deliveryGroupsHint').textContent = deliverySettings.groups_available === false ? '暂时无法读取 Sub2 分组；已有选择仅供查看，分组恢复后才能提交带分组的任务。' : groups.length ? '可选多个分组；不选时进入未分组。' : 'Sub2 暂无可用分组，本批进入未分组。';
         deliveryPriority.value = String(options.priority);
         deliveryConcurrency.value = String(options.concurrency);
-        deliveryNamePrefix.value = batchNamePrefix ?? options.name_prefix ?? '';
-        deliveryNamePrefix.disabled = false;
+        deliveryMerchant.value = options.merchant || '';
+        deliveryDeadline.value = options.deadline || '';
+        deliveryMerchant.disabled = false;
+        deliveryDeadline.disabled = false;
         deliveryOptionsStatus.textContent = '';
         deliveryOptionsApply.disabled = deliverySettings.groups_available === false && options.group_ids.length > 0;
-        deliveryPriority.focus({ preventScroll: true });
+        deliveryMerchant.focus({ preventScroll: true });
     });
     return promise;
 }
@@ -989,13 +981,14 @@ deliveryOptionsForm.addEventListener('submit', async event => {
     const options = {
         group_ids: deliverySettings.groups_available === false ? [...deliveryBatchOptions.group_ids] : [...deliveryGroups.querySelectorAll('input:checked')].map(input => Number(input.dataset.deliveryGroup)),
         priority: Number(deliveryPriority.value), concurrency: Number(deliveryConcurrency.value),
-        ...(normalizeNamePrefix(deliveryNamePrefix.value) ? { name_prefix: normalizeNamePrefix(deliveryNamePrefix.value) } : {})
+        merchant: normalizeDeliveryValue(deliveryMerchant.value),
+        deadline: normalizeDeliveryValue(deliveryDeadline.value)
     };
-    const prefixError = namePrefixError(deliveryNamePrefix.value);
-    if (prefixError) {
-        deliveryOptionsStatus.textContent = prefixError;
+    const deliveryIdentityError = deliveryValueError(options.merchant, '号商', 32) || deliveryValueError(options.deadline, '截止时间', 64);
+    if (deliveryIdentityError) {
+        deliveryOptionsStatus.textContent = deliveryIdentityError;
         deliveryOptionsStatus.classList.add('error');
-        deliveryNamePrefix.focus();
+        (options.merchant ? deliveryDeadline : deliveryMerchant).focus();
         return;
     }
     if (!deliveryPriority.value || !Number.isSafeInteger(options.priority) || options.priority < 0 || options.priority > 2147483647 ||
@@ -1019,9 +1012,6 @@ deliveryOptionsForm.addEventListener('submit', async event => {
             deliverySettings.defaults = copyDeliveryOptions(options);
         }
         deliveryBatchOptions = copyDeliveryOptions(options);
-        accountNamePrefix.value = options.name_prefix || '';
-        accountNamePrefixEdited = true;
-        validateAccountNamePrefix();
         renderDeliveryOptionsSummary();
         deliveryOptionsSaving = false;
         closeDeliveryOptions(copyDeliveryOptions(options));
@@ -2292,9 +2282,7 @@ async function importLoginResultsToSub2() {
         }
         const skipped = results.length - ids.length;
         const message = `将 ${ids.length} 个批量登录成功账号导入 Sub2。${skipped ? `另有 ${skipped} 个结果已导入、不可用或未找到对应历史记录，将跳过。` : ''}`;
-        const batchAccount = accounts.find(account => account.status === 'success' && typeof account.namePrefix === 'string' &&
-            ids.includes(accountsByEmail.get(account.email.toLowerCase())?.id));
-        const options = await chooseDeliveryOptions(message, true, batchAccount?.namePrefix);
+        const options = await chooseDeliveryOptions(message, true);
         if (!options) return;
         historyBatchRunning = false;
         renderHistory();
@@ -2335,11 +2323,9 @@ async function runAccounts(targetAccounts) {
     if (processing || historyBatchRunning || targetAccounts.length === 0) return;
     const autoDeliver = autoDeliveryConfigured === true && Boolean(autoDeliverToggle?.checked);
     if (targetAccounts.some(account => (account.autoDeliver ?? autoDeliver) && !account.deliveryOptions) && !await prepareDeliveryBatch()) return;
-    if (targetAccounts.some(account => typeof account.namePrefix !== 'string') && !validateAccountNamePrefix()) return;
     if (processing || historyBatchRunning) return;
     processing = true;
     const frozenOptions = deliveryBatchOptions ? copyDeliveryOptions(deliveryBatchOptions) : null;
-    const namePrefix = normalizeNamePrefix(accountNamePrefix.value);
     renderAutoDeliverySetting();
     startBtn.disabled = true;
     startBtn.innerHTML = '<span class="spinner"></span> 处理中';
@@ -2355,8 +2341,7 @@ async function runAccounts(targetAccounts) {
     for (const account of targetAccounts) {
         // Retrying a login preserves the delivery choice frozen for that account's batch.
         if (typeof account.autoDeliver !== 'boolean') account.autoDeliver = autoDeliver;
-        if (typeof account.namePrefix !== 'string') account.namePrefix = account.deliveryOptions?.name_prefix ?? namePrefix;
-        if (account.autoDeliver && !account.deliveryOptions) account.deliveryOptions = copyDeliveryOptions({ ...frozenOptions, name_prefix: account.namePrefix });
+        if (account.autoDeliver && !account.deliveryOptions) account.deliveryOptions = copyDeliveryOptions(frozenOptions);
         account.status = 'pending';
         account.message = '等待处理';
         account.duration = '';
@@ -2858,7 +2843,7 @@ exportBtn.addEventListener('click', () => {
         exported_at: new Date().toISOString(),
         proxies: [],
         accounts: results.map(r => ({
-            name: `${Date.now()}----${r.Email}`,
+            name: r.Email,
             platform: 'openai',
             type: 'oauth',
             credentials: {

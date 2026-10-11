@@ -225,7 +225,7 @@ func (s *sub2ImportService) buildPayloadWithOperation(accountID int64, operation
 	if len(options) > 0 {
 		opt = options[0]
 	}
-	if err := opt.Validate(); err != nil {
+	if err := opt.ValidateForImport(); err != nil {
 		return nil, "", "", err
 	}
 	email, result, err := s.store.GetOAuthResultByID(context.Background(), accountID)
@@ -234,13 +234,7 @@ func (s *sub2ImportService) buildPayloadWithOperation(accountID int64, operation
 	}
 	// Keep the display name human-readable; the operation marker remains in
 	// `extra.kkai_auth_import` and is used for reconciliation/idempotency.
-	// The service runs in UTC on sys1, so format in the product's local zone.
-	localZone := time.FixedZone("Asia/Shanghai", 8*60*60)
-	prefix := opt.NamePrefix
-	if prefix == "" {
-		prefix = "AUTH"
-	}
-	name := prefix + "_" + time.Now().In(localZone).Format("01021504") + "_" + email
+	name := opt.Merchant + " | " + opt.Deadline + " | " + email
 	if len([]rune(name)) > 100 {
 		name = string([]rune(name)[:100])
 	}
@@ -1027,6 +1021,10 @@ func (s *sub2ImportService) handleImport(w http.ResponseWriter, r *http.Request)
 	options, err := s.loadOptions(r.Context(), request.DeliveryOptions)
 	if err != nil {
 		respondJSONStatus(w, 400, LoginResponse{Message: classifyRecoveryError(err).Error()})
+		return
+	}
+	if err := options.ValidateForImport(); err != nil {
+		respondJSONStatus(w, 400, LoginResponse{Message: err.Error(), Code: "invalid_import_options"})
 		return
 	}
 	if !s.workerMu.TryLock() {

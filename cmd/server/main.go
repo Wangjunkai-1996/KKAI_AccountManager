@@ -699,6 +699,11 @@ func validateLoginRequest(req *LoginRequest) error {
 	if strings.EqualFold(strings.TrimSpace(req.Proxy), "direct") && strings.TrimSpace(req.UpstreamProxy) != "" {
 		return fmt.Errorf("IPv4 直连不能同时填写前置代理")
 	}
+	if req.AutoDeliver && req.DeliveryOptions != nil {
+		if err := req.DeliveryOptions.ValidateForImport(); err != nil {
+			return fmt.Errorf("Sub2 交付参数无效: %w", err)
+		}
+	}
 
 	return nil
 }

@@ -53,12 +53,12 @@ func TestDeliveryOptionsDefaultsSnapshotAndGroups(t *testing.T) {
 	defer api.Close()
 	s := &sub2ImportService{store: history, baseURL: api.URL, adminAPIKey: "fixture", destinationKey: "fixture", client: api.Client()}
 	save := httptest.NewRecorder()
-	s.handleImportSettings(save, httptest.NewRequest(http.MethodPut, "/api/sub2/import-settings", strings.NewReader(`{"group_ids":[7,7],"priority":0,"concurrency":12,"name_prefix":"  测试池  "}`)))
+	s.handleImportSettings(save, httptest.NewRequest(http.MethodPut, "/api/sub2/import-settings", strings.NewReader(`{"group_ids":[7,7],"priority":0,"concurrency":12,"merchant":"  测试号商  ","deadline":"  2026-12-31 23:59  "}`)))
 	if save.Code != 200 {
 		t.Fatalf("save: %d %s", save.Code, save.Body.String())
 	}
 	options, err := s.resolveOptions(ctx, nil)
-	if err != nil || options.Priority != 0 || options.Concurrency != 12 || options.NamePrefix != "测试池" || !reflect.DeepEqual(options.GroupIDs, []int64{7}) {
+	if err != nil || options.Priority != 0 || options.Concurrency != 12 || options.Merchant != "测试号商" || options.Deadline != "2026-12-31 23:59" || !reflect.DeepEqual(options.GroupIDs, []int64{7}) {
 		t.Fatalf("defaults: %+v %v", options, err)
 	}
 	delivery, err := history.QueueAccountDelivery(ctx, id, "fixture", options)
@@ -81,8 +81,8 @@ func TestDeliveryOptionsDefaultsSnapshotAndGroups(t *testing.T) {
 	if !body.SkipDefaultGroupBind || body.Data.Accounts[0].Concurrency != 12 || body.Data.Accounts[0].Priority != 0 {
 		t.Fatal("new account parameters lost")
 	}
-	if !strings.HasPrefix(body.Data.Accounts[0].Name, "测试池_") || !strings.HasSuffix(body.Data.Accounts[0].Name, "_sub2@example.com") {
-		t.Fatalf("new account prefix lost: %q", body.Data.Accounts[0].Name)
+	if body.Data.Accounts[0].Name != "测试号商 | 2026-12-31 23:59 | sub2@example.com" {
+		t.Fatalf("new account name lost: %q", body.Data.Accounts[0].Name)
 	}
 	binding, _, err := history.CreateOrGetSub2Import(ctx, "fixture", id, operation, key, payload)
 	if err != nil {
@@ -125,7 +125,7 @@ func TestSub2ImportUnconfirmedDeadlineAndImmutableRetry(t *testing.T) {
 	}))
 	defer api.Close()
 	s := &sub2ImportService{store: history, baseURL: api.URL, adminAPIKey: "fixture", destinationKey: "fixture", client: api.Client()}
-	payload, op, key, err := s.buildPayload(id, store.DeliveryOptions{GroupIDs: []int64{7}, Priority: 4, Concurrency: 8, NamePrefix: "首批"})
+	payload, op, key, err := s.buildPayload(id, store.DeliveryOptions{GroupIDs: []int64{7}, Priority: 4, Concurrency: 8, Merchant: "首批号商", Deadline: "2026-12-31"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestSub2ImportUnconfirmedDeadlineAndImmutableRetry(t *testing.T) {
 func TestDeliveryOptionsPreserveGroupsAfterEarlierCompletedDelivery(t *testing.T) {
 	history, accountID := testOAuthStore(t)
 	ctx := context.Background()
-	options := store.DeliveryOptions{GroupIDs: []int64{7}, Priority: 2, Concurrency: 4}
+	options := store.DeliveryOptions{GroupIDs: []int64{7}, Priority: 2, Concurrency: 4, Merchant: "历史号商", Deadline: "2026-12-31"}
 	previous, err := history.QueueAccountDelivery(ctx, accountID, "fixture", options)
 	if err != nil {
 		t.Fatal(err)
@@ -226,8 +226,8 @@ func TestSub2ManualImportQueuesWithoutRemoteCallsAndFreezesOptions(t *testing.T)
 	}))
 	defer api.Close()
 	s := &sub2ImportService{store: history, baseURL: api.URL, destinationKey: "fixture", adminAPIKey: "fixture", client: api.Client()}
-	firstOptions := store.DeliveryOptions{GroupIDs: []int64{7}, Priority: 0, Concurrency: 12}
-	for _, options := range []store.DeliveryOptions{firstOptions, {GroupIDs: []int64{8}, Priority: 99, Concurrency: 42}} {
+	firstOptions := store.DeliveryOptions{GroupIDs: []int64{7}, Priority: 0, Concurrency: 12, Merchant: "首批号商", Deadline: "2026-12-31"}
+	for _, options := range []store.DeliveryOptions{firstOptions, {GroupIDs: []int64{8}, Priority: 99, Concurrency: 42, Merchant: "下一批号商", Deadline: "2027-01-31"}} {
 		raw, err := json.Marshal(options)
 		if err != nil {
 			t.Fatal(err)
@@ -263,7 +263,7 @@ func TestDeliveryRecoveryBindsGroupsOnlyAfterSuccessfulProbe(t *testing.T) {
 			if _, err := f.store.UpdateAccountRecoveryTask(ctx, f.task.ID, store.RecoveryCanceled, "fixture setup"); err != nil {
 				t.Fatal(err)
 			}
-			options := store.DeliveryOptions{GroupIDs: []int64{7}, Priority: 2, Concurrency: 8}
+			options := store.DeliveryOptions{GroupIDs: []int64{7}, Priority: 2, Concurrency: 8, Merchant: "分组号商", Deadline: "2026-12-31"}
 			attempt, err := f.store.StartAttempt(ctx, f.account.Email)
 			if err != nil {
 				t.Fatal(err)

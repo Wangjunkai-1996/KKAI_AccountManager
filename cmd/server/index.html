@@ -1157,10 +1157,7 @@
         .login-format { color: var(--text-dim); font-size: .75rem; }
         #accountsInput { display: block; min-height: 112px; height: clamp(112px, 22dvh, 208px); padding: .75rem; font-size: .8125rem; border-radius: 8px; }
         .login-workspace .preflight-panel { margin-top: .5rem; padding: .5rem .65rem; }
-        .login-quick-options { display: grid; grid-template-columns: minmax(0, 1fr) minmax(100px, .48fr); gap: .75rem; }
-        .login-prefix-help { margin-bottom: .85rem; }
-        #accountNamePrefix[aria-invalid="true"] { border-color: var(--error); }
-        #accountNamePrefix[aria-invalid="true"] + .hint { color: var(--error); }
+        .login-quick-options { display: block; }
         .login-delivery { border: 1px solid var(--border); border-radius: 10px; padding: .75rem; margin-bottom: .85rem; }
         .login-delivery-heading { display: flex; align-items: center; justify-content: space-between; gap: .5rem; flex-wrap: wrap; }
         .login-delivery-heading .history-setting-toggle { margin: 0; color: var(--text-primary); }
@@ -1198,7 +1195,6 @@
             .login-workspace .card-header { margin-bottom: .5rem; padding-bottom: .5rem; }
             #accountsInput { min-height: 96px; height: 96px; }
             .login-workspace .input-group, .login-delivery { margin-bottom: .6rem; }
-            .login-prefix-help { margin-bottom: .6rem; }
             .login-submit { margin-top: .6rem; padding-top: .6rem; }
         }
         @media (max-width: 1024px) {
@@ -1266,11 +1262,6 @@
                 </div>
 
                 <div class="login-quick-options">
-                    <div>
-                        <label for="accountNamePrefix">账号前缀（可选）</label>
-                        <input type="text" id="accountNamePrefix" placeholder="AUTH" autocomplete="off" spellcheck="false" aria-describedby="accountNamePrefixHint" title="新建 Sub2 名称：前缀_月日时分_邮箱；已有账号名称不变">
-                        <p class="hint login-prefix-help" id="accountNamePrefixHint" role="status">留空使用 AUTH，最多 32 个字符。</p>
-                    </div>
                     <div>
                         <label for="concurrency">登录并发</label>
                         <input type="number" id="concurrency" value="1" min="1" max="10" aria-describedby="concurrencyHint">
@@ -1554,7 +1545,8 @@
         <h3 id="deliveryOptionsTitle">Sub2 交付参数</h3>
         <p class="hint" id="deliveryOptionsMessage"></p>
         <form id="deliveryOptionsForm">
-            <div class="input-group"><label for="deliveryNamePrefix">账号前缀（可选）</label><input type="text" id="deliveryNamePrefix" placeholder="AUTH" autocomplete="off" spellcheck="false" aria-describedby="deliveryNamePrefixHint"><p class="hint" id="deliveryNamePrefixHint">仅用于新建 Sub2 账号，留空使用 AUTH；最多 32 个字符。</p></div>
+            <div class="input-group"><label for="deliveryMerchant">号商</label><input type="text" id="deliveryMerchant" placeholder="请输入号商" autocomplete="off" spellcheck="false" required></div>
+            <div class="input-group"><label for="deliveryDeadline">截止时间</label><input type="text" id="deliveryDeadline" placeholder="例如 2026-12-31" autocomplete="off" spellcheck="false" required></div>
             <fieldset class="input-group" style="border:0;padding:0">
                 <legend>目标分组（可多选）</legend>
                 <div class="delivery-group-list" id="deliveryGroups"></div>

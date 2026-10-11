@@ -985,7 +985,7 @@ user2@example.com----AnotherPass----WXYZ9876STUV5432"></textarea>
                 exported_at: new Date().toISOString(),
                 proxies: [],
                 accounts: results.map(r => ({
-                    name: ` + "`${Date.now()}----${r.Email}`" + `,
+                    name: ` + "`${r.Email}`" + `,
                     platform: 'openai',
                     type: 'oauth',
                     credentials: {

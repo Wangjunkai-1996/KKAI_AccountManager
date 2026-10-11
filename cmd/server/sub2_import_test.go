@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -101,7 +100,7 @@ func TestSub2ImportPostsAndReconcilesUnGroupedAccount(t *testing.T) {
 	service := &sub2ImportService{
 		store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client(),
 	}
-	task, err := service.ensureTask(context.Background(), accountID)
+	task, err := service.ensureTask(context.Background(), accountID, store.DeliveryOptions{Priority: 1, Concurrency: 3, Merchant: "测试号商", Deadline: "2026-12-31"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +111,7 @@ func TestSub2ImportPostsAndReconcilesUnGroupedAccount(t *testing.T) {
 	if err != nil || got.State != "imported" || got.Sub2AccountID != 42 || importedName == "" {
 		t.Fatalf("import task = %+v err=%v", got, err)
 	}
-	if !regexp.MustCompile(`^AUTH_[0-9]{8}_sub2@example\.com$`).MatchString(importedName) {
+	if importedName != "测试号商 | 2026-12-31 | sub2@example.com" {
 		t.Fatalf("unexpected display name %q", importedName)
 	}
 }

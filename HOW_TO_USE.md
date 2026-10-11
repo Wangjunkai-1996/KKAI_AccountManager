@@ -102,7 +102,7 @@ go build -o bin/openai-login ./cmd/main.go
   "proxies": [],
   "accounts": [
     {
-      "name": "时间戳----email",
+      "name": "号商 | 截止时间 | email",
       "platform": "openai",
       "type": "oauth",
       "credentials": {
