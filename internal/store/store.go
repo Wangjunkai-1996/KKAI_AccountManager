@@ -117,6 +117,7 @@ type Sub2Import struct {
 	DestinationKey     string    `json:"-"`
 	AccountID          int64     `json:"account_id"`
 	AccountEmail       string    `json:"email,omitempty"`
+	CredentialVersion  int64     `json:"-"`
 	OperationID        string    `json:"operation_id"`
 	IdempotencyKey     string    `json:"-"`
 	State              string    `json:"state"`
@@ -316,6 +317,7 @@ CREATE TABLE IF NOT EXISTS sub2_imports (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   destination_key TEXT NOT NULL,
   account_id INTEGER NOT NULL,
+  credential_version INTEGER NOT NULL DEFAULT 0,
   operation_id TEXT NOT NULL UNIQUE,
   idempotency_key TEXT NOT NULL UNIQUE,
   payload_cipher BLOB NOT NULL,
@@ -331,6 +333,35 @@ CREATE INDEX IF NOT EXISTS sub2_imports_state_updated ON sub2_imports(state, upd
 `)
 	if err != nil {
 		return fmt.Errorf("migrate sqlite: %w", err)
+	}
+	// Older databases predate the credential version guard. Keep their
+	// existing tasks usable while binding them to the latest known successful
+	// login before the worker is allowed to send them.
+	rows, err := s.db.Query(`PRAGMA table_info(sub2_imports)`)
+	if err != nil {
+		return fmt.Errorf("inspect sub2 imports migration: %w", err)
+	}
+	hasCredentialVersion := false
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return fmt.Errorf("read sub2 imports migration: %w", err)
+		}
+		if name == "credential_version" {
+			hasCredentialVersion = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close sub2 imports migration: %w", err)
+	}
+	if !hasCredentialVersion {
+		if _, err := s.db.Exec(`ALTER TABLE sub2_imports ADD COLUMN credential_version INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add sub2 import credential version: %w", err)
+		}
 	}
 	return nil
 }
@@ -593,7 +624,7 @@ func scanSub2Import(row scanner) (Sub2Import, error) {
 	var item Sub2Import
 	var created, updated int64
 	var acknowledged, sub2ID sql.NullInt64
-	if err := row.Scan(&item.ID, &item.DestinationKey, &item.AccountID, &item.AccountEmail, &item.OperationID, &item.IdempotencyKey, &item.State, &acknowledged, &sub2ID, &item.LastError, &created, &updated); err != nil {
+	if err := row.Scan(&item.ID, &item.DestinationKey, &item.AccountID, &item.AccountEmail, &item.CredentialVersion, &item.OperationID, &item.IdempotencyKey, &item.State, &acknowledged, &sub2ID, &item.LastError, &created, &updated); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Sub2Import{}, ErrSub2ImportNotFound
 		}
@@ -607,7 +638,7 @@ func scanSub2Import(row scanner) (Sub2Import, error) {
 	return item, nil
 }
 
-const sub2ImportSelect = `SELECT i.id,i.destination_key,i.account_id,COALESCE(a.email,''),i.operation_id,i.idempotency_key,i.state,i.create_acknowledged,i.sub2_account_id,COALESCE(i.last_error,''),i.created_at,i.updated_at FROM sub2_imports i LEFT JOIN accounts a ON a.id=i.account_id`
+const sub2ImportSelect = `SELECT i.id,i.destination_key,i.account_id,COALESCE(a.email,''),i.credential_version,i.operation_id,i.idempotency_key,i.state,i.create_acknowledged,i.sub2_account_id,COALESCE(i.last_error,''),i.created_at,i.updated_at FROM sub2_imports i LEFT JOIN accounts a ON a.id=i.account_id`
 
 // CreateOrGetSub2Import creates one durable task per destination/account.
 // The bool reports whether a new row was inserted.
@@ -622,7 +653,7 @@ func (s *Store) CreateOrGetSub2Import(ctx context.Context, destinationKey string
 	now := time.Now().Unix()
 	// The account can be deleted after the caller builds its OAuth snapshot.
 	// Check existence in the insert itself so a stale request cannot orphan a task.
-	result, err := s.db.ExecContext(ctx, `INSERT INTO sub2_imports(destination_key,account_id,operation_id,idempotency_key,payload_cipher,state,created_at,updated_at) SELECT ?,id,?,?,?,'queued',?,? FROM accounts WHERE id=? ON CONFLICT(destination_key,account_id) DO NOTHING`, destinationKey, operationID, idempotencyKey, ciphertext, now, now, accountID)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO sub2_imports(destination_key,account_id,credential_version,operation_id,idempotency_key,payload_cipher,state,created_at,updated_at) SELECT ?,id,COALESCE((SELECT MAX(la.id) FROM login_attempts la WHERE la.account_id=accounts.id AND la.status='success'),0),?,?,?,'queued',?,? FROM accounts WHERE id=? ON CONFLICT(destination_key,account_id) DO NOTHING`, destinationKey, operationID, idempotencyKey, ciphertext, now, now, accountID)
 	if err != nil {
 		return Sub2Import{}, false, fmt.Errorf("create sub2 import: %w", err)
 	}
@@ -660,10 +691,39 @@ func (s *Store) ListSub2ImportStatuses(ctx context.Context) ([]Sub2Import, error
 }
 
 func (s *Store) ListQueuedSub2Imports(ctx context.Context, limit int) ([]Sub2Import, error) {
+	return s.ListQueuedSub2ImportsForDestination(ctx, "", limit)
+}
+
+func (s *Store) ListQueuedSub2ImportsForDestination(ctx context.Context, destination string, limit int) ([]Sub2Import, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, sub2ImportSelect+` WHERE i.state='queued' ORDER BY i.created_at ASC,i.id ASC LIMIT ?`, limit)
+	destination = strings.TrimSpace(destination)
+	rows, err := s.db.QueryContext(ctx, sub2ImportSelect+` WHERE i.state='queued' AND (?='' OR i.destination_key=?) ORDER BY i.created_at ASC,i.id ASC LIMIT ?`, destination, destination, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]Sub2Import, 0)
+	for rows.Next() {
+		item, err := scanSub2Import(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) ListPendingSub2Cleanup(ctx context.Context, destination string, limit int) ([]Sub2Import, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	destination = strings.TrimSpace(destination)
+	// Keep a transient cleanup failure from monopolizing the importer. Manual
+	// conflicts use a separate state and are intentionally excluded.
+	due := time.Now().Add(-30 * time.Second).Unix()
+	rows, err := s.db.QueryContext(ctx, sub2ImportSelect+` WHERE i.state='cleanup_pending' AND i.updated_at<=? AND (?='' OR i.destination_key=?) ORDER BY i.updated_at ASC,i.id ASC LIMIT ?`, due, destination, destination, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -705,12 +765,35 @@ func (s *Store) MarkSub2ImportSending(ctx context.Context, id int64) error {
 	return nil
 }
 
+func (s *Store) MarkSub2ImportSendingForVersion(ctx context.Context, id, credentialVersion int64) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state='sending',updated_at=? WHERE id=? AND state='queued' AND credential_version=?`, time.Now().Unix(), id, credentialVersion)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return errors.New("sub2 import is not queued for the current credentials")
+	}
+	return nil
+}
+
 func (s *Store) UpdateSub2Import(ctx context.Context, id int64, state string, acknowledged bool, sub2AccountID int64, lastError string) error {
 	state = strings.TrimSpace(state)
 	if state == "" {
 		return errors.New("sub2 import state is required")
 	}
 	_, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state=?,create_acknowledged=?,sub2_account_id=CASE WHEN ? > 0 THEN ? ELSE sub2_account_id END,last_error=?,updated_at=? WHERE id=?`, state, boolInt(acknowledged), sub2AccountID, sub2AccountID, strings.TrimSpace(lastError), time.Now().Unix(), id)
+	return err
+}
+
+// MarkSub2ImportCleanupPending records the credential version that produced
+// the deletion observation. A later successful login can then supersede the
+// retry without allowing an obsolete cleanup to delete the new account.
+func (s *Store) MarkSub2ImportCleanupPending(ctx context.Context, id, credentialVersion, sub2AccountID int64, lastError string) error {
+	if id <= 0 || credentialVersion < 0 || sub2AccountID <= 0 {
+		return errors.New("invalid Sub2 cleanup task")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state='cleanup_pending',credential_version=?,create_acknowledged=1,sub2_account_id=?,last_error=?,updated_at=? WHERE id=? AND state IN ('imported','cleanup_pending')`, credentialVersion, sub2AccountID, strings.TrimSpace(lastError), time.Now().Unix(), id)
 	return err
 }
 
@@ -731,6 +814,31 @@ func (s *Store) RefreshSub2ImportPayload(ctx context.Context, id int64, payload 
 		return err
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET payload_cipher=?,state='queued',last_error='',updated_at=? WHERE id=? AND state='failed'`, ciphertext, time.Now().Unix(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return errors.New("sub2 import is not failed")
+	}
+	return nil
+}
+
+func (s *Store) RefreshSub2ImportPayloadForVersion(ctx context.Context, id, credentialVersion int64, requireVersion bool, payload []byte) error {
+	if len(payload) == 0 {
+		return errors.New("sub2 import payload is required")
+	}
+	ciphertext, err := s.seal(string(payload))
+	if err != nil {
+		return err
+	}
+	query := `UPDATE sub2_imports SET payload_cipher=?,credential_version=?,state='queued',last_error='',updated_at=? WHERE id=? AND state IN ('failed','queued')`
+	args := []any{ciphertext, credentialVersion, time.Now().Unix(), id}
+	if requireVersion {
+		query += ` AND credential_version<>?`
+		args = append(args, credentialVersion)
+	}
+	result, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -891,8 +999,9 @@ func (s *Store) StartAttempt(ctx context.Context, email string) (Attempt, error)
 }
 
 // FinishAttempt records the result and updates account metadata atomically.
-// A deleted account is hard-deleted only when Failure.AccountStatus is exactly
-// "deleted"; deactivated/403 accounts remain available for later retry.
+// Officially deleted accounts remain as a local tombstone until the verified
+// Sub2 binding is removed. This prevents the remote cleanup from losing the
+// account identity immediately after the failed login is recorded.
 func (s *Store) FinishAttempt(ctx context.Context, id int64, success bool, result *Result, failure *Failure) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -945,21 +1054,14 @@ func (s *Store) finishAttemptTx(ctx context.Context, tx *sql.Tx, id int64, succe
 			failure = &Failure{Code: "login_failed", Message: "login failed"}
 		}
 		status := strings.ToLower(strings.TrimSpace(failure.AccountStatus))
-		if status == "deleted" {
-			if _, err = tx.ExecContext(ctx, `DELETE FROM accounts WHERE id=?`, accountID); err != nil {
-				return err
-			}
-			// ON DELETE CASCADE removes this attempt as well; this is deliberate.
-		} else {
-			if status == "" {
-				status = "failed"
-			}
-			if _, err = tx.ExecContext(ctx, `UPDATE accounts SET status=?,last_error_code=?,last_error=?,last_http_status=?,updated_at=? WHERE id=?`, status, failure.Code, failure.Message, failure.HTTPStatus, now, accountID); err != nil {
-				return err
-			}
-			if _, err = tx.ExecContext(ctx, `UPDATE login_attempts SET status='failed',stage=?,error_code=?,error_message=?,http_status=?,retryable=?,finished_at=?,duration_ms=? WHERE id=?`, failure.Stage, failure.Code, failure.Message, failure.HTTPStatus, boolInt(failure.Retryable), now, duration, id); err != nil {
-				return err
-			}
+		if status == "" {
+			status = "failed"
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE accounts SET status=?,last_error_code=?,last_error=?,last_http_status=?,updated_at=? WHERE id=?`, status, failure.Code, failure.Message, failure.HTTPStatus, now, accountID); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE login_attempts SET status='failed',stage=?,error_code=?,error_message=?,http_status=?,retryable=?,finished_at=?,duration_ms=? WHERE id=?`, failure.Stage, failure.Code, failure.Message, failure.HTTPStatus, boolInt(failure.Retryable), now, duration, id); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1037,6 +1139,46 @@ func (s *Store) DeleteAccountByID(ctx context.Context, id int64) error {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM accounts WHERE id=?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// FinalizeDeletedAccount removes a deleted local tombstone after its verified
+// remote binding has already been removed. Callers must hold the account
+// recovery lease so a new login cannot race the final local deletion.
+func (s *Store) FinalizeDeletedAccount(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return ErrAccountNotFound
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var email, status string
+	if err := tx.QueryRowContext(ctx, `SELECT email,status FROM accounts WHERE id=?`, id).Scan(&email, &status); errors.Is(err, sql.ErrNoRows) {
+		return ErrAccountNotFound
+	} else if err != nil {
+		return err
+	}
+	if status != "deleted" {
+		return nil
+	}
+	s.activeMu.Lock()
+	_, active := s.active[email]
+	s.activeMu.Unlock()
+	if !active {
+		return ErrAccountBusy
+	}
+	var bindingExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sub2_imports WHERE account_id=?)`, id).Scan(&bindingExists); err != nil {
+		return err
+	}
+	if bindingExists {
+		return ErrAccountBusy
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM accounts WHERE id=? AND status='deleted'`, id); err != nil {
 		return err
 	}
 	return tx.Commit()

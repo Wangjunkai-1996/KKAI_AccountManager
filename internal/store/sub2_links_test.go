@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 )
 
@@ -60,5 +61,67 @@ func TestDeleteSub2ImportBindingRequiresOperationIdentity(t *testing.T) {
 	}
 	if _, err := s.GetSub2Import(ctx, "current", a.ID); !errors.Is(err, ErrSub2ImportNotFound) {
 		t.Fatalf("binding remains after matching delete: %v", err)
+	}
+}
+
+func TestListQueuedSub2ImportsForDestinationIsolatesPools(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		email, destination string
+	}{
+		{"pool-a@example.test", "pool-a"},
+		{"pool-b@example.test", "pool-b"},
+	} {
+		account, err := s.UpsertCredentials(ctx, Credentials{Email: tc.email, Password: "pw"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.CreateOrGetSub2Import(ctx, tc.destination, account.ID, "op-"+tc.destination, "key-"+tc.destination, []byte(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := s.ListQueuedSub2ImportsForDestination(ctx, "pool-a", 10)
+	if err != nil || len(items) != 1 || items[0].DestinationKey != "pool-a" {
+		t.Fatalf("pool-a queued imports = %+v, err=%v", items, err)
+	}
+}
+
+func TestSub2ImportCredentialVersionMigration(t *testing.T) {
+	s, dir := testStore(t)
+	ctx := context.Background()
+	account, err := s.UpsertCredentials(ctx, Credentials{Email: "version-migration@example.test", Password: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := s.StartAttempt(ctx, account.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishAttempt(ctx, attempt.ID, true, &Result{AccessToken: "at", RefreshToken: "rt"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	attempt.Release()
+	task, _, err := s.CreateOrGetSub2Import(ctx, "migration", account.ID, "migration-op", "migration-key", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.CredentialVersion != attempt.ID {
+		t.Fatalf("new task version=%d want=%d", task.CredentialVersion, attempt.ID)
+	}
+	if _, err := s.db.Exec(`ALTER TABLE sub2_imports DROP COLUMN credential_version`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(filepath.Join(dir, "accounts.db"), filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	migrated, err := reopened.GetSub2Import(ctx, "migration", account.ID)
+	if err != nil || migrated.CredentialVersion != 0 {
+		t.Fatalf("migrated task=%+v err=%v", migrated, err)
 	}
 }

@@ -336,10 +336,13 @@ func TestSub2DeletionConfirmed(t *testing.T) {
 		want                           bool
 	}{
 		{"deleted", "account_deleted", "", "", true},
+		{"user deleted", "user_deleted", "", "", true},
 		{"deactivated", "account_disabled", "account_deactivated", "", true},
+		{"user deactivated", "user_deactivated", "", "", true},
+		{"user disabled", "user_disabled", "", "", true},
 		{"deactivated stream", "account_disabled", "", "account_deactivated", true},
 		{"mixed", "account_unavailable", "deleted_or_deactivated", "", false},
-		{"other disabled", "account_disabled", "account_disabled", "", false},
+		{"other disabled", "account_disabled", "account_disabled", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := sub2DeletionConfirmed(tc.outcome, tc.errorCode, tc.streamCode); got != tc.want {

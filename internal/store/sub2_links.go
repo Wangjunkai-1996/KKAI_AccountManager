@@ -19,8 +19,8 @@ func (s *Store) LinkSub2Account(ctx context.Context, destinationKey string, acco
 		return Sub2Import{}, err
 	}
 	now := time.Now().Unix()
-	_, err = s.db.ExecContext(ctx, `INSERT INTO sub2_imports(destination_key,account_id,operation_id,idempotency_key,payload_cipher,state,create_acknowledged,sub2_account_id,created_at,updated_at)
-		SELECT ?,id,?,?,?,'imported',1,?,?,? FROM accounts WHERE id=?
+	_, err = s.db.ExecContext(ctx, `INSERT INTO sub2_imports(destination_key,account_id,credential_version,operation_id,idempotency_key,payload_cipher,state,create_acknowledged,sub2_account_id,created_at,updated_at)
+		SELECT ?,id,COALESCE((SELECT MAX(la.id) FROM login_attempts la WHERE la.account_id=accounts.id AND la.status='success'),0),?,?,?,'imported',1,?,?,? FROM accounts WHERE id=?
 		ON CONFLICT(destination_key,account_id) DO NOTHING`, destinationKey, operationID, operationID, payload, sub2AccountID, now, now, accountID)
 	if err != nil {
 		return Sub2Import{}, fmt.Errorf("link sub2 account: %w", err)
@@ -39,6 +39,6 @@ func (s *Store) DeleteSub2ImportBinding(ctx context.Context, destinationKey stri
 	if strings.TrimSpace(destinationKey) == "" || accountID <= 0 || sub2AccountID <= 0 {
 		return errors.New("invalid sub2 account binding")
 	}
-	_, err := s.db.ExecContext(ctx, "DELETE FROM sub2_imports WHERE destination_key=? AND account_id=? AND sub2_account_id=? AND operation_id=? AND state='imported'", destinationKey, accountID, sub2AccountID, operationID)
+	_, err := s.db.ExecContext(ctx, "DELETE FROM sub2_imports WHERE destination_key=? AND account_id=? AND sub2_account_id=? AND operation_id=? AND state IN ('imported','cleanup_pending')", destinationKey, accountID, sub2AccountID, operationID)
 	return err
 }

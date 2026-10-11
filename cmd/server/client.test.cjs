@@ -3,6 +3,10 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
+const completionWatchdog = setTimeout(() => {
+    console.error('client interaction checks did not complete within 10 seconds');
+    process.exitCode = 1;
+}, 10000);
 class Element {
     constructor() {
         this.events = {}; this.value = ''; this.textContent = ''; this.innerHTML = '';
@@ -567,6 +571,8 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     confirmResult = null;
     const lockedImport = run('batchImportHistory()'); await flush();
     run('historyLoading = true');
+    el('deliveryMerchant').value = '测试号商';
+    el('deliveryDeadline').value = '2026-12-31';
     await el('deliveryOptionsForm').emit('submit'); await lockedImport;
     assert.equal(requests.filter(item => item.url === '/api/sub2/import').length, importsBeforeCancel, 'a refresh that starts during confirmation blocks stale submission');
     run('historyLoading = false');
@@ -928,7 +934,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     el('deliveryDeadline').value = '2026-12-31';
     await el('deliveryOptionsForm').emit('submit'); await offlineImport;
     assert.deepEqual(JSON.parse(requests.filter(item => item.url === '/api/sub2/import').at(-1).options.body).delivery_options, {
-        group_ids: [], priority: 4, concurrency: 12, merchant: '手动号商', deadline: '2026-12-31'
+        group_ids: [7], priority: 4, concurrency: 12, merchant: '手动号商', deadline: '2026-12-31'
     }, 'manual confirmation submits merchant and deadline');
     // The Start handler owns the batch before its asynchronous settings read.
     await change('autoDeliverToggle', true);
@@ -1028,4 +1034,8 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     console.log('Delivery identity checks passed: Unicode/control validation, late defaults, safe summary, default save, automatic batch/retry freezing, login-only independence and manual-import fields.');
     console.log('Regression checks passed: double Start during settings load, preparation failure/cancel release, and active/waiting/completed credential repair polling.');
     console.log('Login connection checks passed: bounded setup, uncertain POST is not replayed, active SSE respects the server deadline, and timers are released.');
-})().catch(error => { console.error(error); process.exitCode = 1; });
+    globalThis.__clientTestComplete = true;
+})().then(() => {
+    assert.equal(globalThis.__clientTestComplete, true, 'client interaction checks did not reach completion');
+    clearTimeout(completionWatchdog);
+}).catch(error => { clearTimeout(completionWatchdog); console.error(error); process.exitCode = 1; });

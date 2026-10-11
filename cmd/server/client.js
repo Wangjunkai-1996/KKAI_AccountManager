@@ -1332,13 +1332,13 @@ function renderSub2Status(account) {
     if (!state.exists) return '<span class="history-status sub2-error">Sub2 已删除</span>';
     const status = state.status;
     const conflict = localAuthFailure(account) && ['active', 'available', 'enabled'].includes(status);
-    const runtimePause = sub2RuntimePause(state);
+    const runtimePause = ['active', 'available', 'enabled'].includes(status) ? sub2RuntimePause(state) : null;
     const effective = state.effectiveSchedulable ?? state.schedulable;
     const className = conflict || runtimePause || effective === false ? 'sub2-warning' : status === 'active' || status === 'available' || status === 'enabled' ? 'sub2-ok'
         : status === 'unknown' || status === 'stale' ? 'sub2-unknown' : 'sub2-error';
     const schedule = effective === true ? '可调度' : effective === false ? '暂不可调度' : '';
     const checked = state.checkedAt ? `同步 ${formatHistoryTime(state.checkedAt)}` : '';
-    const reason = [state.errorMessage || runtimePause?.reason || state.error, checked].filter(Boolean).join(' · ');
+    const reason = [state.errorMessage, runtimePause?.reason, state.error, checked].filter(Boolean).join(' · ');
     const title = reason ? ` title="${escapeHTML(reason)}"` : '';
     const label = runtimePause ? runtimePause.label : conflict ? '正常 · 本地凭据失效待处理' : escapeHTML(sub2StatusName(status));
     const suffix = conflict && runtimePause ? ' · 本地凭据失效待处理' : '';
@@ -1647,7 +1647,7 @@ function canImportToSub2(account) {
 }
 
 function historyImportStateName(state) {
-    return ({ queued: '排队中', sending: '导入中', confirming: '核对中', imported: '已关联 Sub2', failed: '导入失败', unknown: '待核对' }[state] || '未导入');
+    return ({ queued: '排队中', sending: '导入中', confirming: '核对中', imported: '已关联 Sub2', failed: '导入失败', unknown: '待核对', cleanup_pending: '正在清理' }[state] || '未导入');
 }
 
 function historyActionsLocked() {

@@ -254,7 +254,7 @@ func TestAttemptHistoryBusySuccessAndFailure(t *testing.T) {
 	}
 }
 
-func TestDeletedAccountIsRemovedAndDeactivatedIsRetained(t *testing.T) {
+func TestDeletedAccountIsRetainedUntilFinalizedAndDeactivatedIsRetained(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
 	if _, err := s.UpsertCredentials(ctx, Credentials{Email: "deleted@example.com", Password: "pw"}); err != nil {
@@ -279,8 +279,20 @@ func TestDeletedAccountIsRemovedAndDeactivatedIsRetained(t *testing.T) {
 		t.Fatal(err)
 	}
 	attempt.Release()
+	deleted, err := s.GetAccount(ctx, "deleted@example.com")
+	if err != nil || deleted.Status != "deleted" {
+		t.Fatalf("deleted account tombstone = %+v, err=%v", deleted, err)
+	}
+	lease, err := s.AcquireAccountRecovery(ctx, deleted.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if err := s.FinalizeDeletedAccount(ctx, deleted.ID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.GetAccount(ctx, "deleted@example.com"); !errors.Is(err, ErrAccountNotFound) {
-		t.Fatalf("deleted account lookup = %v", err)
+		t.Fatalf("finalized deleted account lookup = %v", err)
 	}
 }
 

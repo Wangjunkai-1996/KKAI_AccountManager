@@ -282,14 +282,11 @@ func (s *accountCheckService) finish(id, accountID int64, result store.AccountCh
 }
 
 func sub2DeletionConfirmed(outcome string, errorCodes ...string) bool {
-	if outcome == "account_deleted" {
+	if accountDeactivationConfirmed(outcome) {
 		return true
 	}
-	if outcome != "account_disabled" {
-		return false
-	}
 	for _, code := range errorCodes {
-		if code == "account_deactivated" {
+		if accountDeactivationConfirmed(code) {
 			return true
 		}
 	}
