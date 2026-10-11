@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
@@ -297,6 +298,7 @@ func runWithHistoryAccount(ctx context.Context, accountID int64, req LoginReques
 		return nil, err
 	}
 	defer attempt.Release()
+	expectedCredentialVersion, versionErr := loginHistory.GetAccountCredentialVersion(persistCtx, attempt.AccountID)
 	result, loginErr := run(ctx)
 	finishCtx, finishCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer finishCancel()
@@ -305,6 +307,17 @@ func runWithHistoryAccount(ctx context.Context, accountID int64, req LoginReques
 		failure := &store.Failure{Stage: info.Stage, Code: info.Code, HTTPStatus: info.HTTPStatus, Retryable: info.Retryable, Message: info.Message, AccountStatus: info.AccountStatus}
 		if err := loginHistory.FinishAttempt(finishCtx, attempt.ID, false, nil, failure); err != nil {
 			return nil, fmt.Errorf("save failed login history: %w", err)
+		}
+		if accountDeactivationConfirmed(info.Code) && versionErr == nil {
+			// FinishAttempt releases the database state, but the per-email attempt
+			// lock remains until attempt.Release below. Release it before the
+			// cleanup acquires the account recovery lease.
+			attempt.Release()
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := sub2Importer.deleteDeletedAccount(cleanupCtx, attempt.AccountID, expectedCredentialVersion); err != nil {
+				log.Printf("检测确认账号已停用，但清理 Sub2 账号失败: account_id=%d", attempt.AccountID)
+			}
+			cleanupCancel()
 		}
 		return result, loginErr
 	}

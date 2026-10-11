@@ -844,8 +844,8 @@ func (s *sub2ImportService) apiJSONStatus(ctx context.Context, method, path stri
 }
 
 // deleteDeletedAccount removes the verified Sub2 binding when AUTH has
-// explicitly confirmed that the upstream account was deleted. A missing
-// remote account is already in the desired state and is therefore successful.
+// explicitly confirmed that the upstream account was deleted or deactivated.
+// A missing remote account is already in the desired state and is therefore successful.
 func (s *sub2ImportService) deleteDeletedAccount(ctx context.Context, accountID, expectedCredentialAttemptID int64) error {
 	if s == nil || !s.configured() || accountID <= 0 {
 		return nil
@@ -855,6 +855,20 @@ func (s *sub2ImportService) deleteDeletedAccount(ctx context.Context, accountID,
 		return err
 	}
 	defer lease.Release()
+	return s.deleteDeletedAccountWithLease(ctx, lease, accountID, expectedCredentialAttemptID)
+}
+
+func accountDeactivationConfirmed(code string) bool {
+	return strings.EqualFold(strings.TrimSpace(code), "account_deactivated")
+}
+
+// deleteDeletedAccountWithLease is used by recovery flows that already hold
+// the account recovery lease. The caller must keep that lease until this
+// method returns.
+func (s *sub2ImportService) deleteDeletedAccountWithLease(ctx context.Context, lease *store.AccountRecoveryLease, accountID, expectedCredentialAttemptID int64) error {
+	if s == nil || !s.configured() || lease == nil || accountID <= 0 {
+		return nil
+	}
 	currentVersion, err := s.store.GetAccountCredentialVersion(ctx, accountID)
 	if err != nil {
 		return err

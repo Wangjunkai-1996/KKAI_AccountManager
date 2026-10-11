@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"strconv"
@@ -242,6 +243,11 @@ func (s *sub2RecoveryService) loginCredentialRepair(ctx context.Context, repair 
 		s.failCredentialRepair(repair, err)
 		return
 	}
+	expectedCredentialVersion, err := s.store.GetAccountCredentialVersion(ctx, account.ID)
+	if err != nil {
+		s.failCredentialRepair(repair, err)
+		return
+	}
 	var options store.DeliveryOptions
 	if s.configured() {
 		var requested *store.DeliveryOptions
@@ -291,6 +297,11 @@ func (s *sub2RecoveryService) loginCredentialRepair(ctx context.Context, repair 
 		if err := s.store.FinishAttempt(finishCtx, attempt.ID, false, nil, &store.Failure{Stage: info.Stage, Code: info.Code, HTTPStatus: info.HTTPStatus, Retryable: info.Retryable, Message: info.Message, AccountStatus: info.AccountStatus}); err != nil {
 			s.pauseRecovery(0)
 			return
+		}
+		if accountDeactivationConfirmed(info.Code) {
+			if err := s.sub2.deleteDeletedAccountWithLease(finishCtx, lease, account.ID, expectedCredentialVersion); err != nil {
+				log.Printf("检测确认账号已停用，但清理 Sub2 账号失败: account_id=%d", account.ID)
+			}
 		}
 		s.failCredentialRepair(repair, classifyRecoveryLoginError(loginErr))
 		return

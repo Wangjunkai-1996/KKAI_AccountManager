@@ -273,7 +273,8 @@ func TestAccountCheckWorkerFinalRequestEvidence(t *testing.T) {
 	}
 }
 
-func TestAccountCheckDeletedRemovesSub2Account(t *testing.T) {
+func runAccountCheckSub2CleanupTest(t *testing.T, outcome, errorCode, requestKey string) {
+	t.Helper()
 	history, ids := accountCheckFixture(t, 1)
 	var deleted atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -299,16 +300,16 @@ func TestAccountCheckDeletedRemovesSub2Account(t *testing.T) {
 
 	checker := newAccountCheckService(history, "", "")
 	checker.runProbe = func(context.Context, string, string, string) probe.Result {
-		return probe.Result{Outcome: "account_deleted", HTTPStatus: http.StatusForbidden, RequestAttempted: true}
+		return probe.Result{Outcome: outcome, ErrorCode: errorCode, HTTPStatus: http.StatusForbidden, RequestAttempted: true}
 	}
-	batch, _, err := history.CreateAccountCheckBatch(context.Background(), store.AccountCheckInput{RequestKey: "deleted-sub2", AccountIDs: ids, Concurrency: 1, ProxyMode: "direct"})
+	batch, _, err := history.CreateAccountCheckBatch(context.Background(), store.AccountCheckInput{RequestKey: requestKey, AccountIDs: ids, Concurrency: 1, ProxyMode: "direct"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	checker.Start()
 	defer checker.Stop()
 	_, items := waitCheckBatch(t, history, batch.ID)
-	if len(items) != 1 || items[0].Outcome != "account_deleted" {
+	if len(items) != 1 || items[0].Outcome != outcome {
 		t.Fatalf("check result = %+v", items)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -317,6 +318,34 @@ func TestAccountCheckDeletedRemovesSub2Account(t *testing.T) {
 	}
 	if deleted.Load() != 1 {
 		t.Fatalf("delete requests = %d, want 1", deleted.Load())
+	}
+}
+
+func TestAccountCheckDeletedRemovesSub2Account(t *testing.T) {
+	runAccountCheckSub2CleanupTest(t, "account_deleted", "", "deleted-sub2")
+}
+
+func TestAccountCheckDeactivatedRemovesSub2Account(t *testing.T) {
+	runAccountCheckSub2CleanupTest(t, "account_disabled", "account_deactivated", "deactivated-sub2")
+}
+
+func TestSub2DeletionConfirmed(t *testing.T) {
+	for _, tc := range []struct {
+		name                           string
+		outcome, errorCode, streamCode string
+		want                           bool
+	}{
+		{"deleted", "account_deleted", "", "", true},
+		{"deactivated", "account_disabled", "account_deactivated", "", true},
+		{"deactivated stream", "account_disabled", "", "account_deactivated", true},
+		{"mixed", "account_unavailable", "deleted_or_deactivated", "", false},
+		{"other disabled", "account_disabled", "account_disabled", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sub2DeletionConfirmed(tc.outcome, tc.errorCode, tc.streamCode); got != tc.want {
+				t.Fatalf("sub2DeletionConfirmed() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
