@@ -417,6 +417,32 @@ func TestAccountCheckPrecheckAndNoRefreshRead(t *testing.T) {
 	}
 }
 
+func TestAccountCheckOfficialLifecycleEvent(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	accountID := checkTestAccount(t, s, "lifecycle-check")
+	batch := checkTestBatch(t, s, "lifecycle-check", 1, accountID)
+	work := checkTestClaim(t, s)
+	httpStatus := 403
+	attempted := true
+	if _, err := s.FinishAccountCheck(ctx, work.Check.ID, AccountCheckResult{
+		Outcome: "account_disabled", ErrorCode: "account_deactivated", HTTPStatus: &httpStatus,
+		Message: "上游报告账号停用", RequestAttempted: &attempted,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if batch.State == "" {
+		t.Fatal("missing check batch")
+	}
+	events, err := s.ListLifecycleEventsForAccount(ctx, accountID, 10)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("events = %+v, err=%v", events, err)
+	}
+	if events[0].Source != "official" || events[0].Status != "deactivated" || events[0].Code != "account_deactivated" || events[0].HTTPStatus != httpStatus {
+		t.Fatalf("event = %+v", events[0])
+	}
+}
+
 func TestAccountCheckCancelConcurrent(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()

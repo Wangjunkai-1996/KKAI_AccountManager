@@ -53,29 +53,36 @@ type historyLoginRequest struct {
 }
 
 type historyListResponse struct {
-	Success          bool                                   `json:"success"`
-	Data             []store.Account                        `json:"data"`
-	Imports          []store.Sub2Import                     `json:"imports,omitempty"`
-	Sub2Statuses     map[int64]sub2AccountStatus            `json:"sub2_statuses,omitempty"`
-	Sub2Configured   bool                                   `json:"sub2_configured"`
-	ImportsAvailable bool                                   `json:"imports_available"`
-	ChecksAvailable  bool                                   `json:"checks_available"`
-	Checks           map[int64]store.AccountCheckSummary    `json:"checks"`
-	Recoveries       map[int64]store.AccountRecoveryTask    `json:"recoveries"`
-	Deliveries       map[int64]store.AccountDelivery        `json:"deliveries"`
-	Rechecks         map[int64]store.AccountRecoveryRecheck `json:"rechecks"`
-	Repairs          map[int64]store.CredentialRepair       `json:"repairs"`
+	Success            bool                                   `json:"success"`
+	Data               []store.Account                        `json:"data"`
+	LifecycleEvents    map[int64][]store.LifecycleEvent       `json:"lifecycle_events,omitempty"`
+	LifecycleAvailable bool                                   `json:"lifecycle_events_available"`
+	Imports            []store.Sub2Import                     `json:"imports,omitempty"`
+	Sub2Statuses       map[int64]sub2AccountStatus            `json:"sub2_statuses,omitempty"`
+	Sub2Configured     bool                                   `json:"sub2_configured"`
+	ImportsAvailable   bool                                   `json:"imports_available"`
+	ChecksAvailable    bool                                   `json:"checks_available"`
+	Checks             map[int64]store.AccountCheckSummary    `json:"checks"`
+	Recoveries         map[int64]store.AccountRecoveryTask    `json:"recoveries"`
+	Deliveries         map[int64]store.AccountDelivery        `json:"deliveries"`
+	Rechecks           map[int64]store.AccountRecoveryRecheck `json:"rechecks"`
+	Repairs            map[int64]store.CredentialRepair       `json:"repairs"`
 }
 
 type historyDetailResponse struct {
-	Success                  bool                        `json:"success"`
-	Account                  store.Account               `json:"account"`
-	Attempts                 []store.AttemptRecord       `json:"attempts"`
-	RecoveryHistory          []store.AccountRecoveryTask `json:"recovery_history"`
-	RecoveryHistoryAvailable bool                        `json:"recovery_history_available"`
-	RecoveryHistoryTruncated bool                        `json:"recovery_history_truncated"`
-	Checks                   []store.AccountCheck        `json:"checks"`
-	ChecksAvailable          bool                        `json:"checks_available"`
+	Success                   bool                                `json:"success"`
+	Account                   store.Account                       `json:"account"`
+	Attempts                  []store.AttemptRecord               `json:"attempts"`
+	RecoveryHistory           []store.AccountRecoveryTask         `json:"recovery_history"`
+	RecoveryHistoryAvailable  bool                                `json:"recovery_history_available"`
+	RecoveryHistoryTruncated  bool                                `json:"recovery_history_truncated"`
+	RecoveryFailures          []store.AccountRecoveryFailureEvent `json:"recovery_failures"`
+	RecoveryFailuresAvailable bool                                `json:"recovery_failures_available"`
+	RecoveryFailuresTruncated bool                                `json:"recovery_failures_truncated"`
+	Checks                    []store.AccountCheck                `json:"checks"`
+	ChecksAvailable           bool                                `json:"checks_available"`
+	LifecycleEvents           []store.LifecycleEvent              `json:"lifecycle_events"`
+	LifecycleEventsAvailable  bool                                `json:"lifecycle_events_available"`
 }
 
 func handleHistory() http.HandlerFunc {
@@ -129,7 +136,17 @@ func handleHistory() http.HandlerFunc {
 			respondJSONStatus(w, http.StatusServiceUnavailable, LoginResponse{Message: "读取后台处理状态失败，请稍后刷新"})
 			return
 		}
+		lifecycleEvents, lifecycleErr := loginHistory.ListLifecycleEvents(r.Context(), 1000)
+		lifecycleByAccount := make(map[int64][]store.LifecycleEvent)
+		if lifecycleErr == nil {
+			for _, event := range lifecycleEvents {
+				if event.AccountID > 0 {
+					lifecycleByAccount[event.AccountID] = append(lifecycleByAccount[event.AccountID], event)
+				}
+			}
+		}
 		respondJSON(w, historyListResponse{Success: true, Data: accounts, Imports: imports, Sub2Statuses: sub2Statuses, Sub2Configured: configured,
+			LifecycleEvents: lifecycleByAccount, LifecycleAvailable: lifecycleErr == nil,
 			ImportsAvailable: importsErr == nil, ChecksAvailable: checksErr == nil, Checks: checks, Recoveries: recoveries, Deliveries: deliveries, Rechecks: rechecks, Repairs: repairs})
 	}
 }
@@ -175,9 +192,13 @@ func handleHistoryDelete() http.HandlerFunc {
 			}
 			checks, checksErr := loginHistory.ListAccountChecks(r.Context(), account.ID, 20, destination)
 			recoveryHistory, recoveryHistoryTruncated, recoveryHistoryErr := loginHistory.ListAccountRecoveryHistory(r.Context(), account.ID, 100, destination)
+			recoveryFailures, recoveryFailuresTruncated, recoveryFailuresErr := loginHistory.ListAccountRecoveryFailureEvents(r.Context(), account.ID, 100, destination)
+			lifecycleEvents, lifecycleErr := loginHistory.ListLifecycleEventsForAccount(r.Context(), account.ID, 100)
 			respondJSON(w, historyDetailResponse{Success: true, Account: account, Attempts: attempts,
 				RecoveryHistory: recoveryHistory, RecoveryHistoryAvailable: recoveryHistoryErr == nil,
-				RecoveryHistoryTruncated: recoveryHistoryTruncated, Checks: checks, ChecksAvailable: checksErr == nil})
+				RecoveryHistoryTruncated: recoveryHistoryTruncated, RecoveryFailures: recoveryFailures,
+				RecoveryFailuresAvailable: recoveryFailuresErr == nil, RecoveryFailuresTruncated: recoveryFailuresTruncated,
+				Checks: checks, ChecksAvailable: checksErr == nil, LifecycleEvents: lifecycleEvents, LifecycleEventsAvailable: lifecycleErr == nil})
 			return
 		}
 		if err := loginHistory.DeleteAccountByID(r.Context(), id); errors.Is(err, store.ErrAccountBusy) {

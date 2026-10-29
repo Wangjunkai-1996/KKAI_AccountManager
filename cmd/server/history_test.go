@@ -118,6 +118,35 @@ func TestHistoryListAndDeleteEndpoints(t *testing.T) {
 	}
 }
 
+func TestHistoryLifecycleEventsAreProjected(t *testing.T) {
+	history := newTestHistory(t)
+	ctx := context.Background()
+	account, err := history.UpsertCredentials(ctx, store.Credentials{Email: "lifecycle-api@example.test", Password: "password-123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := history.RecordLifecycleEvent(ctx, store.LifecycleEvent{
+		AccountID: account.ID, Email: account.Email, Source: "official", Status: "deactivated",
+		Reason: "官方账号已停用", Code: "account_deactivated", HTTPStatus: http.StatusForbidden,
+		DedupeKey: "history-api:lifecycle-api@example.test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	list := httptest.NewRecorder()
+	handleHistory()(list, httptest.NewRequest(http.MethodGet, "/api/history", nil))
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"lifecycle_events"`) || !strings.Contains(list.Body.String(), "account_deactivated") {
+		t.Fatalf("lifecycle list projection = %d %s", list.Code, list.Body.String())
+	}
+
+	detail := httptest.NewRecorder()
+	handleHistoryDelete()(detail, httptest.NewRequest(http.MethodGet, "/api/history/"+itoa(account.ID), nil))
+	body := detail.Body.String()
+	if detail.Code != http.StatusOK || !strings.Contains(body, `"lifecycle_events_available":true`) || !strings.Contains(body, "lifecycle-api@example.test") || !strings.Contains(body, `"http_status":403`) {
+		t.Fatalf("lifecycle detail projection = %d %s", detail.Code, body)
+	}
+}
+
 func TestHistoryRecoveryCountsAndSafeTimeline(t *testing.T) {
 	history := newTestHistory(t)
 	ctx := context.Background()
@@ -151,6 +180,33 @@ func TestHistoryRecoveryCountsAndSafeTimeline(t *testing.T) {
 		if path != "/api/history" && (!strings.Contains(body, `"recovery_history_available":true`) || !strings.Contains(body, `"recovery_history_truncated":false`) || !strings.Contains(body, `"state":"unknown"`) || !strings.Contains(body, `"state":"completed"`)) {
 			t.Fatalf("missing recovery timeline: %s", body)
 		}
+	}
+}
+
+func TestHistoryRecoveryFailureProjectionIsRedacted(t *testing.T) {
+	history := newTestHistory(t)
+	ctx := context.Background()
+	account, err := history.UpsertCredentials(ctx, store.Credentials{Email: "recovery-failure-history@example.test", Password: "secret-fixture-password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, _, err := history.CreateOrGetAccountRecoveryTask(ctx, account.ID, 0, 42, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := history.RecordAccountRecoveryFailure(ctx, task.ID, store.RecoveryFailure{
+		State: store.RecoveryUnknown, Stage: store.RecoveryValidating, Code: "upstream_error", Message: "上游服务暂不可用", HTTPStatus: 503, RetryAction: "resume",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handleHistoryDelete()(response, httptest.NewRequest(http.MethodGet, "/api/history/"+itoa(account.ID), nil))
+	body := response.Body.String()
+	if response.Code != http.StatusOK || !strings.Contains(body, `"recovery_failures_available":true`) || !strings.Contains(body, `"failure_stage":"validating"`) || !strings.Contains(body, `"error_code":"upstream_error"`) || !strings.Contains(body, `"http_status":503`) {
+		t.Fatalf("missing failure projection: %d %s", response.Code, body)
+	}
+	if strings.Contains(body, "secret-fixture-password") || strings.Contains(body, "upstream raw response") {
+		t.Fatalf("unsafe failure projection: %s", body)
 	}
 }
 

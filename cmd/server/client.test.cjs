@@ -64,7 +64,7 @@ assert.match(indexHTML, /<section[^>]*id="historyRecoveryPopover"[^>]*role="dial
 const ids = [...indexHTML.matchAll(/id="([^"]+)"/g)].map(match => match[1]);
 const elements = new Map(ids.map(id => { const element = new Element(); element.id = id; return [id, element]; }));
 const el = id => elements.get(id);
-const tabs = ['login', 'history', 'checks'].map(name => { const tab = el(`tab-${name}`); tab.dataset.tab = name; return tab; });
+const tabs = ['login', 'history'].map(name => { const tab = el(`tab-${name}`); tab.dataset.tab = name; return tab; });
 const panels = ['login', 'history', 'checks'].map(name => { const panel = el(`panel-${name}`); panel.dataset.tab = name; return panel; });
 el('historySearchInput').parentElement = el('panel-history');
 el('historySelectAll').parentElement = el('panel-history');
@@ -82,7 +82,7 @@ const historyEvents = [];
 document.dispatchEvent = event => { historyEvents.push(event.type); return Element.prototype.dispatchEvent.call(document, event); };
 let rows = Array.from({ length: 25 }, (_, index) => ({ id: index + 1, email: `account${String(index + 1).padStart(3, '0')}@example.test`, status: ['active', 'error', 'running', 'deleted', 'interrupted'][index % 5], recovery_count: index === 0 ? 2 : 0, recovery_attempt_count: index === 0 ? 3 : 0 }));
 let sub2Statuses = {
-    1: { configured: true, imported: true, exists: true, status: 'active', schedulable: true, checked_at: '2026-10-05T10:00:00Z' },
+    1: { configured: true, imported: true, exists: true, status: 'active', schedulable: true, checked_at: '2026-10-05T10:00:00Z', quota: { five_hour: { used_percent: 42, reset_at: '2026-10-05T15:00:00Z' }, seven_day: { used_percent: 68, reset_after_seconds: 3600 }, credits: { balance: '12', has_credits: true, unlimited: false }, updated_at: '2026-10-05T10:00:00Z', source: 'Sub2 extra' } },
     2: { configured: true, imported: true, exists: true, status: 'disabled', schedulable: false, checked_at: '2026-10-05T10:01:00Z' }
 };
 let recoverySettings = { auto_recovery_enabled: false, interval_seconds: 60 };
@@ -91,12 +91,14 @@ let deliveries = {}, rechecks = {}, repairs = {}, sub2Configured = true, loginSt
 let importSettings = { defaults: { group_ids: [], priority: 1, concurrency: 3 }, groups: [{id: 7, name: '稳定池'}, {id: 8, name: '<img unsafe>测试池'}], groups_available: true };
 let settingsReadFailure = false, settingsReadGate = null, importSettingsSaveFailure = false, credentialsFailure = false;
 const intervals = [];
-let imports = [], historyFailure = false, historyGate = null, deleteGate = null;
+let imports = [], lifecycleEvents = {}, historyFailure = false, historyGate = null, deleteGate = null;
 let deletionFailures = new Map(), missingIDs = new Set(), acceptedImportIDs = null, importGate = null;
 let confirmations = [], confirmResult = true, requests = [];
+let groupActions = [];
 let detailGate = null, detailFailure = false, recoveryHistoryAvailable = true, recoveryHistoryTruncated = false;
 let recoveryHistory = [{ id: 3, state: 'unknown', created_at: '2026-10-07T06:08:41Z', updated_at: '2026-10-07T06:08:59Z', last_error: '<img src=x onerror=alert(1)>身份待核对' },
     { id: 2, state: 'completed', created_at: '2026-10-06T01:00:00Z', updated_at: '2026-10-06T01:01:00Z' }];
+let recoveryFailures = [];
 const response = (body, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => structuredClone(body) });
 const location = { hash: '' };
 const window = new Element();
@@ -128,7 +130,7 @@ const context = vm.createContext({ document, window, location, console, Event, C
         if (url === '/api/history') {
             if (historyGate) { const gate = historyGate; historyGate = null; await gate.promise; }
             if (historyFailure) return response({ message: 'fixture refresh unavailable' }, 503);
-            return response({ data: rows, imports, sub2_configured: sub2Configured, imports_available: true, sub2_statuses: sub2Statuses, checks, recoveries, deliveries, rechecks, repairs, checks_available: true });
+            return response({ data: rows, imports, lifecycle_events: lifecycleEvents, lifecycle_events_available: true, sub2_configured: sub2Configured, imports_available: true, sub2_statuses: sub2Statuses, checks, recoveries, deliveries, rechecks, repairs, checks_available: true });
         }
         if (url === '/api/account-recovery/settings' && !options.method) return response(recoverySettings);
         if (url === '/api/account-recovery/settings' && options.method === 'PUT') {
@@ -147,12 +149,16 @@ const context = vm.createContext({ document, window, location, console, Event, C
             recoveries[id] = { ...recoveries[id], state: 'queued', resumable: false };
             return response({ success: true, task: recoveries[id] });
         }
+        if (/^\/api\/account-recovery\/\d+\/groups$/.test(url) && options.method === 'POST') {
+            groupActions.push({ url, body: JSON.parse(options.body) });
+            return response({ success: true, queued: true });
+        }
         if (url.startsWith('/api/history/') && !options.method) {
             if (detailGate) { const gate = detailGate; detailGate = null; await gate.promise; }
             if (detailFailure) return response({ message: 'fixture detail unavailable' }, 503);
             const id = Number(url.split('/').pop());
             const account = rows.find(row => row.id === id);
-            return response({ account, attempts: [], recovery_history: recoveryHistory, recovery_history_available: recoveryHistoryAvailable, recovery_history_truncated: recoveryHistoryTruncated });
+            return response({ account, attempts: [], recovery_history: recoveryHistory, recovery_history_available: recoveryHistoryAvailable, recovery_history_truncated: recoveryHistoryTruncated, recovery_failures: recoveryFailures, recovery_failures_available: true, lifecycle_events: lifecycleEvents[id] || [], lifecycle_events_available: true });
         }
         if (url.startsWith('/api/history/') && options.method === 'DELETE') {
             if (deleteGate) { const gate = deleteGate; deleteGate = null; await gate.promise; }
@@ -188,6 +194,8 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     await flush();
     assert.equal(el('panel-login').hidden, false);
     assert.equal(el('panel-checks').hidden, true);
+    assert.match(indexHTML, /id="tab-checks"[^>]*hidden/, 'account checks tab is hidden');
+    assert.match(indexHTML, /id="tab-history"[^>]*>账号表/, 'account table is the primary account tab');
     assert.equal(el('historyActionBar').hidden, true);
     await click('tab-history');
     assert.equal(location.hash, '#panel-history');
@@ -318,6 +326,36 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.match(el('historyGrid').innerHTML, /Sub2 正常/);
     assert.match(el('historyGrid').innerHTML, /可调度/);
     assert.match(el('historyGrid').innerHTML, /Sub2 已禁用/);
+    assert.doesNotMatch(el('historyGrid').innerHTML, /data-history-action="check"/, 'table rows do not link to the hidden checks page');
+    const firstAccountRow = el('historyGrid').innerHTML.match(/<article[^>]*data-history-card="1"[^>]*>.*?<\/article>/s)?.[0];
+    assert.ok(firstAccountRow, 'first account appears as a table row');
+    for (const column of ['identity', 'auth', 'sub2', 'source', 'quota', 'workflow', 'time', 'actions']) {
+        assert.match(firstAccountRow, new RegExp(`history-row-${column}`), `${column} has its own scannable column`);
+    }
+    assert.match(firstAccountRow, /Sub2 正常/);
+    assert.match(firstAccountRow, /可调度/);
+    assert.match(firstAccountRow, /5h 42%/);
+    assert.match(firstAccountRow, /7d 68%/);
+    assert.match(firstAccountRow, /未发现删除/);
+    const officialDeletedRow = el('historyGrid').innerHTML.match(/<article[^>]*data-history-card="4"[^>]*>.*?<\/article>/s)?.[0];
+    assert.match(officialDeletedRow || '', /官方删除/, 'AUTH deletion is shown as an official deletion source');
+    assert.doesNotMatch(el('historyGrid').innerHTML, /成功复活 0 次/, 'accounts without recovery records do not show empty history buttons');
+    assert.match(el('accountTableSummary').textContent, /全部 25 · 可调度 1 · 需处理 \d+ · 处理中 \d+/);
+    await change('historyStatusFilter', 'schedulable');
+    assert.match(el('historyGrid').innerHTML, /data-history-card="1"/);
+    assert.doesNotMatch(el('historyGrid').innerHTML, /data-history-card="2"/, 'unschedulable accounts are excluded');
+    await change('historyStatusFilter', 'attention');
+    assert.match(el('historyGrid').innerHTML, /data-history-card="2"/, 'failed accounts remain visible in attention');
+    await change('historyStatusFilter', 'working');
+    assert.match(el('historyGrid').innerHTML, /data-history-card="3"/, 'active work remains visible');
+    deliveries[1] = { state: 'queued' };
+    await click('refreshHistoryBtn');
+    assert.match(el('historyGrid').innerHTML, /data-history-card="1"/, 'queued delivery appears in working');
+    await change('historyStatusFilter', 'schedulable');
+    assert.match(el('historyGrid').innerHTML, /data-history-card="1"/, 'ongoing delivery does not hide a schedulable Sub2 account');
+    deliveries = {};
+    await click('refreshHistoryBtn');
+    await change('historyStatusFilter', 'all');
     assert.equal(el('autoRecoveryToggle').checked, false);
     await change('autoRecoveryToggle', true);
     assert.equal(recoverySettings.auto_recovery_enabled, true);
@@ -352,7 +390,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     await click('refreshHistoryBtn');
     assert.match(el('historyGrid').innerHTML, /HTTP 401/);
     assert.match(el('historyGrid').innerHTML, /正在重新登录/);
-    assert.match(el('historyGrid').innerHTML, /disabled>恢复中…/);
+    assert.doesNotMatch(el('historyGrid').innerHTML, /data-history-action="recover" data-history-id="2"/, 'active recovery keeps progress visible without an unusable action button');
     sub2Statuses[2] = { ...sub2Statuses[2], status: 'active', schedulable: true, effective_schedulable: true };
     recoveries[2] = {};
     await click('refreshHistoryBtn');
@@ -371,14 +409,11 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), false,
         'a confirmed AUTH 401 keeps immediate recovery available during a Sub2 cooldown');
     checks[2].eligible = true;
-    run("historySelectedIDs.clear(); window.AccountChecks = { startMany: async ids => { globalThis.immediateCheckIDs = ids; return true; } }");
     rows = [{ id: 2, email: 'account002@example.test', status: 'active' }];
     imports = [{ account_id: 2, sub2_account_id: 200, state: 'imported', operation_id: 'linked-200' }];
     sub2Statuses[2] = { ...sub2Statuses[2], rate_limit_reset_at: '', effective_schedulable: true };
     await click('refreshHistoryBtn');
-    await click('historyCheckNowBtn');
-    assert.deepEqual(Array.from(run('immediateCheckIDs')), ['2'], 'history immediate check submits the visible linked account');
-    assert.match(el('historyCheckNowStatus').textContent, /已提交 1 个/);
+    assert.match(indexHTML, /id="historyCheckNowBtn"[^>]*hidden/, 'standalone manual checks are hidden from the account table');
     rows = Array.from({ length: 25 }, (_, index) => ({ id: index + 1, email: `account${String(index + 1).padStart(3, '0')}@example.test`, status: ['active', 'error', 'running', 'deleted', 'interrupted'][index % 5] }));
     run('historySelectedIDs.clear()');
     await click('refreshHistoryBtn');
@@ -409,6 +444,8 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     sub2Statuses[2].exists = false;
     await click('refreshHistoryBtn');
     assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).reason"), '该账号已从 Sub2 删除');
+    const sub2DeletedRow = el('historyGrid').innerHTML.match(/<article[^>]*data-history-card="2"[^>]*>.*?<\/article>/s)?.[0];
+    assert.match(sub2DeletedRow || '', /Sub2 已删除/, 'Sub2 deletion is shown separately from official status');
     for (const [association, label] of [['unmatched', '未找到关联'], ['ambiguous', '多条匹配待确认'], ['conflict', '身份不一致']]) {
         sub2Statuses[2] = { imported: false, exists: false, unknown: true, association_status: association, error: '<reason>' };
         await click('refreshHistoryBtn');
@@ -416,8 +453,14 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
         assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), true);
     }
     sub2Statuses[2] = null;
+    const deletesBeforeUnknown = deletes().length;
     await click('refreshHistoryBtn');
     assert.match(el('historyGrid').innerHTML, /Sub2 状态待核对/, 'missing Sub2 status must not imply confirmed absence');
+    assert.equal(run("historyAccountMatches(historyAccounts.find(account => account.id === '2'), 'unknown')"), true);
+    assert.equal(deletes().length, deletesBeforeUnknown, 'an unknown Sub2 result never deletes an account');
+    const unknownAccountRow = el('historyGrid').innerHTML.match(/<article[^>]*data-history-card="2"[^>]*>.*?<\/article>/s)?.[0];
+    assert.ok(unknownAccountRow, 'unknown accounts remain visible');
+    assert.doesNotMatch(unknownAccountRow, /清理记录/, 'unknown status is not represented as a deleted account');
     recoverySettings = { ...recoverySettings, scanning: true, last_scan_at: '2026-10-05T11:01:00Z', next_scan_at: '2026-10-05T11:02:00Z', last_error: '出口暂不可用', summary: 'Sub2 异常 2 个，提交检测 1 个，恢复 0 个，等待或冷却 1 个' };
     await run('loadRecoverySettings()');
     assert.equal(el('autoRecoveryStatus').textContent, '正在巡检…');
@@ -470,7 +513,27 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     repairs = { 2: { state: 'completed' } };
     await run('loadHistory()');
     assert.equal(run('historyRefreshDelay()'), 300000, 'completed repairs return to idle polling');
+    recoveries[1] = { state: 'unknown', requires_action: true, updated_at: '2026-10-08T01:00:00Z' };
+    repairs = { 1: { state: 'completed', updated_at: '2026-10-08T02:00:00Z' } };
+    await run('loadHistory()');
+    assert.equal(run("historyAccountMatches(historyAccounts.find(account => account.id === '1'), 'attention')"), false,
+        'a newer completed credential repair supersedes old recovery attention');
+    const repairedAccountRow = el('historyGrid').innerHTML.match(/<article[^>]*data-history-card="1"[^>]*>.*?<\/article>/s)?.[0];
+    assert.ok(repairedAccountRow);
+    assert.doesNotMatch(repairedAccountRow, /history-workflow-state">需处理/, 'repaired account workflow no longer requests attention');
     repairs = {};
+    for (const state of ['failed', 'unknown']) {
+        recoveries[1] = { state, next_retry_at: new Date(Date.now() + 600000).toISOString() };
+        await run('loadHistory()');
+        assert.equal(run("historyAccountMatches(historyAccounts.find(account => account.id === '1'), 'working')"), true,
+            `${state} recovery waiting for an automatic retry remains in working`);
+    }
+    recoveries = {};
+    rechecks[1] = { state: 'checking' };
+    await run('loadHistory()');
+    assert.equal(run("historyAccountMatches(historyAccounts.find(account => account.id === '1'), 'working')"), true,
+        'an active delayed recheck appears in working');
+    rechecks = {};
     await run('loadHistory()');
     recoverySettings.last_error = '手动恢复未能入队';
     await run('loadRecoverySettings()');
@@ -654,14 +717,46 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     const timedOutImport = await run('waitForImportCompletion(["2001"], 0)');
     assert.equal(timedOutImport.running, false, 'poll timeout must clear running');
     assert.equal(timedOutImport.pending, 1);
-    rows = [{ id: 1000, email: 'details@example.test', status: 'active' }];
+    rows = [{ id: 1000, email: 'details@example.test', status: 'active', password: 'fixture-secret', totp_secret: 'fixture-totp' }];
+    sub2Statuses[1000] = { configured: true, imported: true, exists: true, status: 'active', schedulable: true, effective_schedulable: true, checked_at: '2026-10-05T10:00:00Z', quota: {
+        five_hour: { used_percent: 42, resets_at: '2026-10-05T14:00:00Z', used_requests: 42, limit_requests: 100 },
+        seven_day: { used_percent: 68 }, seven_day_sonnet: { used_percent: 21 }, seven_day_fable: { used_percent: 8 },
+        thirty_day: { used_percent: 12 }, credits: { balance: '12', has_credits: true }, updated_at: '2026-10-05T10:01:00Z', source: 'cached'
+    } };
+    lifecycleEvents = { 1000: [{ id: 12, account_id: 1000, email: 'details@example.test', source: 'official', status: 'deactivated', reason: '官方账号已停用', code: 'account_deactivated', http_status: 403, observed_at: '2026-10-05T10:02:00Z' }] };
     imports = []; await click('refreshHistoryBtn');
+    await change('historySearchInput', 'DETAILS@');
+    assert.match(el('historyGrid').innerHTML, /data-history-card="1000"/, 'email searches are case insensitive');
+    await change('historySearchInput', '1000');
+    assert.match(el('historyGrid').innerHTML, /data-history-card="1000"/, 'account IDs are searchable independently of the email');
+    await change('historySearchInput', 'not-a-matching-account');
+    assert.doesNotMatch(el('historyGrid').innerHTML, /data-history-card="1000"/);
+    await change('historySearchInput', '');
+    recoveryFailures = [{ id: 7, task_id: 224, failure_stage: 'enabling_schedule', error_code: 'probe_failed', http_status: 503, retry_count: 2, created_at: '2026-10-08T01:02:03Z' }];
     // History details keep keyboard focus inside the dialog and return it to the opener.
     run("historySelectedIDs.add('1000'); renderHistory()");
     el('historyBatchDeleteBtn').disabled = false;
     el('historyBatchDeleteBtn').dataset.historyId = '1000';
     await run("openHistoryDetails('1000', historyBatchDeleteBtn)");
     assert.equal(el('historyDetail').hidden, false);
+    assert.match(el('historyDetailBody').innerHTML, /Sub2 检测失败证据/);
+    assert.match(el('historyDetailBody').innerHTML, /任务 #224/);
+    assert.match(el('historyDetailBody').innerHTML, /HTTP 503/);
+    assert.match(el('historyDetailBody').innerHTML, /Sub2 状态 \/ 调度/);
+    assert.match(el('historyDetailBody').innerHTML, /状态来源/);
+    assert.match(el('historyDetailBody').innerHTML, /Sub2 最近同步/);
+    assert.match(el('historyDetailBody').innerHTML, /7 天 Sonnet/);
+    assert.match(el('historyDetailBody').innerHTML, /7 天 Fable/);
+    assert.match(el('historyDetailBody').innerHTML, /30 天使用额度/);
+    assert.match(el('historyDetailBody').innerHTML, /请求 42\/100/);
+    assert.match(el('historyDetailBody').innerHTML, /Sub2 正常/);
+    assert.match(el('historyDetailBody').innerHTML, /可调度/);
+    assert.match(el('historyDetailBody').innerHTML, /账号状态历史/);
+    assert.match(el('historyDetailBody').innerHTML, /details@example.test/);
+    assert.match(el('historyDetailBody').innerHTML, /官方检测/);
+    assert.match(el('historyDetailBody').innerHTML, /已停用/);
+    assert.match(el('historyDetailBody').innerHTML, /HTTP 403/);
+    assert.doesNotMatch(el('historyDetailBody').innerHTML, /fixture-secret|fixture-totp/, 'account details never reveal saved credentials');
     assert.equal(document.activeElement, el('historyDetail'), 'opening details moves focus into the dialog');
     el('historyDetailClose').focus();
     let trapped = false;
@@ -676,28 +771,35 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     await run("openHistoryDetails('1000', historyBatchDeleteBtn)");
     run("historyAccounts = historyAccounts.filter(account => account.id !== '1000'); closeHistoryDetails()");
     assert.equal(document.activeElement, el('historySelectAll'), 'removed opener falls back to history selection');
-    // Navigation uses one selected/focusable tab and supports keyboard and history.
+    // Navigation uses the two visible tabs and redirects old checks links to the table.
     run("historyDetailID = '123'; historyDetail.hidden = false");
     el('historySearchInput').focus();
-    window.AuthTabs.select('checks');
+    window.AuthTabs.select('login');
     assert.equal(el('historyDetail').hidden, true, 'leaving history closes stale details');
     assert.equal(run('historyDetailID'), '');
-    assert.equal(document.activeElement, el('tab-checks'), 'programmatic switch must move focus out of hidden panel');
-    assert.equal(location.hash, '#accountChecksPanel');
+    assert.equal(document.activeElement, el('tab-login'), 'programmatic switch must move focus out of hidden panel');
+    assert.equal(location.hash, '#panel-login');
     const transitions = historyEvents.filter(name => name === 'auth-tab-changed').length;
-    window.AuthTabs.select('checks');
+    window.AuthTabs.select('login');
     assert.equal(historyEvents.filter(name => name === 'auth-tab-changed').length, transitions, 'same-tab selection must not trigger recovery again');
+    window.AuthTabs.select('checks');
+    assert.equal(el('panel-history').hidden, false, 'old checks actions open the account table');
+    assert.equal(el('panel-checks').hidden, true);
+    assert.equal(location.hash, '#panel-history');
     let prevented = false;
-    await el('tab-checks').emit('keydown', el('tab-checks'), { key: 'ArrowRight', preventDefault() { prevented = true; } });
-    assert.equal(prevented, true); assert.equal(document.activeElement, el('tab-login'));
+    await el('tab-login').emit('keydown', el('tab-login'), { key: 'ArrowRight', preventDefault() { prevented = true; } });
+    assert.equal(prevented, true); assert.equal(document.activeElement, el('tab-history'));
     await el('tab-login').emit('keydown', el('tab-login'), { key: 'End', preventDefault() {} });
-    assert.equal(document.activeElement, el('tab-checks'));
+    assert.equal(document.activeElement, el('tab-history'));
     location.hash = '#panel-history'; await window.emit('popstate');
     assert.equal(el('panel-history').hidden, false);
     location.hash = '#accountChecksPanel'; await window.emit('hashchange');
-    assert.equal(el('panel-checks').hidden, false);
-    assert.deepEqual(tabs.map(tab => tab.tabIndex), [-1, -1, 0]);
-    assert.deepEqual(tabs.map(tab => tab.attributes['aria-selected']), ['false', 'false', 'true']);
+    assert.equal(el('panel-history').hidden, false);
+    assert.equal(el('panel-checks').hidden, true);
+    location.hash = '#panel-checks'; await window.emit('hashchange');
+    assert.equal(el('panel-history').hidden, false);
+    assert.deepEqual(tabs.map(tab => tab.tabIndex), [-1, 0]);
+    assert.deepEqual(tabs.map(tab => tab.attributes['aria-selected']), ['false', 'true']);
     // One parameter form serves login batches and manual imports; saving defaults is explicit.
     confirmResult = null;
     let selectedGroups = [7];
@@ -790,6 +892,9 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.doesNotMatch(el('historyGrid').innerHTML, /<img/);
     assert.equal(el('historyAttention').hidden, true, 'temporary delivery errors are not manual alerts');
     assert.match(el('historyGrid').innerHTML, /Sub2 交付完成/);
+    assert.match(run("deliveryStatusText({state:'queued',blocked_reason:'后台服务已暂停，需要恢复服务后继续'})"), /自动交付已暂停/);
+    assert.doesNotMatch(run("deliveryStatusText({state:'queued',blocked_reason:'后台服务已暂停，需要恢复服务后继续'})"), /等待自动交付/);
+    assert.equal(run("deliveryStatusText({state:'completed',blocked_reason:'后台服务已暂停'})"), 'Sub2 交付完成');
     assert.doesNotMatch(run("automaticTaskPolicy({state:'completed',next_retry_at:'2026-10-08T00:00:00Z',retry_action:'resume'})"), /重试|下次/);
     // A batch finishing while an older history snapshot is in flight must
     // still fetch the delivery state that exists after the batch finished.
@@ -988,7 +1093,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
                 options.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
             });
         };
-        const stalled = run('loginAccount({email:"timeout@example.test"}, "direct")');
+        const stalled = run('loginAccount({email:"timeout@example.test"}, "direct", new AbortController().signal)');
         assert.equal(connectionTimers.size, 1);
         const connectionTimer = [...connectionTimers.values()][0];
         assert.equal(connectionTimer.delay, 15000);
@@ -1004,7 +1109,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
             return { ok: true, headers: new Map([['content-type', 'text/event-stream']]),
                 body: new ReadableStream({ start(controller) { streamController = controller; } }) };
         };
-        const streaming = run('loginAccount({email:"stream@example.test"}, "direct")');
+        const streaming = run('loginAccount({email:"stream@example.test"}, "direct", new AbortController().signal)');
         await flush();
         assert.equal(connectionTimers.size, 0, 'receiving SSE headers clears the connection deadline while login is still pending');
         assert.equal(streamSignal.aborted, false);
@@ -1017,7 +1122,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
             connectionRequests++;
             throw new TypeError('fixture connection reset');
         };
-        await assert.rejects(run('loginAccount({email:"reset@example.test"}, "direct")'), /fixture connection reset/);
+        await assert.rejects(run('loginAccount({email:"reset@example.test"}, "direct", new AbortController().signal)'), /fixture connection reset/);
         assert.equal(connectionRequests, 3, 'network failure must not automatically replay a login POST');
         assert.equal(connectionTimers.size, 0, 'network failure releases the connection timer');
     } finally {
@@ -1025,6 +1130,160 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
         context.setTimeout = savedSetTimeout;
         context.clearTimeout = savedClearTimeout;
     }
+    // A stopped request stays non-retryable until its persisted result is known.
+    await change('autoDeliverToggle', false);
+    el('modeSelect').value = 'sequential';
+    run("accounts = ['first', 'second', 'third'].map((name, id) => ({id, email:name + '@example.test', password:'synthetic-only', totp_secret:'fixture'})); results = []");
+    const stopRequestsBefore = requests.filter(item => item.url === '/api/login/stream').length;
+    const secondStarted = gate();
+    let streamAborted = false;
+    context.fetch = async (url, options = {}) => {
+        if (url !== '/api/login/stream' || JSON.parse(options.body).email !== 'second@example.test') return savedFetch(url, options);
+        requests.push({ url, options });
+        const body = new ReadableStream({ start(controller) {
+            options.signal.addEventListener('abort', () => {
+                streamAborted = true;
+                controller.error(new Error('stream aborted'));
+            }, { once: true });
+        } });
+        secondStarted.release();
+        return { ok: true, headers: new Map([['content-type', 'text/event-stream']]), body };
+    };
+    try {
+        const stoppedBatch = run('runAccounts(accounts)');
+        await secondStarted.promise; await flush();
+        assert.equal(el('stopBtn').hidden, false, 'Stop is available during an active batch');
+        await click('stopBtn');
+        await stoppedBatch;
+        assert.equal(streamAborted, true, 'Stop aborts the in-flight SSE request');
+        assert.deepEqual(Array.from(run('accounts.map(account => account.status)')), ['success', 'checking', 'stopped']);
+        assert.equal(run('results.length'), 1, 'completed results survive Stop');
+        assert.equal(el('successCount').textContent, 1);
+        assert.equal(el('stoppedCount').textContent, 1);
+        assert.equal(el('checkingCount').textContent, 1);
+        assert.equal(el('pendingCount').textContent, 0);
+        assert.deepEqual(requests.filter(item => item.url === '/api/login/stream').slice(stopRequestsBefore).map(item => JSON.parse(item.options.body).email),
+            ['first@example.test', 'second@example.test'], 'queued accounts never start after Stop');
+        assert.equal(el('stopBtn').hidden, true, 'Stop hides after cleanup');
+        const requestsBeforeUnsafeRetry = requests.filter(item => item.url === '/api/login/stream').length;
+        await window.retryAccount(1);
+        assert.equal(requests.filter(item => item.url === '/api/login/stream').length, requestsBeforeUnsafeRetry,
+            'an unresolved in-flight request cannot be retried');
+        rows.push({ id: 9002, email: 'second@example.test', status: 'active', attempt_count: 1,
+            last_attempt_at: new Date(run('accounts[1].startTime')).toISOString(),
+            last_success_at: new Date().toISOString() });
+        await window.recheckStoppedAccount(1);
+        assert.deepEqual(Array.from(run('accounts.map(account => account.status)')), ['success', 'success', 'stopped']);
+        assert.match(run('accounts[1].message'), /登录结果已保存/);
+        assert.equal(Boolean(run('accounts[1].result')), false, 'history reconciliation does not invent a returned token');
+        assert.equal(run('accounts[1].historyID'), '9002');
+        assert.equal(el('retryFailedBtn').disabled, false, 'only safely stopped queued accounts remain retryable');
+    } finally {
+        context.fetch = savedFetch;
+    }
+    // The server-busy retry delay must also yield to Stop without another POST.
+    run("accounts = [{id:0,email:'busy@example.test',password:'synthetic-only',totp_secret:'fixture'}]; results = []");
+    const busyStarted = gate();
+    const busyRequestsBefore = requests.filter(item => item.url === '/api/login/stream').length;
+    context.fetch = async (url, options = {}) => {
+        if (url !== '/api/login/stream') return savedFetch(url, options);
+        requests.push({ url, options });
+        busyStarted.release();
+        return { ...response({ code: 'platform_busy', retry_after: 1 }, 429), headers: new Map([['content-type', 'application/json']]) };
+    };
+    try {
+        const busyBatch = run('runAccounts(accounts)');
+        await busyStarted.promise; await flush();
+        await click('stopBtn');
+        await busyBatch;
+        assert.equal(run('accounts[0].status'), 'stopped');
+        assert.equal(requests.filter(item => item.url === '/api/login/stream').length, busyRequestsBefore + 1,
+            'Stop ends the rate-limit wait without replaying the login POST');
+    } finally {
+        context.fetch = savedFetch;
+    }
+    // A persisted failed attempt can be retried after a fresh history read.
+    run("accounts = [{id:0,email:'failed-stop@example.test',password:'synthetic-only',totp_secret:'fixture'}]; results = []");
+    const failedStarted = gate();
+    context.fetch = async (url, options = {}) => {
+        if (url !== '/api/login/stream') return savedFetch(url, options);
+        requests.push({ url, options });
+        const body = new ReadableStream({ start(controller) {
+            options.signal.addEventListener('abort', () => controller.error(new Error('stream aborted')), { once: true });
+        } });
+        failedStarted.release();
+        return { ok: true, headers: new Map([['content-type', 'text/event-stream']]), body };
+    };
+    try {
+        const failedBatch = run('runAccounts(accounts)');
+        await failedStarted.promise; await flush();
+        await click('stopBtn');
+        await failedBatch;
+        assert.equal(run('accounts[0].status'), 'checking');
+        rows.push({ id: 9011, email: 'failed-stop@example.test', status: 'failed', attempt_count: 1,
+            last_attempt_at: new Date(run('accounts[0].startTime')).toISOString() });
+        await window.recheckStoppedAccount(0);
+        assert.equal(run('accounts[0].status'), 'stopped');
+        assert.equal(el('retryFailedBtn').disabled, false);
+    } finally {
+        context.fetch = savedFetch;
+    }
+    // Parallel Stop cancels every active stream and never starts the queued item.
+    el('modeSelect').value = 'parallel';
+    el('concurrency').value = '2';
+    run("accounts = ['parallel-a', 'parallel-b', 'parallel-c'].map((name, id) => ({id,email:name+'@example.test',password:'synthetic-only',totp_secret:'fixture'})); results = []");
+    const parallelStarted = gate();
+    let parallelRequests = 0, parallelAborts = 0;
+    context.fetch = async (url, options = {}) => {
+        if (url !== '/api/login/stream') return savedFetch(url, options);
+        requests.push({ url, options });
+        parallelRequests++;
+        if (parallelRequests === 2) parallelStarted.release();
+        const body = new ReadableStream({ start(controller) {
+            options.signal.addEventListener('abort', () => {
+                parallelAborts++;
+                controller.error(new Error('stream aborted'));
+            }, { once: true });
+        } });
+        return { ok: true, headers: new Map([['content-type', 'text/event-stream']]), body };
+    };
+    try {
+        const parallelBatch = run('runAccounts(accounts)');
+        await parallelStarted.promise; await flush();
+        await click('stopBtn');
+        await parallelBatch;
+        assert.equal(parallelRequests, 2);
+        assert.equal(parallelAborts, 2);
+        assert.deepEqual(Array.from(run('accounts.map(account => account.status)')), ['checking', 'checking', 'stopped']);
+    } finally {
+        context.fetch = savedFetch;
+        el('modeSelect').value = 'sequential';
+    }
+    // Group conflicts expose a safe, explicit choice with redacted task
+    // evidence; the request carries the displayed IDs as a CAS snapshot.
+    rows.push({ id: 9010, email: 'group-conflict@example.test', status: 'error', recovery_count: 0, recovery_attempt_count: 1 });
+    deliveries[9010] = {
+        id: 551, account_id: 9010, state: 'requires_action', requires_action: true,
+        manual_action: '当前分组与本批目标分组不一致', error_code: 'group_conflict',
+        failure_stage: 'applying_groups', http_status: 409,
+        diagnostic: { current_group_ids: [13, 12], target_group_ids: [44, 12] }
+    };
+    await run('loadHistory()');
+    assert.match(el('historyAttentionList').innerHTML, /当前分组：12、13；目标分组：12、44/);
+    assert.match(el('historyAttentionList').innerHTML, /任务 #551/);
+    assert.match(el('historyAttentionList').innerHTML, /保留当前分组/);
+    assert.match(el('historyAttentionList').innerHTML, /按目标分组修正/);
+    assert.match(el('historyAttentionList').innerHTML, /阶段：写入分组/);
+    assert.match(el('historyAttentionList').innerHTML, /分类：group_conflict/);
+    assert.match(el('historyAttentionList').innerHTML, /HTTP 409/);
+    await run("resolveGroupConflict(historyDeliveries.get('9010'), 'keep_current')");
+    assert.deepEqual(groupActions.at(-1), {
+        url: '/api/account-recovery/551/groups',
+        body: { action: 'keep_current', current_group_ids: [12, 13], target_group_ids: [12, 44] }
+    });
+    await run("resolveGroupConflict(historyDeliveries.get('9010'), 'apply_target')");
+    assert.deepEqual(groupActions.at(-1).body, { action: 'apply_target', current_group_ids: [12, 13], target_group_ids: [12, 44] });
+    console.log('Group conflict checks passed: redacted task diagnostics, explicit choices, confirmation and snapshot-bound requests.');
     console.log('History checks passed: Sub2 status/settings, ordinary/cross-page select, cancellation, delete locking/409/404/timeouts/refresh failures, partial/chunked import, relogin retention.');
     console.log('Tab checks passed: selection isolation, navigation, keyboard, focus, hash/back navigation, panel scrolling.');
     console.log('Confirmation checks passed: plain text, cancellation/acceptance for all batch actions, modal focus/Tab/Escape/restore, repeat opens, navigation cancellation, stale-state guards.');
@@ -1034,6 +1293,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     console.log('Delivery identity checks passed: Unicode/control validation, late defaults, safe summary, default save, automatic batch/retry freezing, login-only independence and manual-import fields.');
     console.log('Regression checks passed: double Start during settings load, preparation failure/cancel release, and active/waiting/completed credential repair polling.');
     console.log('Login connection checks passed: bounded setup, uncertain POST is not replayed, active SSE respects the server deadline, and timers are released.');
+    console.log('Batch Stop checks passed: sequential/parallel SSE cancellation, queued work, persisted success/failure reconciliation, retry gating and rate-limit wait.');
     globalThis.__clientTestComplete = true;
 })().then(() => {
     assert.equal(globalThis.__clientTestComplete, true, 'client interaction checks did not reach completion');

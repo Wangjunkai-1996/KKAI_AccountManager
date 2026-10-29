@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -438,24 +439,58 @@ type sub2ListResponse struct {
 // current remote account state. A failed lookup is marked stale/unknown so a
 // transient management API failure cannot be mistaken for a deleted account.
 type sub2AccountStatus struct {
-	Exists                  bool      `json:"exists"`
-	Imported                bool      `json:"imported"`
-	Sub2AccountID           int64     `json:"sub2_account_id,omitempty"`
-	Status                  string    `json:"status,omitempty"`
-	Schedulable             *bool     `json:"schedulable,omitempty"`
-	EffectiveSchedulable    *bool     `json:"effective_schedulable,omitempty"`
-	ErrorMessage            string    `json:"error_message,omitempty"`
-	RateLimitedAt           any       `json:"rate_limited_at,omitempty"`
-	RateLimitResetAt        any       `json:"rate_limit_reset_at,omitempty"`
-	OverloadUntil           any       `json:"overload_until,omitempty"`
-	TempUnschedulableUntil  any       `json:"temp_unschedulable_until,omitempty"`
-	TempUnschedulableReason string    `json:"temp_unschedulable_reason,omitempty"`
-	ExpiresAt               any       `json:"expires_at,omitempty"`
-	CheckedAt               time.Time `json:"checked_at"`
-	Stale                   bool      `json:"stale,omitempty"`
-	Error                   string    `json:"error,omitempty"`
-	Unknown                 bool      `json:"unknown,omitempty"`
-	AssociationStatus       string    `json:"association_status,omitempty"`
+	Exists                  bool       `json:"exists"`
+	Imported                bool       `json:"imported"`
+	Sub2AccountID           int64      `json:"sub2_account_id,omitempty"`
+	Status                  string     `json:"status,omitempty"`
+	Schedulable             *bool      `json:"schedulable,omitempty"`
+	EffectiveSchedulable    *bool      `json:"effective_schedulable,omitempty"`
+	ErrorMessage            string     `json:"error_message,omitempty"`
+	RateLimitedAt           any        `json:"rate_limited_at,omitempty"`
+	RateLimitResetAt        any        `json:"rate_limit_reset_at,omitempty"`
+	OverloadUntil           any        `json:"overload_until,omitempty"`
+	TempUnschedulableUntil  any        `json:"temp_unschedulable_until,omitempty"`
+	TempUnschedulableReason string     `json:"temp_unschedulable_reason,omitempty"`
+	ExpiresAt               any        `json:"expires_at,omitempty"`
+	CheckedAt               time.Time  `json:"checked_at"`
+	Stale                   bool       `json:"stale,omitempty"`
+	Error                   string     `json:"error,omitempty"`
+	Unknown                 bool       `json:"unknown,omitempty"`
+	AssociationStatus       string     `json:"association_status,omitempty"`
+	Quota                   *sub2Quota `json:"quota,omitempty"`
+	UsageUnknown            bool       `json:"usage_unknown,omitempty"`
+	UsageStale              bool       `json:"usage_stale,omitempty"`
+	UsageError              string     `json:"usage_error,omitempty"`
+}
+
+type sub2UsageWindow struct {
+	UsedPercent       *float64 `json:"used_percent,omitempty"`
+	ResetAt           any      `json:"reset_at,omitempty"`
+	ResetAfterSeconds *float64 `json:"reset_after_seconds,omitempty"`
+	WindowMinutes     *float64 `json:"window_minutes,omitempty"`
+	RemainingSeconds  *float64 `json:"remaining_seconds,omitempty"`
+	UsedRequests      *float64 `json:"used_requests,omitempty"`
+	LimitRequests     *float64 `json:"limit_requests,omitempty"`
+}
+
+type sub2Credits struct {
+	Balance    string `json:"balance,omitempty"`
+	HasCredits *bool  `json:"has_credits,omitempty"`
+	Unlimited  *bool  `json:"unlimited,omitempty"`
+}
+
+// sub2Quota is the small, non-sensitive usage snapshot exposed by Sub2's
+// account detail response. Credentials, fingerprints and private metadata are
+// deliberately excluded.
+type sub2Quota struct {
+	FiveHour       *sub2UsageWindow `json:"five_hour,omitempty"`
+	SevenDay       *sub2UsageWindow `json:"seven_day,omitempty"`
+	SevenDaySonnet *sub2UsageWindow `json:"seven_day_sonnet,omitempty"`
+	SevenDayFable  *sub2UsageWindow `json:"seven_day_fable,omitempty"`
+	ThirtyDay      *sub2UsageWindow `json:"thirty_day,omitempty"`
+	Credits        *sub2Credits     `json:"credits,omitempty"`
+	UpdatedAt      any              `json:"updated_at,omitempty"`
+	Source         string           `json:"source,omitempty"`
 }
 
 var (
@@ -716,6 +751,7 @@ send:
 	}
 	close(jobs)
 	wg.Wait()
+	s.attachSub2Usage(statusCtx, statuses)
 	return statuses
 }
 
@@ -731,6 +767,7 @@ func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, che
 	}
 	if err != nil {
 		if code == http.StatusNotFound {
+			s.recordSub2NotFoundLifecycle(ctx, id, accounts...)
 			status.Exists = false
 			status.Error = "Sub2 账号不存在"
 			return status
@@ -763,6 +800,7 @@ func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, che
 	status.TempUnschedulableUntil = detail["temp_unschedulable_until"]
 	status.TempUnschedulableReason, _ = detail["temp_unschedulable_reason"].(string)
 	status.ExpiresAt = detail["expires_at"]
+	status.Quota = sub2QuotaSnapshot(detail)
 	if value, ok := detail["schedulable"].(bool); ok {
 		status.Schedulable = &value
 		effective := value
@@ -782,6 +820,51 @@ func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, che
 		status.EffectiveSchedulable = &effective
 	}
 	return status
+}
+
+// recordSub2NotFoundLifecycle persists a deletion observation only when the
+// remote ID belongs to an explicit AUTH/Sub2 binding. A missing or ambiguous
+// association is deliberately left as unknown and must not become deletion
+// evidence.
+func (s *sub2ImportService) recordSub2NotFoundLifecycle(ctx context.Context, sub2ID int64, accounts ...store.Account) {
+	if s == nil || s.store == nil || sub2ID <= 0 {
+		return
+	}
+	if len(accounts) == 0 {
+		imports, err := s.store.ListSub2ImportStatuses(ctx)
+		if err != nil {
+			return
+		}
+		for _, task := range imports {
+			if task.DestinationKey != s.destinationKey || task.Sub2AccountID != sub2ID || task.AccountID <= 0 {
+				continue
+			}
+			account, accountErr := s.store.GetAccountByID(ctx, task.AccountID)
+			if accountErr == nil {
+				s.recordSub2NotFoundLifecycle(ctx, sub2ID, account)
+			}
+		}
+		return
+	}
+	for _, account := range accounts {
+		if account.ID <= 0 || strings.TrimSpace(account.Email) == "" {
+			continue
+		}
+		task, err := s.store.GetSub2Import(ctx, s.destinationKey, account.ID)
+		if err != nil || task.Sub2AccountID != sub2ID || task.Sub2AccountID <= 0 {
+			continue
+		}
+		_, _ = s.store.RecordLifecycleEvent(ctx, store.LifecycleEvent{
+			AccountID:  account.ID,
+			Email:      account.Email,
+			Source:     "sub2",
+			Status:     "deleted",
+			Reason:     "Sub2 账号不存在",
+			Code:       "not_found",
+			HTTPStatus: http.StatusNotFound,
+			DedupeKey:  fmt.Sprintf("sub2:%s:%d:not_found", s.destinationKey, sub2ID),
+		})
+	}
 }
 
 func (s *sub2ImportService) cachedSub2AccountDetail(ctx context.Context, id int64) (map[string]any, int, error) {
@@ -849,6 +932,350 @@ func remoteStatusTime(value any) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+func optionalNumber(value any) (*float64, bool) {
+	switch value.(type) {
+	case float64, json.Number, int, int64:
+		parsed := toFloat(value)
+		return &parsed, true
+	default:
+		return nil, false
+	}
+}
+
+func optionalBool(value any) (*bool, bool) {
+	parsed, ok := value.(bool)
+	if !ok {
+		return nil, false
+	}
+	return &parsed, true
+}
+
+func sub2QuotaSnapshot(detail map[string]any) *sub2Quota {
+	extra, ok := detail["extra"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	window := func(prefix string) (*sub2UsageWindow, bool) {
+		result := &sub2UsageWindow{}
+		found := false
+		if value, ok := optionalNumber(extra[prefix+"_used_percent"]); ok {
+			result.UsedPercent, found = value, true
+		}
+		if value, ok := extra[prefix+"_reset_at"]; ok && value != nil {
+			result.ResetAt, found = value, true
+		}
+		if value, ok := optionalNumber(extra[prefix+"_reset_after_seconds"]); ok {
+			result.ResetAfterSeconds, found = value, true
+		}
+		if value, ok := optionalNumber(extra[prefix+"_window_minutes"]); ok {
+			result.WindowMinutes, found = value, true
+		}
+		return result, found
+	}
+	fiveHour, hasFiveHour := window("codex_5h")
+	sevenDay, hasSevenDay := window("codex_7d")
+	result := &sub2Quota{Source: "Sub2 extra"}
+	if hasFiveHour {
+		result.FiveHour = fiveHour
+	}
+	if hasSevenDay {
+		result.SevenDay = sevenDay
+	}
+	if value, ok := extra["codex_usage_updated_at"]; ok && value != nil {
+		result.UpdatedAt = value
+	}
+	if snapshot, ok := extra["codex_credits_snapshot"].(map[string]any); ok {
+		if credits, ok := snapshot["credits"].(map[string]any); ok {
+			result.Credits = &sub2Credits{}
+			if balance, ok := credits["balance"].(string); ok {
+				result.Credits.Balance = balance
+			}
+			result.Credits.HasCredits, _ = optionalBool(credits["has_credits"])
+			result.Credits.Unlimited, _ = optionalBool(credits["unlimited"])
+		}
+	}
+	if !hasFiveHour && !hasSevenDay && result.UpdatedAt == nil && result.Credits == nil {
+		return nil
+	}
+	return result
+}
+
+// sub2QuotaFromUsage converts Sub2's UsageInfo shape into the small snapshot
+// used by AUTH. It deliberately keeps only percentages and reset metadata;
+// the upstream response may contain provider-specific fields that should not
+// be copied into the account table.
+func sub2QuotaFromUsage(value map[string]any) *sub2Quota {
+	if value == nil {
+		return nil
+	}
+	window := func(input any) (*sub2UsageWindow, bool) {
+		item, ok := input.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		result := &sub2UsageWindow{}
+		found := false
+		number := func(keys ...string) (*float64, bool) {
+			for _, key := range keys {
+				if parsed, ok := optionalNumber(item[key]); ok {
+					return parsed, true
+				}
+			}
+			return nil, false
+		}
+		if parsed, ok := number("utilization", "used_percent", "usedPercent"); ok {
+			result.UsedPercent, found = parsed, true
+		}
+		for _, key := range []string{"resets_at", "reset_at", "resetsAt", "resetAt"} {
+			if item[key] != nil {
+				result.ResetAt, found = item[key], true
+				break
+			}
+		}
+		if parsed, ok := number("remaining_seconds", "remainingSeconds"); ok {
+			result.RemainingSeconds, found = parsed, true
+		}
+		if parsed, ok := number("used_requests", "usedRequests"); ok {
+			result.UsedRequests, found = parsed, true
+		}
+		if parsed, ok := number("limit_requests", "limitRequests"); ok {
+			result.LimitRequests, found = parsed, true
+		}
+		if parsed, ok := number("reset_after_seconds", "resetAfterSeconds"); ok {
+			result.ResetAfterSeconds, found = parsed, true
+		}
+		if parsed, ok := number("window_minutes", "windowMinutes"); ok {
+			result.WindowMinutes, found = parsed, true
+		}
+		return result, found
+	}
+	result := &sub2Quota{}
+	for key, target := range map[string]**sub2UsageWindow{
+		"five_hour":        &result.FiveHour,
+		"seven_day":        &result.SevenDay,
+		"seven_day_sonnet": &result.SevenDaySonnet,
+		"seven_day_fable":  &result.SevenDayFable,
+		"thirty_day":       &result.ThirtyDay,
+	} {
+		if parsed, ok := window(value[key]); ok {
+			*target = parsed
+		}
+	}
+	if source, ok := value["source"].(string); ok {
+		result.Source = source
+	}
+	result.UpdatedAt = value["updated_at"]
+	if result.FiveHour == nil && result.SevenDay == nil && result.SevenDaySonnet == nil &&
+		result.SevenDayFable == nil && result.ThirtyDay == nil && result.UpdatedAt == nil {
+		return nil
+	}
+	return result
+}
+
+type sub2BatchUsageResponse struct {
+	Usage  map[string]map[string]any  `json:"usage"`
+	Errors map[string]json.RawMessage `json:"errors"`
+}
+
+func decodeSub2UsagePayload(raw json.RawMessage) (map[string]map[string]any, map[string]json.RawMessage) {
+	usage := make(map[string]map[string]any)
+	errorsByID := make(map[string]json.RawMessage)
+	var object map[string]json.RawMessage
+	if len(raw) == 0 || string(raw) == "null" || json.Unmarshal(raw, &object) != nil {
+		return usage, errorsByID
+	}
+	if value, ok := object["usage"]; ok {
+		_ = json.Unmarshal(value, &usage)
+	}
+	if value, ok := object["errors"]; ok {
+		_ = json.Unmarshal(value, &errorsByID)
+	}
+	if len(usage) > 0 || len(errorsByID) > 0 || object["usage"] != nil || object["errors"] != nil {
+		return usage, errorsByID
+	}
+	for id, value := range object {
+		var item map[string]any
+		if json.Unmarshal(value, &item) == nil {
+			usage[id] = item
+		}
+	}
+	return usage, errorsByID
+}
+
+func sub2UsageErrorText(raw json.RawMessage) string {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return "Sub2 额度查询失败"
+	}
+	if message, ok := value.(string); ok && strings.TrimSpace(message) != "" {
+		return message
+	}
+	if object, ok := value.(map[string]any); ok {
+		for _, key := range []string{"message", "error", "detail", "reason"} {
+			if message, ok := object[key].(string); ok && strings.TrimSpace(message) != "" {
+				return message
+			}
+		}
+	}
+	return "Sub2 额度查询失败"
+}
+
+// sub2AccountUsageBatch reads cached/passive snapshots in one request. A
+// usage failure is returned separately from the HTTP error so callers can
+// retain a verified account existence/status result.
+func (s *sub2ImportService) sub2AccountUsageBatch(ctx context.Context, ids []int64) (map[int64]*sub2Quota, map[int64]string, error) {
+	usage := make(map[int64]*sub2Quota)
+	errorsByID := make(map[int64]string)
+	unique := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	if len(unique) == 0 {
+		return usage, errorsByID, nil
+	}
+	body, err := json.Marshal(map[string]any{"account_ids": unique, "force": false})
+	if err != nil {
+		return usage, errorsByID, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/admin/accounts/usage/batch", bytes.NewReader(body))
+	if err != nil {
+		return usage, errorsByID, err
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("x-api-key", s.adminAPIKey)
+	response, err := s.client.Do(request)
+	if err != nil {
+		return usage, errorsByID, err
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(response.Body, 2<<20))
+	if err != nil {
+		return usage, errorsByID, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return usage, errorsByID, recoveryHTTPError(response.StatusCode, recoveryRetryAfter(response.Header.Get("Retry-After")))
+	}
+	var envelope struct {
+		Code    int                        `json:"code"`
+		Message string                     `json:"message"`
+		Data    json.RawMessage            `json:"data"`
+		Usage   map[string]map[string]any  `json:"usage"`
+		Errors  map[string]json.RawMessage `json:"errors"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return usage, errorsByID, errors.New("Sub2 额度查询返回格式无效")
+	}
+	if envelope.Code != 0 {
+		message := envelope.Message
+		if message == "" {
+			message = "Sub2 额度查询失败"
+		}
+		return usage, errorsByID, errors.New(message)
+	}
+	payload := sub2BatchUsageResponse{Usage: envelope.Usage, Errors: envelope.Errors}
+	dataUsage, dataErrors := decodeSub2UsagePayload(envelope.Data)
+	if len(dataUsage) > 0 || len(dataErrors) > 0 {
+		payload.Usage, payload.Errors = dataUsage, dataErrors
+	}
+	for rawID, item := range payload.Usage {
+		id, parseErr := strconv.ParseInt(rawID, 10, 64)
+		if parseErr != nil || id <= 0 {
+			continue
+		}
+		if snapshot := sub2QuotaFromUsage(item); snapshot != nil {
+			usage[id] = snapshot
+		}
+	}
+	for rawID, rawMessage := range payload.Errors {
+		id, parseErr := strconv.ParseInt(rawID, 10, 64)
+		if parseErr == nil && id > 0 {
+			if message := sub2UsageErrorText(rawMessage); message != "" {
+				errorsByID[id] = message
+			}
+		}
+	}
+	return usage, errorsByID, nil
+}
+
+func (s *sub2ImportService) attachSub2Usage(ctx context.Context, statuses map[int64]sub2AccountStatus) {
+	if len(statuses) == 0 {
+		return
+	}
+	remoteIDs := make([]int64, 0, len(statuses))
+	for _, status := range statuses {
+		if status.Exists && status.Sub2AccountID > 0 {
+			remoteIDs = append(remoteIDs, status.Sub2AccountID)
+		}
+	}
+	if len(remoteIDs) == 0 {
+		return
+	}
+	usage, errorsByID, err := s.sub2AccountUsageBatch(ctx, remoteIDs)
+	for accountID, status := range statuses {
+		if !status.Exists || status.Sub2AccountID <= 0 {
+			continue
+		}
+		if err != nil {
+			status.UsageUnknown, status.UsageStale, status.UsageError = true, true, err.Error()
+			statuses[accountID] = status
+			continue
+		}
+		if snapshot, ok := usage[status.Sub2AccountID]; ok {
+			status.Quota = mergeSub2Quota(status.Quota, snapshot)
+			status.UsageUnknown, status.UsageStale, status.UsageError = false, false, ""
+		} else if message := errorsByID[status.Sub2AccountID]; message != "" {
+			status.UsageUnknown, status.UsageStale, status.UsageError = true, true, message
+		} else if status.Quota == nil {
+			status.UsageUnknown, status.UsageStale, status.UsageError = true, true, "Sub2 未返回额度数据"
+		}
+		statuses[accountID] = status
+	}
+}
+
+func mergeSub2Quota(base, update *sub2Quota) *sub2Quota {
+	if base == nil {
+		return update
+	}
+	if update == nil {
+		return base
+	}
+	merged := *base
+	if update.FiveHour != nil {
+		merged.FiveHour = update.FiveHour
+	}
+	if update.SevenDay != nil {
+		merged.SevenDay = update.SevenDay
+	}
+	if update.SevenDaySonnet != nil {
+		merged.SevenDaySonnet = update.SevenDaySonnet
+	}
+	if update.SevenDayFable != nil {
+		merged.SevenDayFable = update.SevenDayFable
+	}
+	if update.ThirtyDay != nil {
+		merged.ThirtyDay = update.ThirtyDay
+	}
+	if update.Credits != nil {
+		merged.Credits = update.Credits
+	}
+	if update.UpdatedAt != nil {
+		merged.UpdatedAt = update.UpdatedAt
+	}
+	if update.Source != "" {
+		merged.Source = update.Source
+	}
+	return &merged
 }
 
 func (s *sub2ImportService) apiJSON(ctx context.Context, method, path string, query url.Values, out any) error {
@@ -1133,6 +1560,10 @@ func toFloat(value any) float64 {
 	switch v := value.(type) {
 	case float64:
 		return v
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
 	case json.Number:
 		f, _ := v.Float64()
 		return f

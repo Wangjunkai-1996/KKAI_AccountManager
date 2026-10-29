@@ -108,7 +108,9 @@ func (s *sub2RecoveryService) processNextCredentialRepair() bool {
 	repair, err := s.store.ClaimCredentialRepair(ctx, time.Now())
 	cancel()
 	if err != nil {
-		s.pauseRecovery(0)
+		if !errors.Is(err, store.ErrQueueDeferred) || !retryStorageRead(s.ctx, err) {
+			s.pauseRecovery(0, err)
+		}
 		return false
 	}
 	if repair == nil {
@@ -122,7 +124,7 @@ func (s *sub2RecoveryService) finishCredentialRepair(repair store.CredentialRepa
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.store.FinishCredentialRepair(ctx, repair, state, message, next); err != nil {
-		s.pauseRecovery(0)
+		s.pauseRecovery(0, err)
 	}
 }
 
@@ -152,7 +154,7 @@ func (s *sub2RecoveryService) processCredentialRepair(repair store.CredentialRep
 	defer lease.Release()
 	latestRepair, err := s.store.GetCredentialRepair(ctx, repair.AccountID)
 	if err != nil {
-		s.pauseRecovery(0)
+		s.pauseRecovery(0, err)
 		return
 	}
 	if latestRepair.Revision != repair.Revision || latestRepair.State != "checking" {
@@ -281,7 +283,7 @@ func (s *sub2RecoveryService) loginCredentialRepair(ctx context.Context, repair 
 	}
 	defer attempt.Release()
 	if err := s.store.SetCredentialRepairAttempt(ctx, repair, attempt.ID); err != nil {
-		s.pauseRecovery(0)
+		s.pauseRecovery(0, err)
 		return
 	}
 	result, loginErr := s.loginWithProxies(ctx, credentials.Email, credentials.Password, credentials.TOTPSecret, credentials.Proxy, "")
@@ -295,7 +297,7 @@ func (s *sub2RecoveryService) loginCredentialRepair(ctx context.Context, repair 
 	if loginErr != nil {
 		info := describeLoginError(loginErr)
 		if err := s.store.FinishAttempt(finishCtx, attempt.ID, false, nil, &store.Failure{Stage: info.Stage, Code: info.Code, HTTPStatus: info.HTTPStatus, Retryable: info.Retryable, Message: info.Message, AccountStatus: info.AccountStatus}); err != nil {
-			s.pauseRecovery(0)
+			s.pauseRecovery(0, err)
 			return
 		}
 		if accountDeactivationConfirmed(info.Code) {
@@ -313,7 +315,7 @@ func (s *sub2RecoveryService) loginCredentialRepair(ctx context.Context, repair 
 		err = s.store.FinishAttempt(finishCtx, attempt.ID, true, stored, nil)
 	}
 	if err != nil {
-		s.pauseRecovery(0)
+		s.pauseRecovery(0, err)
 		return
 	}
 	s.finishCredentialRepair(repair, "completed", "新资料已登录成功，后台继续处理交付", nil)

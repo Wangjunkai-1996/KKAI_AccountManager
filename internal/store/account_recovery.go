@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -38,29 +39,54 @@ const (
 // AccountRecoveryTask is the durable state for one AUTH account's Sub2
 // recovery. It contains identifiers and redacted errors only.
 type AccountRecoveryTask struct {
-	ID                        int64      `json:"id"`
-	AccountID                 int64      `json:"account_id"`
-	AccountEmail              string     `json:"email,omitempty"`
-	CheckID                   int64      `json:"check_id,omitempty"`
-	SourceCredentialAttemptID int64      `json:"source_credential_attempt_id"`
-	ResultCredentialAttemptID int64      `json:"result_credential_attempt_id,omitempty"`
-	Resumable                 bool       `json:"resumable"`
-	Sub2AccountID             int64      `json:"sub2_account_id"`
-	DestinationKey            string     `json:"-"`
-	OriginalSchedulable       bool       `json:"original_schedulable"`
-	Purpose                   string     `json:"purpose"`
-	DeliveryID                int64      `json:"delivery_id,omitempty"`
-	State                     string     `json:"state"`
-	LastError                 string     `json:"last_error,omitempty"`
-	FailureStage              string     `json:"failure_stage,omitempty"`
-	ErrorCode                 string     `json:"error_code,omitempty"`
-	RetryAction               string     `json:"retry_action,omitempty"`
-	NextRetryAt               *time.Time `json:"next_retry_at,omitempty"`
-	RetryCount                int        `json:"retry_count"`
-	ManualAction              string     `json:"manual_action,omitempty"`
-	RequiresAction            bool       `json:"requires_action"`
-	CreatedAt                 time.Time  `json:"created_at"`
-	UpdatedAt                 time.Time  `json:"updated_at"`
+	ID                        int64               `json:"id"`
+	AccountID                 int64               `json:"account_id"`
+	AccountEmail              string              `json:"email,omitempty"`
+	CheckID                   int64               `json:"check_id,omitempty"`
+	SourceCredentialAttemptID int64               `json:"source_credential_attempt_id"`
+	ResultCredentialAttemptID int64               `json:"result_credential_attempt_id,omitempty"`
+	Resumable                 bool                `json:"resumable"`
+	Sub2AccountID             int64               `json:"sub2_account_id"`
+	DestinationKey            string              `json:"-"`
+	OriginalSchedulable       bool                `json:"original_schedulable"`
+	Purpose                   string              `json:"purpose"`
+	DeliveryID                int64               `json:"delivery_id,omitempty"`
+	State                     string              `json:"state"`
+	LastError                 string              `json:"last_error,omitempty"`
+	FailureStage              string              `json:"failure_stage,omitempty"`
+	ErrorCode                 string              `json:"error_code,omitempty"`
+	HTTPStatus                int                 `json:"http_status,omitempty"`
+	Diagnostic                *RecoveryDiagnostic `json:"diagnostic,omitempty"`
+	RetryAction               string              `json:"retry_action,omitempty"`
+	NextRetryAt               *time.Time          `json:"next_retry_at,omitempty"`
+	RetryCount                int                 `json:"retry_count"`
+	ManualAction              string              `json:"manual_action,omitempty"`
+	RequiresAction            bool                `json:"requires_action"`
+	CreatedAt                 time.Time           `json:"created_at"`
+	UpdatedAt                 time.Time           `json:"updated_at"`
+}
+
+// RecoveryDiagnostic contains a bounded, structured explanation for an
+// operator action. It deliberately has no upstream response or credential
+// fields; callers may persist only these fixed integer identifiers.
+type RecoveryDiagnostic struct {
+	CurrentGroupIDs []int64 `json:"current_group_ids"`
+	TargetGroupIDs  []int64 `json:"target_group_ids"`
+}
+
+// AccountRecoveryFailureEvent is an append-only, redacted failure record. It
+// intentionally excludes LastError because that field is a user-facing retry
+// message and must never become an upstream response archive.
+type AccountRecoveryFailureEvent struct {
+	ID           int64               `json:"id"`
+	TaskID       int64               `json:"task_id"`
+	Purpose      string              `json:"purpose,omitempty"`
+	FailureStage string              `json:"failure_stage,omitempty"`
+	ErrorCode    string              `json:"error_code,omitempty"`
+	HTTPStatus   int                 `json:"http_status,omitempty"`
+	RetryCount   int                 `json:"retry_count"`
+	Diagnostic   *RecoveryDiagnostic `json:"diagnostic,omitempty"`
+	CreatedAt    time.Time           `json:"created_at"`
 }
 
 // RecoveryFailure contains only the caller's redacted classification.
@@ -73,6 +99,8 @@ type RecoveryFailure struct {
 	RetryAction  string
 	NextRetryAt  *time.Time
 	ManualAction string
+	HTTPStatus   int
+	Diagnostic   *RecoveryDiagnostic
 	// ExpectedState enables a snapshot fence. RetryCount distinguishes failed
 	// rounds even when their state and millisecond timestamp are identical.
 	ExpectedState      string
@@ -97,6 +125,8 @@ CREATE TABLE IF NOT EXISTS account_recovery_tasks (
  last_error TEXT NOT NULL DEFAULT '',
  failure_stage TEXT NOT NULL DEFAULT '',
  error_code TEXT NOT NULL DEFAULT '',
+ probe_http_status INTEGER NOT NULL DEFAULT 0,
+ diagnostic_json TEXT NOT NULL DEFAULT '',
  retry_action TEXT NOT NULL DEFAULT '',
  next_retry_at INTEGER,
  retry_count INTEGER NOT NULL DEFAULT 0,
@@ -139,6 +169,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS account_recovery_one_active ON account_recover
 		{"delivery_id", "INTEGER NOT NULL DEFAULT 0"},
 		{"failure_stage", "TEXT NOT NULL DEFAULT ''"},
 		{"error_code", "TEXT NOT NULL DEFAULT ''"},
+		{"probe_http_status", "INTEGER NOT NULL DEFAULT 0"},
+		{"diagnostic_json", "TEXT NOT NULL DEFAULT ''"},
 		{"retry_action", "TEXT NOT NULL DEFAULT ''"},
 		{"next_retry_at", "INTEGER"},
 		{"retry_count", "INTEGER NOT NULL DEFAULT 0"},
@@ -163,7 +195,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS account_recovery_one_active ON account_recover
 	if err := s.migrateAccountRecoveryRechecks(); err != nil {
 		return err
 	}
+	if err := s.migrateAccountRecoveryFailureEvents(); err != nil {
+		return err
+	}
 	return s.migrateCredentialRepairs()
+}
+
+func (s *Store) migrateAccountRecoveryFailureEvents() error {
+	_, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS account_recovery_failures (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ task_id INTEGER NOT NULL,
+ failure_stage TEXT NOT NULL DEFAULT '',
+ error_code TEXT NOT NULL DEFAULT '',
+ http_status INTEGER NOT NULL DEFAULT 0,
+ retry_count INTEGER NOT NULL DEFAULT 0,
+ diagnostic_json TEXT NOT NULL DEFAULT '',
+ created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS account_recovery_failures_task ON account_recovery_failures(task_id,id DESC);
+`)
+	return err
 }
 
 // RecoverAccountRecoveryTasks marks in-flight work as unknown after a process
@@ -183,7 +235,7 @@ func (s *Store) RecoverAccountRecoveryTasks(ctx context.Context) error {
 	return err
 }
 
-const accountRecoverySelect = `SELECT t.id,t.account_id,COALESCE(a.email,''),t.check_id,t.source_credential_attempt_id,t.result_credential_attempt_id,t.sub2_account_id,t.original_schedulable,t.purpose,t.delivery_id,t.destination_key,t.state,t.last_error,t.failure_stage,t.error_code,t.retry_action,t.next_retry_at,t.retry_count,t.manual_action,t.created_at,t.updated_at,COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=t.account_id AND status='success'),0) FROM account_recovery_tasks t LEFT JOIN accounts a ON a.id=t.account_id`
+const accountRecoverySelect = `SELECT t.id,t.account_id,COALESCE(a.email,''),t.check_id,t.source_credential_attempt_id,t.result_credential_attempt_id,t.sub2_account_id,t.original_schedulable,t.purpose,t.delivery_id,t.destination_key,t.state,t.last_error,t.failure_stage,t.error_code,t.probe_http_status,t.diagnostic_json,t.retry_action,t.next_retry_at,t.retry_count,t.manual_action,t.created_at,t.updated_at,COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=t.account_id AND status='success'),0) FROM account_recovery_tasks t LEFT JOIN accounts a ON a.id=t.account_id`
 
 func recoveryDestination(destinations []string) string {
 	if len(destinations) == 0 {
@@ -196,7 +248,8 @@ func scanAccountRecoveryTask(row scanner) (AccountRecoveryTask, error) {
 	var task AccountRecoveryTask
 	var original, created, updated, currentVersion int64
 	var nextRetry sql.NullInt64
-	if err := row.Scan(&task.ID, &task.AccountID, &task.AccountEmail, &task.CheckID, &task.SourceCredentialAttemptID, &task.ResultCredentialAttemptID, &task.Sub2AccountID, &original, &task.Purpose, &task.DeliveryID, &task.DestinationKey, &task.State, &task.LastError, &task.FailureStage, &task.ErrorCode, &task.RetryAction, &nextRetry, &task.RetryCount, &task.ManualAction, &created, &updated, &currentVersion); err != nil {
+	var diagnostic string
+	if err := row.Scan(&task.ID, &task.AccountID, &task.AccountEmail, &task.CheckID, &task.SourceCredentialAttemptID, &task.ResultCredentialAttemptID, &task.Sub2AccountID, &original, &task.Purpose, &task.DeliveryID, &task.DestinationKey, &task.State, &task.LastError, &task.FailureStage, &task.ErrorCode, &task.HTTPStatus, &diagnostic, &task.RetryAction, &nextRetry, &task.RetryCount, &task.ManualAction, &created, &updated, &currentVersion); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return AccountRecoveryTask{}, ErrAccountRecoveryNotFound
 		}
@@ -205,6 +258,12 @@ func scanAccountRecoveryTask(row scanner) (AccountRecoveryTask, error) {
 	task.OriginalSchedulable = original != 0
 	task.Resumable = task.ResultCredentialAttemptID > 0 && task.ResultCredentialAttemptID == currentVersion && task.RetryAction != "relogin" && (task.State == RecoveryFailed || task.State == RecoveryUnknown)
 	task.RequiresAction = task.RetryAction == "manual" || task.ManualAction != ""
+	if strings.TrimSpace(diagnostic) != "" {
+		var parsed RecoveryDiagnostic
+		if json.Unmarshal([]byte(diagnostic), &parsed) == nil {
+			task.Diagnostic = &parsed
+		}
+	}
 	if nextRetry.Valid {
 		next := time.UnixMilli(nextRetry.Int64)
 		task.NextRetryAt = &next
@@ -410,20 +469,29 @@ func (s *Store) ClaimAccountRecoveryTask(ctx context.Context, id int64) (Account
 	if id <= 0 {
 		return AccountRecoveryTask{}, ErrAccountRecoveryNotFound
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE account_recovery_tasks SET state='validating',updated_at=? WHERE id=? AND state='queued'`, time.Now().UnixMilli(), id)
+	tx, err := s.beginQueueTx(ctx)
+	if err != nil {
+		return AccountRecoveryTask{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE account_recovery_tasks SET state='validating',updated_at=? WHERE id=? AND state='queued'`, time.Now().UnixMilli(), id)
 	if err != nil {
 		return AccountRecoveryTask{}, err
 	}
 	if n, err := result.RowsAffected(); err != nil {
 		return AccountRecoveryTask{}, err
 	} else if n == 0 {
-		task, getErr := s.GetAccountRecoveryTaskByID(ctx, id)
+		task, getErr := scanAccountRecoveryTask(tx.QueryRowContext(ctx, accountRecoverySelect+` WHERE t.id=?`, id))
 		if getErr != nil {
 			return AccountRecoveryTask{}, getErr
 		}
 		return task, ErrAccountRecoveryNotQueued
 	}
-	return s.GetAccountRecoveryTaskByID(ctx, id)
+	task, err := scanAccountRecoveryTask(tx.QueryRowContext(ctx, accountRecoverySelect+` WHERE t.id=?`, id))
+	if err != nil {
+		return AccountRecoveryTask{}, err
+	}
+	return task, tx.Commit()
 }
 
 // UpdateAccountRecoveryTask records a state transition and a redacted error.
@@ -441,7 +509,7 @@ func (s *Store) UpdateAccountRecoveryTask(ctx context.Context, id int64, state, 
 	}
 	defer tx.Rollback()
 	now := time.Now().UnixMilli()
-	result, err := tx.ExecContext(ctx, `UPDATE account_recovery_tasks SET state=?,last_error=?,next_retry_at=NULL,manual_action='',failure_stage=CASE WHEN ? THEN '' ELSE failure_stage END,error_code=CASE WHEN ? THEN '' ELSE error_code END,retry_action=CASE WHEN ? THEN '' ELSE retry_action END,updated_at=? WHERE id=?`, state, strings.TrimSpace(lastError), state == RecoveryCompleted, state == RecoveryCompleted, state == RecoveryCompleted, now, id)
+	result, err := tx.ExecContext(ctx, `UPDATE account_recovery_tasks SET state=?,last_error=?,next_retry_at=NULL,manual_action='',failure_stage=CASE WHEN ? THEN '' ELSE failure_stage END,error_code=CASE WHEN ? THEN '' ELSE error_code END,probe_http_status=CASE WHEN ? THEN 0 ELSE probe_http_status END,diagnostic_json=CASE WHEN ? THEN '' ELSE diagnostic_json END,retry_action=CASE WHEN ? THEN '' ELSE retry_action END,updated_at=? WHERE id=?`, state, strings.TrimSpace(lastError), state == RecoveryCompleted, state == RecoveryCompleted, state == RecoveryCompleted, state == RecoveryCompleted, state == RecoveryCompleted, now, id)
 	if err != nil {
 		return AccountRecoveryTask{}, err
 	}
@@ -482,8 +550,14 @@ func (s *Store) RecordAccountRecoveryFailure(ctx context.Context, id int64, fail
 		}
 		next = failure.NextRetryAt.UnixMilli()
 	}
-	query := `UPDATE account_recovery_tasks SET state=?,last_error=?,failure_stage=?,error_code=?,retry_action=?,next_retry_at=?,retry_count=retry_count+1,manual_action=?,updated_at=? WHERE id=? AND state NOT IN ('completed','canceled')`
-	args := []any{failure.State, strings.TrimSpace(failure.Message), strings.TrimSpace(failure.Stage), strings.TrimSpace(failure.Code), failure.RetryAction, next, strings.TrimSpace(failure.ManualAction), time.Now().UnixMilli(), id}
+	httpStatus := failure.HTTPStatus
+	if httpStatus < 100 || httpStatus > 599 {
+		httpStatus = 0
+	}
+	diagnosticJSON := recoveryDiagnosticJSON(failure.Diagnostic)
+	now := time.Now().UnixMilli()
+	query := `UPDATE account_recovery_tasks SET state=?,last_error=?,failure_stage=?,error_code=?,probe_http_status=?,diagnostic_json=?,retry_action=?,next_retry_at=?,retry_count=retry_count+1,manual_action=?,updated_at=? WHERE id=? AND state NOT IN ('completed','canceled')`
+	args := []any{failure.State, strings.TrimSpace(failure.Message), strings.TrimSpace(failure.Stage), strings.TrimSpace(failure.Code), httpStatus, diagnosticJSON, failure.RetryAction, next, strings.TrimSpace(failure.ManualAction), now, id}
 	if strings.TrimSpace(failure.ExpectedState) != "" {
 		query += ` AND state=? AND retry_count=?`
 		args = append(args, strings.TrimSpace(failure.ExpectedState), failure.ExpectedRetryCount)
@@ -492,13 +566,19 @@ func (s *Store) RecordAccountRecoveryFailure(ctx context.Context, id int64, fail
 		query += ` AND updated_at=?`
 		args = append(args, failure.ExpectedUpdatedAt)
 	}
-	result, err := s.db.ExecContext(ctx, query, args...)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AccountRecoveryTask{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return AccountRecoveryTask{}, err
 	}
 	if n, err := result.RowsAffected(); err != nil {
 		return AccountRecoveryTask{}, err
 	} else if n == 0 {
+		_ = tx.Rollback()
 		task, err := s.GetAccountRecoveryTaskByID(ctx, id)
 		if err != nil {
 			return task, err
@@ -508,7 +588,78 @@ func (s *Store) RecordAccountRecoveryFailure(ctx context.Context, id int64, fail
 		}
 		return task, ErrAccountRecoveryNotResumable
 	}
+	var retryCount int
+	if err := tx.QueryRowContext(ctx, `SELECT retry_count FROM account_recovery_tasks WHERE id=?`, id).Scan(&retryCount); err != nil {
+		return AccountRecoveryTask{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO account_recovery_failures(task_id,failure_stage,error_code,http_status,retry_count,diagnostic_json,created_at) VALUES(?,?,?,?,?,?,?)`, id, strings.TrimSpace(failure.Stage), strings.TrimSpace(failure.Code), httpStatus, retryCount, diagnosticJSON, now); err != nil {
+		return AccountRecoveryTask{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AccountRecoveryTask{}, err
+	}
 	return s.GetAccountRecoveryTaskByID(ctx, id)
+}
+
+func recoveryDiagnosticJSON(diagnostic *RecoveryDiagnostic) string {
+	if diagnostic == nil {
+		return ""
+	}
+	raw, err := json.Marshal(diagnostic)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+// ListAccountRecoveryFailureEvents returns only fixed classifications and
+// statuses. The extra row lets the history endpoint signal that older records
+// exist without returning an unbounded event log.
+func (s *Store) ListAccountRecoveryFailureEvents(ctx context.Context, accountID int64, limit int, destinations ...string) ([]AccountRecoveryFailureEvent, bool, error) {
+	if accountID <= 0 {
+		return nil, false, ErrAccountRecoveryNotFound
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	query := `SELECT f.id,f.task_id,t.purpose,f.failure_stage,f.error_code,f.http_status,f.retry_count,f.diagnostic_json,f.created_at FROM account_recovery_failures f JOIN account_recovery_tasks t ON t.id=f.task_id WHERE t.account_id=?`
+	args := []any{accountID}
+	if destination := recoveryDestination(destinations); destination != "" {
+		query += ` AND (t.destination_key=? OR (t.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=t.account_id AND legacy_dest.sub2_account_id=t.sub2_account_id AND legacy_dest.state='imported')=1 AND EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=t.account_id AND i.sub2_account_id=t.sub2_account_id AND i.state='imported')))`
+		args = append(args, destination, destination)
+	}
+	query += ` ORDER BY f.id DESC LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	events := make([]AccountRecoveryFailureEvent, 0, limit)
+	for rows.Next() {
+		var event AccountRecoveryFailureEvent
+		var diagnostic string
+		var created int64
+		if err := rows.Scan(&event.ID, &event.TaskID, &event.Purpose, &event.FailureStage, &event.ErrorCode, &event.HTTPStatus, &event.RetryCount, &diagnostic, &created); err != nil {
+			return nil, false, err
+		}
+		if strings.TrimSpace(diagnostic) != "" {
+			var parsed RecoveryDiagnostic
+			if json.Unmarshal([]byte(diagnostic), &parsed) == nil {
+				event.Diagnostic = &parsed
+			}
+		}
+		event.CreatedAt = time.UnixMilli(created)
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	truncated := len(events) > limit
+	if truncated {
+		events = events[:limit]
+	}
+	return events, truncated, nil
 }
 
 // ListDueAccountRecoveryTasks never selects superseded tasks or tasks needing

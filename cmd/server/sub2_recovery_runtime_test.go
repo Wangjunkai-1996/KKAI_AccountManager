@@ -38,3 +38,19 @@ func TestSub2RecoveryBrowserPermissionRetriesAfterRuntimeRepair(t *testing.T) {
 		t.Fatalf("runtime repair did not resume account recovery: %+v login=%d", got, f.loginCalls)
 	}
 }
+
+func TestSub2RecoveryProbeEvidenceReachesTaskAndHistory(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.service.recordRecoveryFailure(f.task, store.RecoveryValidating, &recoveryOperationError{Code: "upstream_error", HTTPStatus: 503})
+	failure := f.state(t)
+	if failure.ErrorCode != "upstream_error" || failure.FailureStage != store.RecoveryValidating || failure.HTTPStatus != 503 || strings.Contains(failure.LastError, "secret") {
+		t.Fatalf("probe evidence not classified safely: %+v", failure)
+	}
+	events, truncated, err := f.store.ListAccountRecoveryFailureEvents(context.Background(), f.account.ID, 20, "fixture")
+	if err != nil || truncated || len(events) != 1 {
+		t.Fatalf("probe history=%+v truncated=%v err=%v", events, truncated, err)
+	}
+	if events[0].ErrorCode != "upstream_error" || events[0].FailureStage != store.RecoveryValidating || events[0].HTTPStatus != 503 {
+		t.Fatalf("probe history evidence=%+v", events[0])
+	}
+}

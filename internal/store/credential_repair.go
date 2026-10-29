@@ -130,7 +130,7 @@ func (s *Store) ListCredentialRepairs(ctx context.Context) (map[int64]Credential
 }
 
 func (s *Store) ClaimCredentialRepair(ctx context.Context, now time.Time) (*CredentialRepair, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginQueueTx(ctx)
 	if err != nil {
 		return nil, err
 	}

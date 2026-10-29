@@ -433,6 +433,16 @@
             border: 1px solid rgba(248, 113, 113, 0.3);
         }
 
+        .status-icon.stopped {
+            background: rgba(233, 165, 104, 0.1);
+            border: 1px solid rgba(233, 165, 104, 0.3);
+        }
+
+        .status-icon.checking {
+            background: rgba(250, 204, 21, 0.1);
+            border: 1px solid rgba(250, 204, 21, 0.3);
+        }
+
         .status-info {
             min-width: 0;
         }
@@ -491,9 +501,8 @@
             gap: 0.5rem;
         }
 
-        .history-card {
-            animation-delay: 0.3s;
-        }
+        .history-card { padding: 0; border: 0; background: transparent; animation: none; }
+        .history-card:hover { transform: none; box-shadow: none; }
 
         .check-panel { scroll-margin-top: 1rem; }
         .check-controls { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -539,6 +548,10 @@
             color: var(--text-dim);
             font-size: 0.75rem;
         }
+        .history-monitor-details { margin: -.4rem 0 .65rem; color: var(--text-dim); font-size: .73rem; }
+        .history-monitor-details summary { width: max-content; max-width: 100%; cursor: pointer; }
+        .history-monitor-details summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+        .history-monitor-details p { margin-top: .35rem; line-height: 1.5; overflow-wrap: anywhere; }
 
         .history-attention { margin: .75rem 0 1rem; border: 1px solid rgba(233,165,104,.3); border-radius: 8px; background: rgba(233,165,104,.04); }
         .history-attention[hidden] { display: none; }
@@ -556,7 +569,7 @@
             overflow-y: auto;
             display: flex;
             flex-direction: column;
-            gap: 0.75rem;
+            gap: 0;
         }
 
         .history-filter-toolbar {
@@ -766,34 +779,61 @@
             white-space: nowrap;
         }
 
-        .history-account-card { grid-template-columns: 20px minmax(0, 1fr); gap: 0.65rem 0.85rem; padding: 1rem 1.1rem 0.85rem; transition: border-color .15s, background .15s; }
-        .history-account-card .history-select { padding-top: .2rem; }
-        .history-account-card .history-actions { grid-column: 2; padding-top: .7rem; border-top: 1px solid var(--border); }
+        .account-table-controls { display: grid; grid-template-columns: minmax(16rem, 2fr) minmax(20rem, 1.6fr); gap: .75rem; align-items: end; margin-bottom: .75rem; }
+        .account-table-controls .input-group, .account-table-controls .history-filter-toolbar { margin: 0; }
+        .account-table-controls .input-group label { margin-bottom: .35rem; }
+        .account-table-controls input, .account-table-controls select { height: 40px; padding: .5rem .7rem; border-radius: 6px; font-family: inherit; font-size: .82rem; }
+        .account-table-controls .history-filter-toolbar select { margin-top: .35rem; }
+        .account-table-heading, .history-account-card {
+            display: grid;
+            grid-template-columns: 36px minmax(12rem, 1.5fr) minmax(7rem, 1fr) minmax(9rem, 1.3fr) minmax(8rem, 1fr) minmax(10rem, 1.3fr) minmax(11rem, 1.3fr) minmax(7rem, .95fr) minmax(8rem, .9fr);
+            gap: .55rem;
+            align-items: center;
+        }
+        .account-table-heading { padding: .55rem .75rem; color: var(--text-dim); font-size: .72rem; white-space: nowrap; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+        .history-account-card { padding: .55rem .75rem; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; background: transparent; transition: background .15s; }
+        .history-account-card:hover { background: var(--bg-mid); border-color: var(--border); }
+        .history-account-card .history-select { padding-top: 0; align-self: center; }
+        .history-account-card .history-row-identity, .history-account-card .history-row-auth, .history-account-card .history-row-sub2, .history-account-card .history-row-source, .history-account-card .history-row-quota, .history-account-card .history-row-workflow, .history-account-card .history-row-time, .history-account-card .history-row-actions { min-width: 0; overflow-wrap: anywhere; }
+        .history-account-card .history-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: .3rem; flex-wrap: wrap; }
+        .history-account-card .history-actions { padding: 0; border: 0; }
+        .history-account-card .history-row-label { display: none; }
+        .history-account-card .history-row-time { font-size: .73rem; color: var(--text-secondary); }
+        .history-account-card .history-workflow-state { font-size: .8rem; font-weight: 600; }
         .history-heading, .history-identity, .history-state-row { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
         .history-identity { min-width: 0; flex: 1 1 15rem; flex-wrap: nowrap; }
-        .history-account-card .history-email { font-family: inherit; font-size: .95rem; letter-spacing: -.01em; overflow-wrap: anywhere; white-space: normal; }
+        .history-account-card .history-email { font-family: inherit; font-size: .82rem; overflow-wrap: anywhere; white-space: normal; }
         .history-account-number { color: var(--text-dim); font-size: .7rem; flex-shrink: 0; }
         .history-pool-state { display: inline-flex; align-items: center; gap: .4rem; padding: .28rem .6rem; border-radius: 6px; font-size: .7rem; font-weight: 650; white-space: nowrap; }
         .history-pool-state::before { content: ''; width: 6px; height: 6px; background: currentColor; border-radius: 50%; }
         .history-pool-state.present { color: var(--success); background: rgba(110,231,183,.09); border: 1px solid rgba(110,231,183,.2); }
         .history-pool-state.absent { color: #adb9cb; background: rgba(155,168,188,.09); border: 1px solid rgba(155,168,188,.2); }
         .history-pool-state.unknown { color: var(--warning); background: rgba(233,165,104,.09); border: 1px solid rgba(233,165,104,.22); }
-        .history-recovery-count { color: #b3c5ff; background: transparent; border: 1px solid rgba(122,156,255,.2); border-radius: 6px; padding: .28rem .6rem; font: inherit; font-size: .72rem; white-space: nowrap; cursor: pointer; }
+        .history-recovery-count { color: #b3c5ff; background: transparent; border: 1px solid rgba(122,156,255,.2); border-radius: 6px; padding: .18rem .4rem; font: inherit; font-size: .68rem; white-space: nowrap; cursor: pointer; }
         .history-recovery-count:hover, .history-recovery-count[aria-expanded="true"] { background: var(--accent-dim); border-color: #708cd1; }
         .history-state-row { margin-top: .6rem; gap: .4rem; font-size: .73rem; }
         .history-account-card .history-status { padding: .1rem .45rem; border: 0; border-radius: 4px; background: rgba(155,168,188,.07); }
+        .history-source { display: inline-block; padding: .14rem .4rem; border-radius: 4px; font-size: .7rem; line-height: 1.35; }
+        .history-source.official { color: var(--error); background: rgba(248,113,113,.1); }
+        .history-source.sub2 { color: #f3bb8b; background: rgba(233,165,104,.12); }
+        .history-source.unknown { color: var(--warning); background: rgba(233,165,104,.09); }
+        .history-source.neutral { color: var(--text-dim); background: rgba(155,168,188,.07); }
+        .history-quota-summary { display: flex; flex-wrap: wrap; gap: .25rem .4rem; color: var(--text-secondary); font-size: .7rem; line-height: 1.35; }
+        .history-quota-summary span { white-space: nowrap; }
         .history-account-card .history-meta { gap: .45rem; margin-top: .55rem; font-size: .73rem; line-height: 1.6; }
         .history-account-card .history-expiry { padding: 0; border: 0; background: none; }
         .history-plan { color: var(--text-secondary); }
-        .history-diagnostics { margin-top: .65rem; background: rgba(233,165,104,.045); border-radius: 6px; }
-        .history-diagnostics > summary { display: flex; align-items: center; gap: .75rem; padding: .5rem .65rem; color: var(--warning); cursor: pointer; font-size: .78rem; line-height: 1.45; list-style: none; }
+        .history-diagnostics { margin-top: .25rem; border-radius: 4px; min-width: 0; }
+        .history-diagnostics > summary { display: flex; align-items: center; gap: .4rem; padding: .2rem .3rem; color: var(--text-secondary); cursor: pointer; font-size: .72rem; line-height: 1.35; list-style: none; }
+        .history-diagnostics.is-alert { background: rgba(233,165,104,.065); }
+        .history-diagnostics.is-alert > summary { color: var(--warning); }
         .history-diagnostics > summary > span:first-child { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .history-diagnostics > summary::-webkit-details-marker, .history-more > summary::-webkit-details-marker { display: none; }
         .history-summary-hint { font-size: .68rem; color: var(--text-dim); white-space: nowrap; }
         .history-diagnostics[open] > summary > span:first-child { white-space: normal; overflow-wrap: anywhere; }
         .history-diagnostics-body { padding: 0 .65rem .6rem; max-height: 16rem; overflow: auto; }
         .history-latest-recovery { margin-right: auto; color: var(--text-dim); font-size: .72rem; }
-        .history-account-card .history-actions .btn-secondary, .history-more > summary { padding: .4rem .65rem; font-size: .75rem; border-radius: 6px; }
+        .history-account-card .history-actions .btn-secondary, .history-more > summary { padding: .3rem .45rem; font-size: .72rem; border-radius: 4px; }
         .history-account-card .history-primary-action { color: #b3c5ff; background: var(--accent-dim); border-color: rgba(122,156,255,.28); order: 1; }
         .history-account-card .history-primary-action:disabled { background: transparent; }
         .history-more { position: relative; }
@@ -804,6 +844,18 @@
         .history-more[open] > summary { width: max-content; margin-left: auto; }
         .history-more-menu button[data-history-action="delete"] { color: var(--error); margin-left: auto; }
         .history-recovery-count:focus-visible, .history-account-card summary:focus-visible, .history-account-card button:focus-visible { outline: 2px solid #87a4ff; outline-offset: 3px; }
+        @media (max-width: 1100px) {
+            .account-table-heading { display: none; }
+            .history-grid { gap: .5rem; }
+            .history-item.history-account-card { grid-template-columns: 20px repeat(2, minmax(0, 1fr)); gap: .6rem .75rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-mid); }
+            .history-account-card .history-select { align-self: start; padding-top: .15rem; grid-row: 1 / span 3; }
+            .history-account-card .history-row-identity, .history-account-card .history-row-actions { grid-column: 2 / -1; }
+            .history-account-card .history-row-auth, .history-account-card .history-row-workflow { grid-column: 2; }
+            .history-account-card .history-row-sub2, .history-account-card .history-row-quota, .history-account-card .history-row-time { grid-column: 3; }
+            .history-account-card .history-row-source { grid-column: 2; }
+            .history-account-card .history-row-actions { justify-content: flex-start; border-top: 1px solid var(--border); padding-top: .55rem; }
+            .history-account-card .history-row-label { display: block; color: var(--text-dim); font-size: .68rem; margin-bottom: .2rem; }
+        }
         .history-recovery-popover { position: fixed; z-index: 25; width: min(400px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); display: flex; flex-direction: column; padding: 1rem; border: 1px solid rgba(122,156,255,.25); border-radius: 12px; background: #131b29; color: var(--text-primary); box-shadow: 0 18px 64px rgba(0,0,0,.5); }
         .history-recovery-popover[hidden] { display: none; }
         .recovery-popover-heading { display: flex; align-items: center; gap: .75rem; margin-bottom: .7rem; }
@@ -953,10 +1005,11 @@
             .history-actions { grid-column: 1 / -1; }
             .history-actions { justify-content: flex-start; }
             .history-pagination { justify-content: flex-start; }
-            .history-detail-summary { grid-template-columns: 1fr; }
-            .history-account-card { padding: .85rem .75rem; gap: .6rem; }
-            .history-account-card .history-actions { grid-column: 1 / -1; }
-            .history-account-card .history-select { grid-row: 1; }
+            .history-detail-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .history-detail-stat { min-width: 0; padding: .55rem .25rem; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; background: transparent; overflow-wrap: anywhere; }
+            .account-table-controls { grid-template-columns: minmax(0, 1fr); }
+            .history-item.history-account-card { grid-template-columns: 20px repeat(2, minmax(0, 1fr)); padding: .75rem; gap: .6rem; }
+            .history-account-card .history-select { grid-row: 1 / span 3; }
             .history-identity { flex-basis: 100%; }
             .history-account-card .history-actions .btn-secondary, .history-more > summary, .history-recovery-count { min-height: 40px; }
             .history-latest-recovery { flex: 1 0 100%; }
@@ -1105,6 +1158,7 @@
         .tab-btn:hover { color: var(--text-primary); }
         .tab-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
         .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+        .tab-btn[hidden] { display: none; }
 
         .tab-badge {
             background: var(--bg-highest); border-radius: 10px;
@@ -1169,10 +1223,13 @@
         .login-advanced summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
         .login-advanced[open] summary { margin-bottom: .75rem; }
         .login-advanced .input-group:last-child { margin-bottom: 0; }
-        .login-submit { border-top: 1px solid var(--border); padding-top: .85rem; margin-top: 1rem; flex-shrink: 0; }
+        .login-submit { display: flex; gap: .5rem; border-top: 1px solid var(--border); padding-top: .85rem; margin-top: 1rem; flex-shrink: 0; }
         .login-submit .btn { min-height: 44px; padding: .75rem 1rem; font-size: .9375rem; border-radius: 8px; }
+        .login-submit #startBtn { flex: 1; }
+        .login-submit #stopBtn { width: auto; flex-shrink: 0; color: var(--error); border-color: rgba(248, 113, 113, .4); }
+        .login-submit #stopBtn[hidden] { display: none; }
         .login-result-actions { display: flex; flex-wrap: wrap; gap: .4rem; }
-        .login-workspace .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .5rem; margin-bottom: 1rem; }
+        .login-workspace .stats { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: .5rem; margin-bottom: 1rem; }
         .login-workspace .stat-item { padding: .7rem .4rem; border-radius: 8px; }
         .login-workspace .stat-value { font-size: 1.5rem; margin-bottom: .2rem; }
         .login-workspace .stat-label { letter-spacing: 0; }
@@ -1200,6 +1257,9 @@
         @media (max-width: 1024px) {
             .login-workspace .card { padding: 1rem; }
             #statusGrid { max-height: 65dvh; overflow-y: auto; }
+        }
+        @media (max-width: 640px) {
+            .login-workspace .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
         }
         @media (max-width: 400px) {
             .login-format { font-size: .6875rem; }
@@ -1231,8 +1291,8 @@
             </div>
             <div class="tab-buttons" role="tablist" aria-label="功能模块">
                 <button id="tab-login" class="tab-btn active" type="button" role="tab" aria-selected="true" aria-controls="panel-login" tabindex="0" data-tab="login">批量登录</button>
-                <button id="tab-history" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="panel-history" tabindex="-1" data-tab="history">账号历史<span class="tab-badge" id="tabBadgeHistory"></span></button>
-                <button id="tab-checks" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="panel-checks" tabindex="-1" data-tab="checks">账号检测<span class="tab-badge tab-badge--warn" id="tabBadgeChecks"></span></button>
+                <button id="tab-history" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="panel-history" tabindex="-1" data-tab="history">账号表<span class="tab-badge" id="tabBadgeHistory"></span></button>
+                <button id="tab-checks" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="panel-checks" tabindex="-1" data-tab="checks" hidden>账号检测<span class="tab-badge tab-badge--warn" id="tabBadgeChecks"></span></button>
             </div>
         </nav>
 
@@ -1316,6 +1376,7 @@
                     <span>▶️</span>
                     <span>开始处理</span>
                 </button>
+                <button class="btn btn-secondary" id="stopBtn" type="button" hidden title="停止本批登录并取消正在处理的请求">停止</button>
                 </div>
             </div>
 
@@ -1352,6 +1413,14 @@
                         <div class="stat-value" id="pendingCount">0</div>
                         <div class="stat-label">待处理</div>
                     </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="stoppedCount" style="color: var(--warning)">0</div>
+                        <div class="stat-label">已停止</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="checkingCount" style="color: var(--warning)">0</div>
+                        <div class="stat-label">待核对</div>
+                    </div>
                 </div>
                 <p class="history-batch-status" id="batchImportStatus" role="status" aria-live="polite" hidden></p>
 
@@ -1366,12 +1435,12 @@
             </div>
         </div>
 
-        <!-- ── 账号历史 ── -->
+        <!-- ── 账号表 ── -->
         <div id="panel-history" class="tab-panel" data-tab="history" role="tabpanel" aria-labelledby="tab-history" tabindex="0" hidden>
             <div class="tab-history-inner">
                 <div class="card history-card">
             <div class="card-header">
-                <h2 class="card-title">账号历史</h2>
+                <h2 class="card-title">账号表</h2>
                 <div class="history-toolbar">
                     <span class="history-refresh-status" id="historyRefreshStatus" role="status" aria-live="polite"></span>
                     <label class="history-setting-toggle" title="开启后立即巡检，每 60 秒检查 Sub2 异常账号；确认凭据失效后自动重新登录。设置会保存，关闭页面后仍继续。">
@@ -1379,30 +1448,34 @@
                         <span>自动检测恢复</span>
                     </label>
                     <span class="history-setting-status" id="autoRecoveryStatus" role="status" aria-live="polite"></span>
-                    <button class="btn-secondary" id="refreshHistoryBtn" type="button">刷新历史</button>
+                    <button class="btn-secondary" id="refreshHistoryBtn" type="button">刷新</button>
                 </div>
             </div>
-            <p class="hint" style="margin-top: -0.75rem; margin-bottom: 1rem;">
-                这里只显示账号状态和错误摘要，不会显示密码或 TOTP；重新登录成功后可复制 Refresh Token。已确认被官方删除的账号会提示清理记录。
-            </p>
-            <p class="hint" id="autoRecoveryDetail" role="status" aria-live="polite">正在读取自动恢复设置…</p>
+            <details class="history-monitor-details">
+                <summary>巡检详情</summary>
+                <p class="history-setting-status" id="autoRecoveryDetail" role="status" aria-live="polite">正在读取自动恢复设置…</p>
+            </details>
             <details class="history-attention" id="historyAttention" hidden>
                 <summary id="historyAttentionSummary">需要处理</summary>
                 <ul class="history-attention-list" id="historyAttentionList"></ul>
             </details>
-            <p class="hint">检测会发起少量模型请求。历史行的 Sub2 状态来自详情接口：原始“可调度”是人工开关，限流、过载、临时暂停和凭据过期会另外标记为“暂不可调度”。AUTH 401 与 Sub2 凭据状态分别显示；仍在 Sub2 池中且未人工暂停的账号，只有 AUTH 当前检测确认凭据失效时才会恢复，正常、人工暂停、已禁用或已删除的账号不会仅凭 Sub2 状态自动恢复。</p>
-            <div class="input-group">
-                <label for="historySearchInput">搜索账号</label>
-                <input type="search" id="historySearchInput" placeholder="输入邮箱或邮箱片段" autocomplete="off" spellcheck="false" aria-controls="historyGrid" disabled>
-            </div>
-            <div class="history-filter-toolbar">
+            <div class="account-table-controls">
+                <div class="input-group">
+                    <label for="historySearchInput">搜索账号</label>
+                    <input type="search" id="historySearchInput" placeholder="邮箱或账号 ID" autocomplete="off" spellcheck="false" aria-controls="historyGrid" disabled>
+                </div>
+                <div class="history-filter-toolbar">
                 <label for="historyStatusFilter">状态
                     <select id="historyStatusFilter">
                         <option value="all" selected>全部</option>
+                        <option value="attention">需处理</option>
+                        <option value="schedulable">可调度</option>
+                        <option value="working">处理中</option>
+                        <option value="unknown">状态未知</option>
                         <option value="available">最近登录成功</option>
                         <option value="failed">登录失败</option>
                         <option value="deactivated">停用或删除</option>
-                        <option value="processing">处理中</option>
+                        <option value="processing">登录处理中</option>
                         <option value="expired">访问令牌已过期</option>
                         <option value="other">中断或未知</option>
                     </select>
@@ -1416,6 +1489,7 @@
                         <option value="email_asc">邮箱 A-Z</option>
                     </select>
                 </label>
+                </div>
             </div>
             <div class="history-list-toolbar" aria-label="账号选择与批量操作">
                 <div class="history-selection-controls">
@@ -1423,15 +1497,17 @@
                         <input type="checkbox" id="historySelectAll" aria-label="全选当前页账号" disabled>
                         <span>全选当前页</span>
                     </label>
-                    <button class="btn-secondary" id="historyCheckNowBtn" type="button" disabled>立即检测</button>
-                    <span class="history-setting-status" id="historyCheckNowStatus" role="status" aria-live="polite"></span>
+                    <button class="btn-secondary" id="historyCheckNowBtn" type="button" disabled hidden>立即检测</button>
+                    <span class="history-setting-status" id="historyCheckNowStatus" role="status" aria-live="polite" hidden></span>
                 </div>
+                <span class="history-selection-status" id="accountTableSummary" role="status" aria-live="polite"></span>
             </div>
             <p class="history-batch-status" id="historyBatchStatus" role="status" aria-live="polite" hidden></p>
+            <div class="account-table-heading" aria-hidden="true"><span>选择</span><span>账号</span><span>AUTH</span><span>Sub2 调度</span><span>状态来源</span><span>使用额度</span><span>交付/恢复</span><span>最近成功</span><span>操作</span></div>
             <div class="history-grid" id="historyGrid">
-                <div class="empty-state"><div class="empty-icon">🗂️</div><p>正在加载账号历史…</p></div>
+                <div class="empty-state"><div class="empty-icon">🗂️</div><p>正在加载账号…</p></div>
             </div>
-            <div class="history-pagination" aria-label="账号历史分页">
+            <div class="history-pagination" aria-label="账号表分页">
                 <span id="historyPageInfo">暂无账号</span>
                 <label>每页
                     <select id="historyPageSize" aria-label="每页显示数量">
@@ -1523,7 +1599,7 @@
         </div>
 
         <!-- History selection actions occupy their own row below the scrolling panel. -->
-        <div class="action-bar" id="historyActionBar" role="group" aria-label="历史账号批量操作" hidden>
+        <div class="action-bar" id="historyActionBar" role="group" aria-label="账号表批量操作" hidden>
             <span class="action-bar-label" id="historySelectionStatus" role="status" aria-live="polite">已选 0 个</span>
             <button class="btn-secondary" id="historyClearSelectionBtn" type="button" disabled>清空选择</button>
             <button class="btn-secondary" id="historyBatchReloginBtn" type="button" title="复活所选的失败、中断或停用账号" disabled>批量复活</button>

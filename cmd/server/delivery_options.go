@@ -132,16 +132,6 @@ func (s *sub2ImportService) applyDeliveryGroups(ctx context.Context, recoveryTas
 	for _, id := range raw {
 		expected = append(expected, int64(toFloat(id)))
 	}
-	groupsOf := func(m map[string]any) []int64 {
-		ids := []int64{}
-		if raw, ok := m["group_ids"].([]any); ok {
-			for _, id := range raw {
-				ids = append(ids, int64(toFloat(id)))
-			}
-		}
-		slices.Sort(ids)
-		return ids
-	}
 	slices.Sort(expected)
 	// Later logins preserve administrator changes to a previously delivered account.
 	prior, err := s.store.HasEarlierCompletedDelivery(ctx, recoveryTask.AccountID, recoveryTask.DeliveryID)
@@ -151,11 +141,25 @@ func (s *sub2ImportService) applyDeliveryGroups(ctx context.Context, recoveryTas
 	if prior {
 		return nil
 	}
-	if slices.Equal(groupsOf(detail), expected) {
+	currentGroups, valid := sub2GroupIDs(detail)
+	if !valid {
+		return &recoveryOperationError{Code: "protocol_error"}
+	}
+	// A confirmed operator choice is consumed only after the remote account has
+	// been rechecked. The worker never infers permission from a stale snapshot.
+	if decision, decisionErr := s.store.GetAccountRecoveryGroupDecision(ctx, recoveryTask.ID); decisionErr == nil && decision.State == "confirmed" {
+		if decision.Action == "keep_current" && slices.Equal(currentGroups, decision.CurrentGroupIDs) {
+			return nil
+		}
+		if decision.Action == "use_target" && slices.Equal(currentGroups, expected) {
+			return nil
+		}
+	}
+	if slices.Equal(currentGroups, expected) {
 		return nil
 	}
-	if len(groupsOf(detail)) > 0 {
-		return &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
+	if len(currentGroups) > 0 {
+		return recoveryGroupConflictError(currentGroups, expected)
 	}
 	options := store.DeliveryOptions{GroupIDs: expected, Concurrency: request.Data.Accounts[0].Concurrency, Priority: request.Data.Accounts[0].Priority}
 	if _, err = s.resolveOptions(ctx, &options); err != nil {
@@ -169,8 +173,12 @@ func (s *sub2ImportService) applyDeliveryGroups(ctx context.Context, recoveryTas
 	if !matchesImportMarker(current, task) || !recoveryMarkerMatches(current, recoveryTask) {
 		return &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
 	}
-	if len(groupsOf(current)) > 0 {
-		return &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
+	remoteGroups, valid := sub2GroupIDs(current)
+	if !valid {
+		return &recoveryOperationError{Code: "protocol_error"}
+	}
+	if len(remoteGroups) > 0 {
+		return recoveryGroupConflictError(remoteGroups, expected)
 	}
 	if recoveryAccountDisabled(current) {
 		return &recoveryOperationError{Code: "manual_pause", RequiresAction: true}
@@ -182,8 +190,71 @@ func (s *sub2ImportService) applyDeliveryGroups(ctx context.Context, recoveryTas
 	if err = s.apiJSON(ctx, http.MethodGet, endpoint, nil, &current); err != nil {
 		return err
 	}
-	if !matchesImportMarker(current, task) || !recoveryMarkerMatches(current, recoveryTask) || !slices.Equal(groupsOf(current), expected) {
-		return &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
+	remoteGroups, valid = sub2GroupIDs(current)
+	if !valid || len(expected) > 0 && !sub2GroupFieldsPresent(current) {
+		return &recoveryOperationError{Code: "protocol_error"}
+	}
+	if !matchesImportMarker(current, task) || !recoveryMarkerMatches(current, recoveryTask) || !slices.Equal(remoteGroups, expected) {
+		return recoveryGroupConflictError(remoteGroups, expected)
 	}
 	return nil
+}
+
+func sub2GroupIDs(m map[string]any) ([]int64, bool) {
+	// The complete Sub2 account response uses omitempty on all three group
+	// representations. If all are absent, that is a confirmed empty assignment.
+	for _, field := range []struct {
+		name string
+		key  string
+	}{
+		{"group_ids", ""},
+		{"groups", "id"},
+		{"account_groups", "group_id"},
+	} {
+		raw, present := m[field.name]
+		if !present || raw == nil {
+			continue
+		}
+		values, ok := raw.([]any)
+		if !ok {
+			encoded, err := json.Marshal(raw)
+			if err != nil || json.Unmarshal(encoded, &values) != nil {
+				return nil, false
+			}
+		}
+		ids := make([]int64, 0, len(values))
+		for _, value := range values {
+			if field.key != "" {
+				object, ok := value.(map[string]any)
+				if !ok {
+					return nil, false
+				}
+				value = object[field.key]
+			}
+			number := toFloat(value)
+			id := int64(number)
+			if id <= 0 || float64(id) != number {
+				return nil, false
+			}
+			ids = append(ids, id)
+		}
+		slices.Sort(ids)
+		return slices.Compact(ids), true
+	}
+	return []int64{}, true
+}
+
+func sub2GroupFieldsPresent(m map[string]any) bool {
+	for _, name := range []string{"group_ids", "groups", "account_groups"} {
+		if raw, ok := m[name]; ok && raw != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func recoveryGroupConflictError(current, target []int64) *recoveryOperationError {
+	return &recoveryOperationError{Code: "group_conflict", RequiresAction: true, Diagnostic: &store.RecoveryDiagnostic{
+		CurrentGroupIDs: append([]int64(nil), current...), TargetGroupIDs: append([]int64(nil), target...),
+	}}
 }

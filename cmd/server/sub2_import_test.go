@@ -182,7 +182,7 @@ func TestListSub2AccountStatusesReadsDetailAndDistinguishesMissing(t *testing.T)
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/v1/admin/accounts/42":
-			_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"id":42,"status":"active","schedulable":true,"error_message":""}}`))
+			_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"id":42,"status":"active","schedulable":true,"error_message":"","extra":{"codex_5h_used_percent":42,"codex_5h_reset_at":"2026-10-29T10:00:00Z","codex_5h_reset_after_seconds":3600,"codex_5h_window_minutes":300,"codex_7d_used_percent":68,"codex_7d_reset_at":"2026-11-04T10:00:00Z","codex_7d_window_minutes":10080,"codex_usage_updated_at":"2026-10-29T09:00:00Z","codex_credits_snapshot":{"credits":{"balance":"12","has_credits":true,"unlimited":false}}}}}`))
 		case "/api/v1/admin/accounts/404":
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"code":1,"message":"not found"}`))
@@ -203,11 +203,100 @@ func TestListSub2AccountStatusesReadsDetailAndDistinguishesMissing(t *testing.T)
 	if !active.Exists || active.Unknown || active.Stale || active.Status != "active" || active.Schedulable == nil || !*active.Schedulable {
 		t.Fatalf("active status = %+v", active)
 	}
+	if active.Quota == nil || active.Quota.FiveHour == nil || active.Quota.FiveHour.UsedPercent == nil || *active.Quota.FiveHour.UsedPercent != 42 || active.Quota.SevenDay == nil || active.Quota.Credits == nil || active.Quota.Credits.Balance != "12" {
+		t.Fatalf("quota snapshot = %+v", active.Quota)
+	}
 	missing := statuses[accountID+1]
 	if missing.Exists || missing.Unknown || missing.Stale || missing.Error == "" {
 		t.Fatalf("missing status = %+v", missing)
 	}
 }
+
+func TestSub2NotFoundRecordsOneLifecycleEventAndTransientFailureDoesNot(t *testing.T) {
+	history, accountID := testOAuthStore(t)
+	ctx := context.Background()
+	if _, err := history.UpsertCredentials(ctx, store.Credentials{Email: "sub2-transient@example.com", Password: "password"}); err != nil {
+		t.Fatal(err)
+	}
+	secondAttempt, err := history.StartAttempt(ctx, "sub2-transient@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.FinishAttempt(ctx, secondAttempt.ID, true, &store.Result{AccessToken: "at-2", RefreshToken: "rt-2", ChatGPTAccountID: "chatgpt-2", ExpiresAt: 123}, nil); err != nil {
+		t.Fatal(err)
+	}
+	secondAttempt.Release()
+	secondAccount, err := history.GetAccount(ctx, "sub2-transient@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingTask, _, err := history.CreateOrGetSub2Import(ctx, "test", accountID, "missing-operation", "missing-idempotency", []byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.UpdateSub2Import(ctx, missingTask.ID, "imported", true, 404, ""); err != nil {
+		t.Fatal(err)
+	}
+	transientTask, _, err := history.CreateOrGetSub2Import(ctx, "test", secondAccount.ID, "transient-operation", "transient-idempotency", []byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.UpdateSub2Import(ctx, transientTask.ID, "imported", true, 503, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/404") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/503") {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
+	imports := []store.Sub2Import{
+		{DestinationKey: "test", AccountID: accountID, Sub2AccountID: 404, State: "imported"},
+		{DestinationKey: "test", AccountID: secondAccount.ID, Sub2AccountID: 503, State: "imported"},
+	}
+	first := service.listSub2AccountStatuses(ctx, imports)
+	if first[accountID].Exists || first[accountID].Unknown || first[accountID].Stale || first[accountID].Error == "" {
+		t.Fatalf("404 status = %+v", first[accountID])
+	}
+	// A second poll must be idempotent, while a transport/5xx failure must not
+	// manufacture deletion evidence.
+	service.listSub2AccountStatuses(ctx, imports[:1])
+	events, err := history.ListLifecycleEventsForAccount(ctx, accountID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Source != "sub2" || events[0].Status != "deleted" || events[0].HTTPStatus != http.StatusNotFound {
+		t.Fatalf("lifecycle events = %+v", events)
+	}
+	transient := service.listSub2AccountStatuses(ctx, []store.Sub2Import{imports[1]})[secondAccount.ID]
+	if transient.Exists || !transient.Unknown || !transient.Stale || transient.Error == "" {
+		t.Fatalf("503 status = %+v", transient)
+	}
+	events, err = history.ListLifecycleEventsForAccount(ctx, accountID, 20)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("transient status added lifecycle evidence: events=%+v err=%v", events, err)
+	}
+}
+
+func TestMergeSub2QuotaKeepsFallbackFields(t *testing.T) {
+	credits := &sub2Credits{Balance: "12"}
+	base := &sub2Quota{FiveHour: &sub2UsageWindow{UsedPercent: floatPtr(10)}, Credits: credits, Source: "detail"}
+	fresh := &sub2Quota{FiveHour: &sub2UsageWindow{UsedPercent: floatPtr(20)}, Source: "usage", UpdatedAt: "now"}
+	merged := mergeSub2Quota(base, fresh)
+	if merged == nil || merged.FiveHour == nil || *merged.FiveHour.UsedPercent != 20 || merged.Credits != credits || merged.Source != "usage" || merged.UpdatedAt == nil {
+		t.Fatalf("merged quota = %+v", merged)
+	}
+}
+
+func floatPtr(value float64) *float64 { return &value }
 
 func TestSub2AccountStatusCachesBriefly(t *testing.T) {
 	history, _ := testOAuthStore(t)
@@ -227,6 +316,88 @@ func TestSub2AccountStatusCachesBriefly(t *testing.T) {
 	}
 	if requests.Load() != 1 {
 		t.Fatalf("detail requests = %d, want 1 within cache TTL", requests.Load())
+	}
+}
+
+func TestSub2QuotaFromUsageMapsWindowsAndUsageMetadata(t *testing.T) {
+	snapshot := sub2QuotaFromUsage(map[string]any{
+		"source":     "cached",
+		"updated_at": "2026-10-29T12:00:00Z",
+		"five_hour":  map[string]any{"utilization": 42.5, "resets_at": "2026-10-29T14:00:00Z", "remaining_seconds": 7200, "used_requests": 17, "limit_requests": 100},
+		"seven_day":  map[string]any{"utilization": 9.25, "resets_at": "2026-11-01T00:00:00Z"},
+	})
+	if snapshot == nil || snapshot.Source != "cached" || snapshot.UpdatedAt == nil || snapshot.FiveHour == nil || snapshot.SevenDay == nil {
+		t.Fatalf("usage snapshot = %+v", snapshot)
+	}
+	if snapshot.FiveHour.UsedPercent == nil || *snapshot.FiveHour.UsedPercent != 42.5 || snapshot.FiveHour.UsedRequests == nil || *snapshot.FiveHour.UsedRequests != 17 {
+		t.Fatalf("five-hour window = %+v", snapshot.FiveHour)
+	}
+}
+
+func TestSub2AccountUsageBatchSeparatesPerAccountErrors(t *testing.T) {
+	history, _ := testOAuthStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/admin/accounts/usage/batch" {
+			http.NotFound(w, r)
+			return
+		}
+		var body struct {
+			AccountIDs []int64 `json:"account_ids"`
+			Force      bool    `json:"force"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if len(body.AccountIDs) != 2 || body.Force {
+			t.Fatalf("unexpected usage request: %+v", body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
+			"usage":  map[string]any{"42": map[string]any{"source": "cached", "five_hour": map[string]any{"utilization": 20}}},
+			"errors": map[string]string{"43": "账号尚无额度快照"},
+		}})
+	}))
+	defer server.Close()
+	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", client: server.Client()}
+	usage, perAccountErrors, err := service.sub2AccountUsageBatch(context.Background(), []int64{42, 43})
+	if err != nil || usage[42] == nil || usage[42].FiveHour == nil || perAccountErrors[43] == "" {
+		t.Fatalf("usage=%+v errors=%+v err=%v", usage, perAccountErrors, err)
+	}
+}
+
+func TestAttachSub2UsageKeepsDetailCredits(t *testing.T) {
+	history, _ := testOAuthStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/admin/accounts/usage/batch" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
+			"usage": map[string]any{"42": map[string]any{"source": "cached", "five_hour": map[string]any{"utilization": 20}}},
+		}})
+	}))
+	defer server.Close()
+	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", client: server.Client()}
+	credits := &sub2Credits{Balance: "12"}
+	statuses := map[int64]sub2AccountStatus{7: {Exists: true, Sub2AccountID: 42, Quota: &sub2Quota{Credits: credits, Source: "Sub2 extra"}}}
+	service.attachSub2Usage(context.Background(), statuses)
+	status := statuses[7]
+	if status.Quota == nil || status.Quota.FiveHour == nil || status.Quota.Credits != credits || status.Quota.Credits.Balance != "12" {
+		t.Fatalf("merged quota lost detail credits: %+v", status.Quota)
+	}
+}
+
+func TestAttachSub2UsageDoesNotChangeVerifiedExistenceOnUsageFailure(t *testing.T) {
+	history, _ := testOAuthStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer server.Close()
+	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", client: server.Client()}
+	statuses := map[int64]sub2AccountStatus{7: {Exists: true, Sub2AccountID: 42}}
+	service.attachSub2Usage(context.Background(), statuses)
+	status := statuses[7]
+	if !status.Exists || !status.UsageUnknown || !status.UsageStale || status.UsageError == "" {
+		t.Fatalf("usage failure changed account existence or was not marked unknown: %+v", status)
 	}
 }
 

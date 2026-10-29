@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -76,8 +75,7 @@ func (s *accountDeliveryService) update(task store.AccountDelivery, state, messa
 	defer cancel()
 	if _, err := s.store.UpdateAccountDelivery(ctx, task.ID, state, message, manual, next, recoveryID); err != nil {
 		if !errors.Is(err, store.ErrAccountNotFound) && !errors.Is(err, store.ErrAccountDeliveryNotFound) && !errors.Is(err, store.ErrAccountDeliverySettled) {
-			s.recovery.paused.Store(true)
-			log.Printf("交付任务存储故障：已停止后续派发 task_id=%d", task.ID)
+			s.recovery.pauseRecovery(task.RecoveryTaskID, err)
 		}
 		return false
 	}
@@ -219,6 +217,7 @@ func listDeliveryStatuses(ctx context.Context, history *store.Store, destination
 				return nil, err
 			}
 			task.LastError, task.ManualAction, task.RequiresAction = recovery.LastError, recovery.ManualAction, recovery.RequiresAction
+			task.FailureStage, task.ErrorCode, task.HTTPStatus, task.Diagnostic = recovery.FailureStage, recovery.ErrorCode, recovery.HTTPStatus, recovery.Diagnostic
 			task.NextRetryAt, task.RetryCount, task.UpdatedAt = recovery.NextRetryAt, recovery.RetryCount, recovery.UpdatedAt
 			switch {
 			case recovery.State == store.RecoveryCompleted:
@@ -232,6 +231,9 @@ func listDeliveryStatuses(ctx context.Context, history *store.Store, destination
 			default:
 				task.State = "verifying"
 			}
+		}
+		if accountRecoveryService != nil && accountRecoveryService.paused.Load() && task.State != "completed" && task.State != "canceled" {
+			task.BlockedReason = "后台服务已暂停，需要恢复服务后继续"
 		}
 		result[task.AccountID] = task
 	}

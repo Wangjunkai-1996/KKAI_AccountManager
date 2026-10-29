@@ -90,8 +90,11 @@ func (s *accountCheckService) worker() {
 		work, err := s.store.ClaimAccountCheck(ctx)
 		cancel()
 		if err != nil {
+			if errors.Is(err, store.ErrQueueDeferred) && retryStorageRead(s.ctx, err) {
+				continue
+			}
 			if s.ctx.Err() == nil {
-				s.pause()
+				s.pause(err)
 			}
 			return
 		}
@@ -108,10 +111,10 @@ func (s *accountCheckService) worker() {
 	}
 }
 
-func (s *accountCheckService) pause() {
+func (s *accountCheckService) pause(err error) {
 	if !s.paused.Swap(true) {
 		// Raw database/network errors can contain private material.
-		log.Print("账号检测存储故障：已暂停派发，需恢复存储后重启检测服务")
+		log.Printf("账号检测存储故障：已暂停派发，需恢复存储后重启检测服务 code=%s", storageErrorCode(err))
 	}
 	s.cancelBatch("")
 }
@@ -151,7 +154,7 @@ func (s *accountCheckService) process(work *store.AccountCheckWork) {
 	batch, _, err := s.store.GetAccountCheckBatch(readCtx, work.Batch.ID)
 	readCancel()
 	if err != nil {
-		s.pause()
+		s.pause(err)
 		return
 	}
 	if batch.State != "active" || ctx.Err() != nil {
@@ -161,12 +164,12 @@ func (s *accountCheckService) process(work *store.AccountCheckWork) {
 	if accountRecoveryService != nil && !accountRecoveryService.autoRecovery.Load() {
 		automatic, err := s.store.AutomaticRecoveryCheck(ctx, batch.ID)
 		if err != nil {
-			s.pause()
+			s.pause(err)
 			return
 		}
 		if automatic {
 			if _, err := s.store.CancelAccountCheckBatch(ctx, batch.ID); err != nil {
-				s.pause()
+				s.pause(err)
 				return
 			}
 			s.finish(work.Check.ID, accountID, store.AccountCheckResult{Canceled: true})
@@ -193,7 +196,7 @@ func (s *accountCheckService) process(work *store.AccountCheckWork) {
 		if ctx.Err() != nil {
 			s.finish(work.Check.ID, accountID, store.AccountCheckResult{Canceled: errors.Is(ctx.Err(), context.Canceled), Outcome: "timeout", Message: "检测等待超时", FailureStage: "precheck", RequestAttempted: &notAttempted})
 		} else {
-			s.pause()
+			s.pause(err)
 		}
 		return
 	}
@@ -225,7 +228,7 @@ func (s *accountCheckService) finish(id, accountID int64, result store.AccountCh
 	defer cancel()
 	batch, err := s.store.FinishAccountCheck(ctx, id, result)
 	if err != nil {
-		s.pause()
+		s.pause(err)
 		return
 	}
 	if batch.State == "stopping" {
@@ -530,6 +533,6 @@ func (s *accountCheckService) respondError(w http.ResponseWriter, r *http.Reques
 		}{false, safe})
 		return
 	}
-	s.pause()
+	s.pause(err)
 	checkAPIError(w, 503, "checks_storage_error", "检测记录暂不可用，请恢复服务后重试")
 }

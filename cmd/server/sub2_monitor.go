@@ -300,7 +300,9 @@ func (s *sub2RecoveryService) retryDueRecoveries() {
 	defer cancel()
 	tasks, err := s.store.ListLatestAccountRecoveryTasksForDestination(ctx, s.sub2.destinationKey)
 	if err != nil {
-		s.pauseRecovery(0)
+		if s.ctx.Err() == nil && !retryStorageRead(s.ctx, err) {
+			s.pauseRecovery(0, err)
+		}
 		return
 	}
 	for _, task := range tasks {
@@ -322,7 +324,7 @@ func (s *sub2RecoveryService) retryDueRecoveries() {
 		account, err := s.store.GetAccountByID(ctx, task.AccountID)
 		if err != nil {
 			if !errors.Is(err, store.ErrAccountNotFound) {
-				s.pauseRecovery(task.ID)
+				s.pauseRecovery(task.ID, err)
 				return
 			}
 			s.recordRecoveryFailure(task, task.FailureStage, &recoveryOperationError{Code: "account_missing", RequiresAction: true})
@@ -330,7 +332,7 @@ func (s *sub2RecoveryService) retryDueRecoveries() {
 		}
 		binding, err := s.sub2.store.GetSub2Import(ctx, s.sub2.destinationKey, task.AccountID)
 		if err != nil && !errors.Is(err, store.ErrSub2ImportNotFound) {
-			s.pauseRecovery(task.ID)
+			s.pauseRecovery(task.ID, err)
 			return
 		}
 		if err != nil || binding.State != "imported" || binding.Sub2AccountID != task.Sub2AccountID {
@@ -353,7 +355,7 @@ func (s *sub2RecoveryService) retryDueRecoveries() {
 				s.recordRecoveryFailure(task, task.FailureStage, &recoveryOperationError{Code: "version_changed", RequiresAction: true})
 				continue
 			}
-			s.pauseRecovery(task.ID)
+			s.pauseRecovery(task.ID, err)
 			return
 		}
 		s.notify()

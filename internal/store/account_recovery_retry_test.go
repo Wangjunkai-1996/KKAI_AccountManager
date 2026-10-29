@@ -63,6 +63,35 @@ func TestRecoveryRetryPolicyPersistsAndClears(t *testing.T) {
 	}
 }
 
+func TestRecoveryFailureEventsPersistRedactedProbeEvidenceAfterCompletion(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	id := checkTestAccount(t, s, "failure-event-evidence")
+	task, _, err := s.CreateOrGetAccountRecoveryTask(ctx, id, 0, 42, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diagnostic := &RecoveryDiagnostic{CurrentGroupIDs: []int64{12, 13}, TargetGroupIDs: []int64{12, 44}}
+	got, err := s.RecordAccountRecoveryFailure(ctx, task.ID, RecoveryFailure{
+		State: RecoveryUnknown, Stage: RecoveryValidating, Code: "upstream_error", Message: "上游服务暂不可用",
+		HTTPStatus: 503, Diagnostic: diagnostic, RetryAction: "resume",
+	})
+	if err != nil || got.HTTPStatus != 503 || got.FailureStage != RecoveryValidating || got.ErrorCode != "upstream_error" {
+		t.Fatalf("probe evidence not persisted: %+v err=%v", got, err)
+	}
+	if _, err := s.UpdateAccountRecoveryTask(ctx, task.ID, RecoveryCompleted, "已恢复"); err != nil {
+		t.Fatal(err)
+	}
+	events, truncated, err := s.ListAccountRecoveryFailureEvents(ctx, id, 20)
+	if err != nil || truncated || len(events) != 1 {
+		t.Fatalf("failure event history=%+v truncated=%v err=%v", events, truncated, err)
+	}
+	event := events[0]
+	if event.TaskID != task.ID || event.FailureStage != RecoveryValidating || event.ErrorCode != "upstream_error" || event.HTTPStatus != 503 || event.RetryCount != 1 || event.Diagnostic == nil || len(event.Diagnostic.CurrentGroupIDs) != 2 || event.Diagnostic.CurrentGroupIDs[0] != 12 || len(event.Diagnostic.TargetGroupIDs) != 2 || event.Diagnostic.TargetGroupIDs[1] != 44 {
+		t.Fatalf("failure event evidence=%+v", event)
+	}
+}
+
 func TestRecoveryFailureSnapshotRejectsSameMillisecondNewRound(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()

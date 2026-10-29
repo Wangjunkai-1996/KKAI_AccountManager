@@ -156,7 +156,12 @@ func (s *sub2RecoveryService) worker() {
 		}
 		cancel()
 		if err != nil {
-			s.pauseRecovery(0)
+			if retryStorageRead(s.ctx, err) {
+				continue
+			}
+			if s.ctx.Err() == nil {
+				s.pauseRecovery(0, err)
+			}
 			return
 		}
 		if len(tasks) > 0 {
@@ -168,12 +173,18 @@ func (s *sub2RecoveryService) worker() {
 				continue
 			}
 			if !errors.Is(claimErr, store.ErrAccountRecoveryNotQueued) {
-				s.pauseRecovery(tasks[0].ID)
+				if errors.Is(claimErr, store.ErrQueueDeferred) && retryStorageRead(s.ctx, claimErr) {
+					continue
+				}
+				s.pauseRecovery(tasks[0].ID, claimErr)
 				return
 			}
 		}
 		if s.processNextCredentialRepair() {
 			continue
+		}
+		if s.ctx.Err() != nil || s.paused.Load() {
+			return
 		}
 		if s.configured() && s.processNextRecheck() {
 			continue
@@ -300,6 +311,16 @@ func (s *sub2RecoveryService) handleAction(w http.ResponseWriter, r *http.Reques
 		}
 		return
 	}
+	if strings.HasSuffix(path, "/groups") {
+		rawID := strings.TrimSuffix(path, "/groups")
+		id, err := strconv.ParseInt(strings.Trim(rawID, "/"), 10, 64)
+		if err != nil || id <= 0 {
+			recoveryAPIError(w, http.StatusBadRequest, "invalid_task_id", "恢复任务 ID 无效")
+			return
+		}
+		s.handleRecoveryGroupAction(w, r, id)
+		return
+	}
 	if r.Method != http.MethodGet {
 		recoveryAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "请求方法不支持")
 		return
@@ -421,7 +442,7 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		} else if errors.Is(err, store.ErrAccountBusy) {
 			fail(store.RecoveryValidating, &recoveryOperationError{Code: "account_busy"})
 		} else {
-			s.pauseRecovery(task.ID)
+			s.pauseRecovery(task.ID, err)
 		}
 		return
 	}
@@ -431,7 +452,7 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		if errors.Is(err, store.ErrAccountNotFound) {
 			require(store.RecoveryValidating, "account_missing")
 		} else {
-			s.pauseRecovery(task.ID)
+			s.pauseRecovery(task.ID, err)
 		}
 		return
 	}
@@ -448,7 +469,7 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 	}
 	binding, err := s.sub2.store.GetSub2Import(ctx, s.sub2.destinationKey, task.AccountID)
 	if err != nil && !errors.Is(err, store.ErrSub2ImportNotFound) {
-		s.pauseRecovery(task.ID)
+		s.pauseRecovery(task.ID, err)
 		return
 	}
 	if err != nil || binding.State != "imported" || binding.Sub2AccountID != task.Sub2AccountID {
@@ -529,7 +550,7 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 	account.OrganizationID, account.PlanType, account.ExpiresAt = oauth.OrganizationID, oauth.PlanType, oauth.ExpiresAt
 	savedTask, err := s.store.GetAccountRecoveryTaskByID(ctx, task.ID)
 	if err != nil {
-		s.pauseRecovery(task.ID)
+		s.pauseRecovery(task.ID, err)
 		return
 	}
 	task = savedTask
@@ -669,7 +690,7 @@ func (s *sub2RecoveryService) loginAgain(ctx context.Context, taskID int64, acco
 		info := describeLoginError(loginErr)
 		if err := lease.FinishAttempt(finishCtx, taskID, attempt.ID, false, nil, &store.Failure{Stage: info.Stage, Code: info.Code, HTTPStatus: info.HTTPStatus, Retryable: info.Retryable, Message: info.Message, AccountStatus: info.AccountStatus}); err != nil {
 			if !recoveryTaskGone(err) {
-				s.pauseRecovery(taskID)
+				s.pauseRecovery(taskID, err)
 			}
 			return out, errors.New("AUTH 登录结果保存失败")
 		}
@@ -683,7 +704,7 @@ func (s *sub2RecoveryService) loginAgain(ctx context.Context, taskID int64, acco
 	if result == nil || strings.TrimSpace(result.AccessToken) == "" || strings.TrimSpace(result.RefreshToken) == "" {
 		if err := lease.FinishAttempt(finishCtx, taskID, attempt.ID, false, nil, &store.Failure{Stage: login.LoginStageUnknown, Code: login.LoginErrorUnknown, Message: "登录未返回完整凭据"}); err != nil {
 			if !recoveryTaskGone(err) {
-				s.pauseRecovery(taskID)
+				s.pauseRecovery(taskID, err)
 			}
 			return out, errors.New("AUTH 登录结果保存失败")
 		}
@@ -693,7 +714,7 @@ func (s *sub2RecoveryService) loginAgain(ctx context.Context, taskID int64, acco
 	if err := verifyOAuthIdentity(out, account); err != nil {
 		if err := lease.FinishAttempt(finishCtx, taskID, attempt.ID, false, nil, &store.Failure{Stage: login.LoginStageToken, Code: "identity_mismatch", Message: "新登录账号身份与原账号不一致"}); err != nil {
 			if !recoveryTaskGone(err) {
-				s.pauseRecovery(taskID)
+				s.pauseRecovery(taskID, err)
 			}
 			return out, errors.New("AUTH 登录结果保存失败")
 		}
@@ -702,7 +723,7 @@ func (s *sub2RecoveryService) loginAgain(ctx context.Context, taskID int64, acco
 	stored := &store.Result{AccessToken: out.AccessToken, RefreshToken: out.RefreshToken, ChatGPTAccountID: out.ChatGPTAccountID, OrganizationID: out.OrganizationID, PlanType: out.PlanType, ExpiresAt: out.ExpiresAt, ExpiresIn: out.ExpiresIn}
 	if err := lease.FinishAttempt(finishCtx, taskID, attempt.ID, true, stored, nil); err != nil {
 		if !recoveryTaskGone(err) {
-			s.pauseRecovery(taskID)
+			s.pauseRecovery(taskID, err)
 		}
 		return recoveryOAuthCredentials{}, errors.New("AUTH 登录结果保存失败")
 	}
@@ -791,7 +812,7 @@ func (s *sub2RecoveryService) setState(id int64, state, message string) bool {
 		if recoveryTaskGone(err) {
 			return false
 		}
-		s.pauseRecovery(id)
+		s.pauseRecovery(id, err)
 		return false
 	}
 	return true
@@ -912,7 +933,7 @@ func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTa
 	current, readErr := s.store.GetAccountRecoveryTaskByID(ctx, task.ID)
 	if readErr != nil {
 		if !recoveryTaskGone(readErr) {
-			s.pauseRecovery(task.ID)
+			s.pauseRecovery(task.ID, readErr)
 		}
 		return
 	}
@@ -925,7 +946,7 @@ func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTa
 		return
 	}
 	failure := classifyRecoveryError(err)
-	record := store.RecoveryFailure{State: store.RecoveryUnknown, Stage: stage, Code: failure.Code, Message: failure.Error()}
+	record := store.RecoveryFailure{State: store.RecoveryUnknown, Stage: stage, Code: failure.Code, Message: failure.Error(), HTTPStatus: failure.HTTPStatus, Diagnostic: failure.Diagnostic}
 	if failure.RequiresAction {
 		record.RetryAction, record.ManualAction = "manual", failure.Error()
 		if current.ResultCredentialAttemptID == 0 {
@@ -950,7 +971,7 @@ func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTa
 		// completion. It is not a storage failure and must not globally pause
 		// recovery dispatch.
 		if !errors.Is(err, store.ErrAccountRecoveryStale) && !errors.Is(err, store.ErrAccountRecoveryNotResumable) {
-			s.pauseRecovery(task.ID)
+			s.pauseRecovery(task.ID, err)
 		}
 	}
 }
@@ -1043,9 +1064,9 @@ func (s *sub2RecoveryService) verifyRecoveryRetry(ctx context.Context, task stor
 	return &recoveryOperationError{Code: "checkpoint_unconfirmed", RequiresAction: true}
 }
 
-func (s *sub2RecoveryService) pauseRecovery(id int64) {
+func (s *sub2RecoveryService) pauseRecovery(id int64, err error) {
 	s.paused.Store(true)
-	log.Printf("恢复任务存储故障：已停止后续派发，修复存储后重启服务核对 task_id=%d", id)
+	log.Printf("恢复任务存储故障：已停止后续派发，修复存储后重启服务核对 task_id=%d code=%s", id, storageErrorCode(err))
 }
 
 func verifyOAuthIdentity(credentials recoveryOAuthCredentials, account store.Account) error {

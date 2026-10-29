@@ -414,7 +414,7 @@ func (s *Store) ClaimAccountCheck(ctx context.Context) (*AccountCheckWork, error
 	return nil, nil
 }
 func (s *Store) claimAccountCheck(ctx context.Context) (*AccountCheckWork, bool, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginQueueTx(ctx)
 	if err != nil {
 		return nil, false, err
 	}
@@ -560,6 +560,42 @@ func (s *Store) FinishAccountCheck(ctx context.Context, id int64, result Account
 	_, err = tx.ExecContext(ctx, `UPDATE account_checks SET state=?,outcome=?,skip_reason=?,request_attempted=COALESCE(?,request_attempted),http_status=?,proxy_http_status=?,stream_error_status=?,error_code=?,stream_error_code=?,error_message=?,failure_stage=?,retry_after_seconds=?,finished_at=?,duration_ms=? WHERE id=? AND state='running'`, state, result.Outcome, skip, result.RequestAttempted, result.HTTPStatus, result.ProxyHTTPStatus, result.StreamErrorStatus, result.ErrorCode, result.StreamErrorCode, result.Message, result.FailureStage, result.RetryAfterSeconds, now, result.DurationMS, id)
 	if err != nil {
 		return batch, err
+	}
+	if state == "finished" && item.AccountID != nil {
+		if lifecycleStatus, lifecycleCode := lifecycleStatusForAccountCheck(result); lifecycleStatus != "" {
+			var email string
+			if err = tx.QueryRowContext(ctx, `SELECT email FROM accounts WHERE id=?`, *item.AccountID).Scan(&email); err != nil {
+				if !errors.Is(err, sql.ErrNoRows) {
+					return batch, err
+				}
+			} else {
+				currentVersion := int64(0)
+				if err = tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0) FROM login_attempts WHERE account_id=? AND status='success'`, *item.AccountID).Scan(&currentVersion); err != nil {
+					return batch, err
+				}
+				if item.CredentialAttemptID != nil && currentVersion != *item.CredentialAttemptID {
+					// A successful re-login superseded this probe while it was in
+					// flight. Keep the check history, but do not persist a stale
+					// lifecycle conclusion.
+					lifecycleStatus = ""
+				}
+			}
+			if email != "" && lifecycleStatus != "" {
+				if err = recordLifecycleEventTx(ctx, tx, LifecycleEvent{
+					AccountID:  *item.AccountID,
+					Email:      email,
+					Source:     "official",
+					Status:     lifecycleStatus,
+					Reason:     result.Message,
+					Code:       lifecycleCode,
+					HTTPStatus: lifecycleHTTPStatus(result.HTTPStatus),
+					DedupeKey:  fmt.Sprintf("account_check:%d", id),
+					ObservedAt: time.UnixMilli(now),
+				}); err != nil {
+					return batch, err
+				}
+			}
+		}
 	}
 	if batch.State == "active" && state == "finished" && result.Outcome == "proxy_error" && result.ProxyHTTPStatus != nil && *result.ProxyHTTPStatus == 407 {
 		if _, err = tx.ExecContext(ctx, `UPDATE account_check_batches SET state='stopping',stop_reason='shared_proxy_failure' WHERE id=? AND state='active'`, batch.ID); err != nil {

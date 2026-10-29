@@ -29,11 +29,13 @@ type recoveryOperationError struct {
 	RetryAfterSeconds int
 	RequiresAction    bool
 	CredentialInvalid bool
+	Diagnostic        *store.RecoveryDiagnostic
 }
 
 func (e *recoveryOperationError) Error() string {
 	messages := map[string]string{
 		"group_unavailable":  "所选 Sub2 分组已删除、停用或不支持 OpenAI，请重新选择",
+		"group_conflict":     "Sub2 当前分组与本批目标不一致，请选择保留当前分组或按目标分组修正",
 		"import_unconfirmed": "尚未核对到 Sub2 创建结果；可重新核对，避免重复创建",
 		"network_error":      "网络暂不可用，稍后自动重试", "timeout": "请求超时，稍后自动重试",
 		"interrupted": "任务被中断，稍后自动核对", "rate_limited": "请求受到限流，等待后自动重试",

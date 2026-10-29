@@ -190,6 +190,10 @@ func Open(dbPath, keyPath string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err = migrateAccountRecoveryGroupDecisions(s); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err = s.migrateAccountDeliveries(); err != nil {
 		db.Close()
 		return nil, err
@@ -309,6 +313,20 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   duration_ms INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS login_attempts_account_started ON login_attempts(account_id, started_at DESC);
+CREATE TABLE IF NOT EXISTS account_lifecycle_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id INTEGER,
+  email TEXT NOT NULL,
+  source TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT,
+  code TEXT,
+  http_status INTEGER NOT NULL DEFAULT 0,
+  dedupe_key TEXT NOT NULL UNIQUE,
+  observed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS account_lifecycle_events_account_observed ON account_lifecycle_events(account_id, observed_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS account_lifecycle_events_email_observed ON account_lifecycle_events(email, observed_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS store_meta (
   key TEXT PRIMARY KEY,
   value_cipher BLOB NOT NULL
@@ -1016,8 +1034,8 @@ func (s *Store) FinishAttempt(ctx context.Context, id int64, success bool, resul
 
 func (s *Store) finishAttemptTx(ctx context.Context, tx *sql.Tx, id int64, success bool, result *Result, failure *Failure) error {
 	var accountID, started int64
-	var status string
-	err := tx.QueryRowContext(ctx, `SELECT account_id,started_at,status FROM login_attempts WHERE id=?`, id).Scan(&accountID, &started, &status)
+	var email, status string
+	err := tx.QueryRowContext(ctx, `SELECT la.account_id,a.email,la.started_at,la.status FROM login_attempts la JOIN accounts a ON a.id=la.account_id WHERE la.id=?`, id).Scan(&accountID, &email, &started, &status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrAttemptNotFound
 	} else if err != nil {
@@ -1062,6 +1080,21 @@ func (s *Store) finishAttemptTx(ctx context.Context, tx *sql.Tx, id int64, succe
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE login_attempts SET status='failed',stage=?,error_code=?,error_message=?,http_status=?,retryable=?,finished_at=?,duration_ms=? WHERE id=?`, failure.Stage, failure.Code, failure.Message, failure.HTTPStatus, boolInt(failure.Retryable), now, duration, id); err != nil {
 			return err
+		}
+		if isOfficialLifecycleStatus(status) {
+			if err := recordLifecycleEventTx(ctx, tx, LifecycleEvent{
+				AccountID:  accountID,
+				Email:      email,
+				Source:     "official",
+				Status:     status,
+				Reason:     failure.Message,
+				Code:       failure.Code,
+				HTTPStatus: failure.HTTPStatus,
+				DedupeKey:  fmt.Sprintf("login_attempt:%d", id),
+				ObservedAt: time.Unix(now, 0),
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

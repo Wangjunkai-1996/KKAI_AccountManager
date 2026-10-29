@@ -18,20 +18,25 @@ var (
 // AccountDelivery tracks a login's handoff without exposing its credentials or
 // counting first delivery as an account recovery.
 type AccountDelivery struct {
-	Options           DeliveryOptions `json:"delivery_options"`
-	ID                int64           `json:"id"`
-	AccountID         int64           `json:"account_id"`
-	CredentialVersion int64           `json:"-"`
-	DestinationKey    string          `json:"-"`
-	RecoveryTaskID    int64           `json:"recovery_task_id,omitempty"`
-	State             string          `json:"state"`
-	LastError         string          `json:"last_error,omitempty"`
-	NextRetryAt       *time.Time      `json:"next_retry_at,omitempty"`
-	ManualAction      string          `json:"manual_action,omitempty"`
-	RequiresAction    bool            `json:"requires_action"`
-	RetryCount        int             `json:"retry_count"`
-	CreatedAt         time.Time       `json:"created_at"`
-	UpdatedAt         time.Time       `json:"updated_at"`
+	BlockedReason     string              `json:"blocked_reason,omitempty"` // Runtime status; never persisted.
+	Options           DeliveryOptions     `json:"delivery_options"`
+	ID                int64               `json:"id"`
+	AccountID         int64               `json:"account_id"`
+	CredentialVersion int64               `json:"-"`
+	DestinationKey    string              `json:"-"`
+	RecoveryTaskID    int64               `json:"recovery_task_id,omitempty"`
+	State             string              `json:"state"`
+	LastError         string              `json:"last_error,omitempty"`
+	FailureStage      string              `json:"failure_stage,omitempty"`
+	ErrorCode         string              `json:"error_code,omitempty"`
+	HTTPStatus        int                 `json:"http_status,omitempty"`
+	Diagnostic        *RecoveryDiagnostic `json:"diagnostic,omitempty"`
+	NextRetryAt       *time.Time          `json:"next_retry_at,omitempty"`
+	ManualAction      string              `json:"manual_action,omitempty"`
+	RequiresAction    bool                `json:"requires_action"`
+	RetryCount        int                 `json:"retry_count"`
+	CreatedAt         time.Time           `json:"created_at"`
+	UpdatedAt         time.Time           `json:"updated_at"`
 }
 
 func (s *Store) migrateAccountDeliveries() error {

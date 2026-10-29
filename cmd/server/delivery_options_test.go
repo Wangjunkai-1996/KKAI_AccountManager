@@ -102,13 +102,41 @@ func TestDeliveryOptionsDefaultsSnapshotAndGroups(t *testing.T) {
 	if err = s.applyDeliveryGroups(ctx, task, binding, detail); err != nil || puts != 1 {
 		t.Fatalf("group retry duplicated write: %v", err)
 	}
+	// Sub2 omits all three optional group fields when the account has no
+	// groups. That response is an authoritative empty assignment, so the
+	// selected target may be written and confirmed normally.
+	delete(detail, "group_ids")
+	if err = s.applyDeliveryGroups(ctx, task, binding, detail); err != nil || puts != 2 {
+		t.Fatalf("omitted empty groups were not applied: puts=%d err=%v", puts, err)
+	}
 	detail["group_ids"] = []any{float64(8)}
-	if err = s.applyDeliveryGroups(ctx, task, binding, detail); err == nil || puts != 1 {
+	if err = s.applyDeliveryGroups(ctx, task, binding, detail); err == nil || puts != 2 {
 		t.Fatal("unexpected existing group overwritten")
 	}
 	marker["operation_id"] = "external-account"
-	if err = s.applyDeliveryGroups(ctx, task, binding, detail); err != nil || puts != 1 {
+	if err = s.applyDeliveryGroups(ctx, task, binding, detail); err != nil || puts != 2 {
 		t.Fatal("existing account configuration changed")
+	}
+}
+
+func TestSub2GroupIDsAcceptsCompleteAccountRepresentations(t *testing.T) {
+	tests := []struct {
+		name   string
+		detail map[string]any
+		want   []int64
+	}{
+		{name: "group ids", detail: map[string]any{"group_ids": []any{float64(8), float64(8), float64(4)}}, want: []int64{4, 8}},
+		{name: "groups", detail: map[string]any{"groups": []any{map[string]any{"id": float64(8)}, map[string]any{"id": float64(4)}}}, want: []int64{4, 8}},
+		{name: "account groups", detail: map[string]any{"account_groups": []any{map[string]any{"group_id": float64(8)}, map[string]any{"group_id": float64(4)}}}, want: []int64{4, 8}},
+		{name: "omitted means empty", detail: map[string]any{"status": "active"}, want: []int64{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, valid := sub2GroupIDs(test.detail)
+			if !valid || !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("group IDs = %#v, want %#v", got, test.want)
+			}
+		})
 	}
 }
 

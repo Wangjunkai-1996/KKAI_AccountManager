@@ -127,7 +127,7 @@ func (s *Store) ClaimAccountRecoveryRecheckForDestination(ctx context.Context, n
 }
 
 func (s *Store) claimAccountRecoveryRecheck(ctx context.Context, now time.Time, destinations ...string) (*AccountRecoveryRecheck, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginQueueTx(ctx)
 	if err != nil {
 		return nil, err
 	}

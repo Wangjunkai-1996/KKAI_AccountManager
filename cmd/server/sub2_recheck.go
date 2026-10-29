@@ -16,7 +16,9 @@ func (s *sub2RecoveryService) processNextRecheck() bool {
 	check, err := s.store.ClaimAccountRecoveryRecheckForDestination(ctx, time.Now(), s.sub2.destinationKey)
 	cancel()
 	if err != nil {
-		s.pauseRecovery(0)
+		if !errors.Is(err, store.ErrQueueDeferred) || !retryStorageRead(s.ctx, err) {
+			s.pauseRecovery(0, err)
+		}
 		return false
 	}
 	if check == nil {
@@ -30,7 +32,7 @@ func (s *sub2RecoveryService) finishRecheck(check store.AccountRecoveryRecheck, 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.store.FinishAccountRecoveryRecheck(ctx, check.TaskID, state, message, next); err != nil {
-		s.pauseRecovery(check.TaskID)
+		s.pauseRecovery(check.TaskID, err)
 	}
 }
 
