@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -32,7 +33,7 @@ func testOAuthStore(t *testing.T) (*store.Store, int64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinishAttempt(ctx, attempt.ID, true, &store.Result{AccessToken: "at", RefreshToken: "rt", ChatGPTAccountID: "chatgpt-1", ExpiresAt: 123}, nil); err != nil {
+	if err := s.FinishAttempt(ctx, attempt.ID, true, &store.Result{AccessToken: "at", RefreshToken: "rt", ChatGPTAccountID: "chatgpt-1", PlanType: "plus", ExpiresAt: 123}, nil); err != nil {
 		t.Fatal(err)
 	}
 	attempt.Release()
@@ -41,6 +42,233 @@ func testOAuthStore(t *testing.T) (*store.Store, int64) {
 		t.Fatal(err)
 	}
 	return s, account.ID
+}
+
+func finishFreeCleanupLogin(t *testing.T, history *store.Store) int64 {
+	t.Helper()
+	ctx := context.Background()
+	attempt, err := history.StartAttempt(ctx, "sub2@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer attempt.Release()
+	if err := history.FinishAttempt(ctx, attempt.ID, true, &store.Result{AccessToken: "free-at", RefreshToken: "free-rt", PlanType: "free", ChatGPTAccountID: "free-workspace"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	return attempt.ID
+}
+
+func TestOfficialSub2CleanupFence(t *testing.T) {
+	for _, scenario := range []string{"confirmed", "discarded", "free", "has_shadow", "already_missing", "unsupported", "delete_404_target_present", "untrusted_target_404", "no_evidence", "unbound_evidence", "stale_version", "wrong_operation", "wrong_workspace", "pause_unconfirmed", "changed_revision", "lost_delete_response", "lost_pause_response"} {
+		t.Run(scenario, func(t *testing.T) {
+			history, accountID := testOAuthStore(t)
+			ctx := context.Background()
+			if err := history.UpdateOAuthResultByID(ctx, accountID, store.Result{AccessToken: "paid-at", RefreshToken: "paid-rt", PlanType: "plus", ChatGPTAccountID: "paid-workspace"}); err != nil {
+				t.Fatal(err)
+			}
+			binding, err := history.LinkSub2Account(ctx, "test", accountID, 42, "linked-fixture")
+			if err != nil {
+				t.Fatal(err)
+			}
+			version := binding.CredentialVersion
+			if scenario == "free" {
+				version = finishFreeCleanupLogin(t, history)
+			} else if scenario == "discarded" {
+				attempt, err := history.StartAttempt(ctx, "sub2@example.com")
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = history.FinishAttempt(ctx, attempt.ID, false, nil, &store.Failure{Stage: "password", Code: "password_rejected"})
+				attempt.Release()
+				if err != nil {
+					t.Fatal(err)
+				}
+				account, err := history.GetAccountByID(ctx, accountID)
+				if err != nil || !account.IsTerminalUnavailable() || account.IsOfficialUnavailable() {
+					t.Fatalf("expected local retirement, got %s: %v", account.Status, err)
+				}
+				if _, err := history.GetCredentialsByID(ctx, accountID); !errors.Is(err, store.ErrAccountDiscarded) {
+					t.Fatalf("discarded credential read: %v", err)
+				}
+				if _, _, err := history.BeginAttempt(ctx, store.Credentials{Email: account.Email, Password: "fixture", ExistingAccountID: accountID}); !errors.Is(err, store.ErrAccountDiscarded) {
+					t.Fatalf("discarded relogin: %v", err)
+				}
+			} else if scenario != "no_evidence" {
+				key := binding.OfficialCleanupEvidenceKey(version)
+				if scenario == "unbound_evidence" {
+					key = "fixture"
+				}
+				if err := history.MarkOfficialUnavailable(ctx, accountID, version, binding, store.LifecycleEvent{
+					Source: "official", Status: "deleted", Code: "account_deleted", DedupeKey: key,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "stale_version" {
+				version++
+			}
+			var paused, deleted atomic.Bool
+			deleted.Store(scenario == "already_missing")
+			var writes atomic.Int32
+			const beforePause = "2026-11-20T00:00:00.123456Z"
+			const afterPause = "2026-11-20T00:00:01.987654Z"
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.Method + " " + r.URL.Path {
+				case "GET /admin/accounts/42":
+					if deleted.Load() {
+						if scenario == "untrusted_target_404" {
+							http.NotFound(w, r)
+							return
+						}
+						w.WriteHeader(http.StatusNotFound)
+						_, _ = w.Write([]byte(`{"code":404,"message":"account not found"}`))
+						return
+					}
+					stamp := beforePause
+					if paused.Load() {
+						stamp = afterPause
+						if scenario == "changed_revision" {
+							stamp = "2026-11-20T00:00:02Z"
+						}
+					}
+					operation := binding.OperationID
+					if scenario == "wrong_operation" {
+						operation = "different-operation"
+					}
+					workspace := "paid-workspace"
+					if scenario == "wrong_workspace" {
+						workspace = "other-workspace"
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
+						"id": 42, "platform": "openai", "type": "oauth", "schedulable": !paused.Load(), "updated_at": stamp,
+						"credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": workspace},
+						"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID, "operation_id": operation}},
+					}})
+				case "GET /admin/accounts":
+					ids := []map[string]int{{"id": 42}}
+					if scenario == "has_shadow" {
+						ids = append(ids, map[string]int{"id": 51, "parent_account_id": 42})
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"items": ids, "total": len(ids)}})
+				case "POST /admin/accounts/42/schedulable":
+					writes.Add(1)
+					var request map[string]any
+					if json.NewDecoder(r.Body).Decode(&request) != nil || request["schedulable"] != false {
+						t.Error("expected a pause request")
+					}
+					if scenario == "unsupported" {
+						http.NotFound(w, r)
+						return
+					}
+					paused.Store(scenario != "pause_unconfirmed")
+					if scenario == "lost_pause_response" {
+						panic(http.ErrAbortHandler)
+					}
+					_, _ = w.Write([]byte(`{"code":0,"data":{"id":42,"schedulable":false,"updated_at":"` + afterPause + `"}}`))
+				case "DELETE /admin/accounts/42":
+					writes.Add(1)
+					if !paused.Load() {
+						t.Error("delete before verified pause")
+					}
+					if scenario == "delete_404_target_present" {
+						w.WriteHeader(http.StatusNotFound)
+						_, _ = w.Write([]byte(`{"code":404,"message":"account not found"}`))
+						return
+					}
+					deleted.Store(true)
+					if scenario == "lost_delete_response" {
+						panic(http.ErrAbortHandler)
+					}
+					_, _ = w.Write([]byte(`{"code":0}`))
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			service := &sub2ImportService{store: history, baseURL: server.URL, adminAPIKey: "fixture", destinationKey: "test", client: server.Client()}
+			if scenario == "discarded" {
+				if _, err := service.ensureTask(ctx, accountID); !errors.Is(err, store.ErrAccountDiscarded) {
+					t.Fatalf("discarded import: %v", err)
+				}
+			}
+			err = service.deleteDeletedAccount(ctx, accountID, version)
+			if scenario == "lost_pause_response" {
+				if err == nil || deleted.Load() || !paused.Load() {
+					t.Fatalf("ambiguous pause advanced to delete: %v", err)
+				}
+				err = service.deleteDeletedAccount(ctx, accountID, version)
+			}
+			switch scenario {
+			case "no_evidence", "unbound_evidence", "stale_version", "wrong_operation", "wrong_workspace", "already_missing":
+				if writes.Load() != 0 {
+					t.Fatalf("issued %d writes without ownership evidence", writes.Load())
+				}
+			}
+			wantDelete := scenario == "confirmed" || scenario == "discarded" || scenario == "free" || scenario == "already_missing" || scenario == "lost_delete_response" || scenario == "lost_pause_response"
+			if deleted.Load() != (wantDelete || scenario == "untrusted_target_404") || (err == nil) != wantDelete {
+				t.Fatalf("deleted = %t, err = %v, want delete = %t", deleted.Load(), err, wantDelete)
+			}
+			retained, err := history.GetSub2Import(ctx, "test", accountID)
+			if err != nil || retained.ID != binding.ID || retained.Sub2AccountID != binding.Sub2AccountID || (retained.State == store.Sub2RemoteMissing) != wantDelete {
+				t.Fatalf("unexpected retained binding: %+v, %v", retained, err)
+			}
+			switch scenario {
+			case "unsupported", "delete_404_target_present", "untrusted_target_404", "pause_unconfirmed", "changed_revision":
+				if retained.State != "cleanup_pending" {
+					t.Fatalf("unconfirmed retirement left automatic queue: %s", retained.State)
+				}
+			}
+			if scenario == "free" {
+				_, saved, err := history.GetOAuthResultByID(ctx, accountID)
+				if err != nil || saved.RefreshToken != "free-rt" {
+					t.Fatal("Free credential was not retained")
+				}
+			}
+		})
+	}
+}
+
+func TestFreeCleanupRequiresLatestR1PaidObservation(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		paid string
+		want bool
+	}{
+		{name: "plus_to_free", paid: "plus", want: true},
+		{name: "team_to_free", paid: "team", want: true},
+		{name: "pro_to_free", paid: "pro", want: false},
+		{name: "paid_then_unknown_then_free", paid: "", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			history, accountID := testOAuthStore(t)
+			if tc.paid != "" {
+				if err := history.UpdateOAuthResultByID(ctx, accountID, store.Result{AccessToken: "paid-at", RefreshToken: "paid-rt", PlanType: tc.paid}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			binding, err := history.LinkSub2Account(ctx, "test", accountID, 42, "linked-free-fixture")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.paid == "" {
+				if err := history.UpdateOAuthResultByID(ctx, accountID, store.Result{AccessToken: "unknown-at", RefreshToken: "unknown-rt", PlanType: "pro"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			finishFreeCleanupLogin(t, history)
+			binding, err = history.GetSub2Import(ctx, "test", accountID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := history.HasFreeSub2CleanupEvidence(ctx, binding)
+			if err != nil || got != tc.want {
+				t.Fatalf("evidence=%t err=%v want=%t binding=%+v", got, err, tc.want, binding)
+			}
+		})
+	}
 }
 
 func TestSub2ImportServiceStartStop(t *testing.T) {
@@ -91,6 +319,12 @@ func TestSub2ImportPostsAndReconcilesUnGroupedAccount(t *testing.T) {
 			}
 			if !body.SkipDefaultGroupBind || len(body.Data.Accounts) != 1 || body.Data.Accounts[0].Concurrency != 3 {
 				t.Fatalf("unexpected import request: %+v", body)
+			}
+			if mode := body.Data.Accounts[0].Extra["codex_fingerprint_mode"]; mode != "full" {
+				t.Fatalf("new account fingerprint mode = %v, want full", mode)
+			}
+			if _, exists := body.Data.Accounts[0].Extra["codex_fingerprint_seed"]; exists {
+				t.Fatal("fingerprint seed must be generated by Sub2")
 			}
 			importedName = body.Data.Accounts[0].Name
 			operationID = body.Data.Accounts[0].Extra["kkai_auth_import"].(map[string]any)["operation_id"].(string)
@@ -247,7 +481,9 @@ func TestSub2NotFoundRecordsOneLifecycleEventAndTransientFailureDoesNot(t *testi
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/404") {
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"code":404,"message":"account not found"}`))
 			return
 		}
 		if strings.HasSuffix(r.URL.Path, "/503") {
@@ -414,313 +650,207 @@ func TestListSub2AccountStatusesMarksTransportFailuresUnknown(t *testing.T) {
 	}
 }
 
-func TestDeleteDeletedAccountVerifiesAndDeletesRemoteBinding(t *testing.T) {
+func officialCleanupFixture(t *testing.T) (*store.Store, store.Sub2Import) {
+	t.Helper()
 	history, accountID := testOAuthStore(t)
 	ctx := context.Background()
-	task, _, err := history.CreateOrGetSub2Import(ctx, "test", accountID, "operation", "idempotency", []byte("{}"))
+	binding, err := history.LinkSub2Account(ctx, "test", accountID, 42, "linked-cleanup")
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := history.UpdateSub2Import(ctx, task.ID, "imported", true, 42, ""); err != nil {
-		t.Fatal(err)
-	}
-	version, err := history.GetAccountCredentialVersion(ctx, accountID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var deleted atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.Method + " " + r.URL.Path {
-		case http.MethodGet + " /api/v1/admin/accounts/42":
-			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
-				"id": 42, "platform": "openai", "type": "oauth",
-				"credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": "chatgpt-1"},
-				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID}},
-			}})
-		case http.MethodDelete + " /api/v1/admin/accounts/42":
-			deleted.Add(1)
-			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"message": "deleted"}})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
-	if err := service.deleteDeletedAccount(ctx, accountID, version); err != nil {
-		t.Fatal(err)
-	}
-	if deleted.Load() != 1 {
-		t.Fatalf("delete requests = %d, want 1", deleted.Load())
-	}
-	if _, err := history.GetSub2Import(ctx, "test", accountID); !errors.Is(err, store.ErrSub2ImportNotFound) {
-		t.Fatalf("deleted remote binding retained: %v", err)
-	}
-}
-
-func TestDeleteDeletedAccountRetriesTransientFailureAndFinalizesTombstone(t *testing.T) {
-	history, accountID := testOAuthStore(t)
-	ctx := context.Background()
-	task, _, err := history.CreateOrGetSub2Import(ctx, "test", accountID, "operation-retry", "idempotency-retry", []byte("{}"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := history.UpdateSub2Import(ctx, task.ID, "imported", true, 42, ""); err != nil {
 		t.Fatal(err)
 	}
 	attempt, err := history.StartAttempt(ctx, "sub2@example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer attempt.Release()
 	if err := history.FinishAttempt(ctx, attempt.ID, false, nil, &store.Failure{Code: "account_deleted", AccountStatus: "deleted"}); err != nil {
 		t.Fatal(err)
 	}
-	attempt.Release()
-	version, err := history.GetAccountCredentialVersion(ctx, accountID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var gets atomic.Int32
-	var deletes atomic.Int32
+	return history, binding
+}
+
+func TestDeleteDeletedAccountVerifiesAndDeletesRemoteBinding(t *testing.T) {
+	testConditionalDelete(t, false, false)
+}
+
+func TestDeleteDeletedAccountRetriesTransientFailureAndFinalizesTombstone(t *testing.T) {
+	testConditionalDelete(t, true, false)
+}
+
+func TestDeleteDeletedAccountHoldsAccountLeaseAcrossRemoteDelete(t *testing.T) {
+	testConditionalDelete(t, false, true)
+}
+
+func testConditionalDelete(t *testing.T, transientFailure, checkLease bool) {
+	t.Helper()
+	history, binding := officialCleanupFixture(t)
+	ctx := context.Background()
+	var gets, deletes atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method + " " + r.URL.Path {
-		case http.MethodGet + " /api/v1/admin/accounts/42":
-			if gets.Add(1) == 1 {
-				http.Error(w, "temporary failure", http.StatusBadGateway)
+		case "GET /admin/accounts/42":
+			if gets.Add(1) == 1 && transientFailure {
+				w.WriteHeader(http.StatusBadGateway)
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
-				"id": 42, "platform": "openai", "type": "oauth",
-				"credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": "chatgpt-1"},
-				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID}},
-			}})
-		case http.MethodDelete + " /api/v1/admin/accounts/42":
+			if deletes.Load() != 0 {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"code":404,"reason":"ACCOUNT_NOT_FOUND","message":"account not found"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"code":0,"data":{"id":42,"platform":"openai","type":"oauth","schedulable":false,"updated_at":"2026-11-20T00:00:00Z","credentials":{"email":"sub2@example.com","chatgpt_account_id":"chatgpt-1"}}}`)
+		case "GET /admin/accounts":
+			_, _ = io.WriteString(w, `{"code":0,"data":{"items":[{"id":42}],"total":1}}`)
+		case "DELETE /admin/accounts/42":
+			if checkLease {
+				lease, err := history.AcquireAccountRecovery(r.Context(), binding.AccountID)
+				if err == nil {
+					lease.Release()
+				}
+				if !errors.Is(err, store.ErrAccountBusy) {
+					t.Errorf("account lease was available during remote delete: %v", err)
+				}
+			}
 			deletes.Add(1)
-			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"message": "deleted"}})
+			_, _ = io.WriteString(w, `{"code":0}`)
 		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
-	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
-	if err := service.deleteDeletedAccount(ctx, accountID, version); err == nil {
-		t.Fatal("transient remote failure unexpectedly succeeded")
+	service := &sub2ImportService{store: history, baseURL: server.URL, adminAPIKey: "fixture", destinationKey: "test", client: server.Client()}
+	if transientFailure {
+		err := service.deleteDeletedAccount(ctx, binding.AccountID, binding.CredentialVersion)
+		pending, readErr := history.GetSub2ImportByID(ctx, binding.ID)
+		if err == nil || readErr != nil || pending.State != "cleanup_pending" || deletes.Load() != 0 {
+			t.Fatalf("transient read did not preserve pending cleanup: %+v, %v, %v", pending, err, readErr)
+		}
 	}
-	pending, err := history.GetSub2Import(ctx, "test", accountID)
-	if err != nil || pending.State != "cleanup_pending" {
-		t.Fatalf("cleanup task = %+v, err=%v", pending, err)
-	}
-	// The worker applies a retry delay; invoke the durable cleanup directly so
-	// this test does not wait for wall-clock backoff.
-	if err := service.deleteDeletedAccount(ctx, accountID, version); err != nil {
+	if err := service.deleteDeletedAccount(ctx, binding.AccountID, binding.CredentialVersion); err != nil {
 		t.Fatal(err)
 	}
-	if account, err := history.GetAccount(ctx, "sub2@example.com"); err == nil {
-		pending, _ := history.GetSub2Import(ctx, "test", accountID)
-		t.Fatalf("deleted tombstone was not finalized: account=%+v task=%+v gets=%d", account, pending, gets.Load())
-	} else if !errors.Is(err, store.ErrAccountNotFound) {
-		t.Fatalf("deleted tombstone lookup failed: %v", err)
+	retained, err := history.GetSub2ImportByID(ctx, binding.ID)
+	if err != nil || retained.State != store.Sub2RemoteMissing || retained.Sub2AccountID != binding.Sub2AccountID ||
+		retained.OperationID != binding.OperationID || deletes.Load() != 1 {
+		t.Fatalf("unexpected retirement result: %+v, %v, deletes=%d", retained, err, deletes.Load())
 	}
-	if _, err := history.GetSub2Import(ctx, "test", accountID); !errors.Is(err, store.ErrSub2ImportNotFound) {
-		t.Fatalf("cleanup binding remains: %v", err)
+	account, err := history.GetAccountByID(ctx, binding.AccountID)
+	if err != nil || !account.IsOfficialUnavailable() {
+		t.Fatalf("official tombstone lost: %+v, %v", account, err)
+	}
+	if _, _, err := history.GetOAuthResultByID(ctx, binding.AccountID); !errors.Is(err, store.ErrAccountOfficialUnavailable) {
+		t.Fatalf("official account OAuth read returned %v", err)
+	}
+}
+
+func TestDeleteDeletedAccountKeepsBindingIfLifecycleWriteFails(t *testing.T) {
+	f := newRecoveryFixture(t, false)
+	ctx := context.Background()
+	binding, err := f.store.GetSub2Import(ctx, "fixture", f.account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.Exec(`CREATE TRIGGER lifecycle_storage_failure BEFORE INSERT ON account_lifecycle_events BEGIN SELECT RAISE(ABORT,'storage failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.service.sub2.finishDeletedSub2Binding(ctx, f.account, binding, http.StatusNotFound); err == nil {
+		t.Fatal("lifecycle storage failure was ignored")
+	}
+	retained, err := f.store.GetSub2Import(ctx, "fixture", f.account.ID)
+	if err != nil || retained.Sub2AccountID != binding.Sub2AccountID || retained.State != binding.State {
+		t.Fatalf("binding was lost after evidence write failed: %+v err=%v", retained, err)
 	}
 }
 
 func TestPendingCleanupDoesNotDeleteAfterNewSuccessfulLogin(t *testing.T) {
 	history, accountID := testOAuthStore(t)
 	ctx := context.Background()
-	task, _, err := history.CreateOrGetSub2Import(ctx, "test", accountID, "operation-new-login", "idempotency-new-login", []byte("{}"))
+	binding, err := history.LinkSub2Account(ctx, "test", accountID, 42, "linked-free")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := history.UpdateSub2Import(ctx, task.ID, "cleanup_pending", true, 42, "temporary failure"); err != nil {
+	version := finishFreeCleanupLogin(t, history)
+	pending, err := history.GetSub2ImportByID(ctx, binding.ID)
+	if err != nil || pending.State != "cleanup_pending" || pending.CredentialVersion != version {
+		t.Fatalf("Free login did not queue cleanup: %+v, %v", pending, err)
+	}
+	if err := history.UpdateOAuthResultByID(ctx, accountID, store.Result{
+		AccessToken: "paid-at", RefreshToken: "paid-rt", PlanType: "plus", ChatGPTAccountID: "chatgpt-1",
+	}); err != nil {
 		t.Fatal(err)
 	}
-	oldVersion, err := history.GetAccountCredentialVersion(ctx, accountID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	attempt, err := history.StartAttempt(ctx, "sub2@example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := history.FinishAttempt(ctx, attempt.ID, true, &store.Result{AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "chatgpt-1"}, nil); err != nil {
-		t.Fatal(err)
-	}
-	attempt.Release()
-	var deleted atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
-			deleted.Add(1)
-		}
-		http.Error(w, "unexpected remote cleanup", http.StatusInternalServerError)
+		t.Errorf("obsolete cleanup issued %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
-	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
-	if err := service.deleteDeletedAccount(ctx, accountID, oldVersion); err == nil {
-		t.Fatal("obsolete cleanup unexpectedly succeeded")
+	service := &sub2ImportService{store: history, baseURL: server.URL, adminAPIKey: "fixture", destinationKey: "test", client: server.Client()}
+	if err := service.deleteDeletedAccount(ctx, accountID, version); !errors.Is(err, store.ErrAccountRecoveryStale) && !errors.Is(err, store.ErrAccountRecoveryVersionChanged) {
+		t.Fatalf("obsolete cleanup returned %v", err)
 	}
-	current, err := history.GetSub2Import(ctx, "test", accountID)
-	if err != nil || current.State != "imported" {
-		t.Fatalf("pending cleanup was not restored for the new login: %+v, err=%v", current, err)
-	}
-	if deleted.Load() != 0 {
-		t.Fatalf("obsolete cleanup issued %d remote deletes", deleted.Load())
+	retained, err := history.GetSub2ImportByID(ctx, binding.ID)
+	if err != nil || retained.State == store.Sub2RemoteMissing || retained.Sub2AccountID != binding.Sub2AccountID {
+		t.Fatalf("original binding lost: %+v, %v", retained, err)
 	}
 }
 
 func TestDeleteDeletedAccountSkipsChangedBinding(t *testing.T) {
-	history, accountID := testOAuthStore(t)
-	ctx := context.Background()
-	task, _, err := history.CreateOrGetSub2Import(ctx, "test", accountID, "operation", "idempotency", []byte("{}"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := history.UpdateSub2Import(ctx, task.ID, "imported", true, 42, ""); err != nil {
-		t.Fatal(err)
-	}
-	version, err := history.GetAccountCredentialVersion(ctx, accountID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var deleted atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.Method + " " + r.URL.Path {
-		case http.MethodGet + " /api/v1/admin/accounts/42":
-			if err := history.UpdateSub2Import(ctx, task.ID, "unknown", true, 0, "changed during verification"); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
-				"id": 42, "platform": "openai", "type": "oauth",
-				"credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": "chatgpt-1"},
-				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID}},
-			}})
-		case http.MethodDelete + " /api/v1/admin/accounts/42":
-			deleted.Add(1)
-			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"message": "deleted"}})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
-	if err := service.deleteDeletedAccount(ctx, accountID, version); err == nil {
-		t.Fatal("changed binding deletion unexpectedly succeeded")
-	}
-	if deleted.Load() != 0 {
-		t.Fatalf("delete requests = %d, want 0", deleted.Load())
-	}
+	testCleanupIdentityConflict(t, true)
 }
 
-func TestDeleteDeletedAccountMarksIdentityConflictManual(t *testing.T) {
-	history, accountID := testOAuthStore(t)
+func TestDeleteDeletedAccountKeepsIdentityConflictPending(t *testing.T) {
+	testCleanupIdentityConflict(t, false)
+}
+
+func testCleanupIdentityConflict(t *testing.T, changeBinding bool) {
+	t.Helper()
+	history, binding := officialCleanupFixture(t)
 	ctx := context.Background()
-	task, _, err := history.CreateOrGetSub2Import(ctx, "test", accountID, "operation-manual", "idempotency-manual", []byte("{}"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := history.UpdateSub2Import(ctx, task.ID, "cleanup_pending", true, 42, "temporary failure"); err != nil {
-		t.Fatal(err)
-	}
-	version, err := history.GetAccountCredentialVersion(ctx, accountID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	var reads atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/admin/accounts/42" {
+			t.Errorf("conflicting cleanup issued %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		reads.Add(1)
+		workspace := "other-workspace"
+		if changeBinding {
+			workspace = "chatgpt-1"
+			if err := history.UpdateSub2Import(r.Context(), binding.ID, "imported", true, 43, "changed"); err != nil {
+				t.Error(err)
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
-			"id": 42, "platform": "openai", "type": "oauth",
-			"credentials": map[string]any{"email": "other@example.com", "chatgpt_account_id": "other-workspace"},
-			"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID + 1}},
-		}})
+		_, _ = fmt.Fprintf(w, `{"code":0,"data":{"id":42,"platform":"openai","type":"oauth","schedulable":false,"updated_at":"2026-11-20T00:00:00Z","credentials":{"email":"sub2@example.com","chatgpt_account_id":%q}}}`, workspace)
 	}))
 	defer server.Close()
-	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
-	if err := service.deleteDeletedAccount(ctx, accountID, version); err == nil {
-		t.Fatal("identity conflict unexpectedly succeeded")
+	service := &sub2ImportService{store: history, baseURL: server.URL, adminAPIKey: "fixture", destinationKey: "test", client: server.Client()}
+	if err := service.deleteDeletedAccount(ctx, binding.AccountID, binding.CredentialVersion); !errors.Is(err, store.ErrAccountRecoveryStale) || reads.Load() != 1 {
+		t.Fatalf("expected conflict after one detail read: %v, reads=%d", err, reads.Load())
 	}
-	current, err := history.GetSub2Import(ctx, "test", accountID)
-	if err != nil || current.State != "cleanup_manual" {
-		t.Fatalf("cleanup conflict state = %+v, err=%v", current, err)
+	retained, err := history.GetSub2ImportByID(ctx, binding.ID)
+	wantState, wantID := "cleanup_pending", binding.Sub2AccountID
+	if changeBinding {
+		wantState, wantID = "imported", 43
+	}
+	if err != nil || retained.State != wantState || retained.Sub2AccountID != wantID {
+		t.Fatalf("unexpected binding after conflict: %+v, %v", retained, err)
 	}
 }
 
 func TestDeleteDeletedAccountSkipsChangedCredentialVersion(t *testing.T) {
-	history, accountID := testOAuthStore(t)
-	ctx := context.Background()
-	task, _, err := history.CreateOrGetSub2Import(ctx, "test", accountID, "operation", "idempotency-version", []byte("{}"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := history.UpdateSub2Import(ctx, task.ID, "imported", true, 42, ""); err != nil {
-		t.Fatal(err)
-	}
-	var requests atomic.Int32
+	history, binding := officialCleanupFixture(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		http.Error(w, "unexpected remote request", http.StatusInternalServerError)
+		t.Errorf("stale cleanup issued %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
-	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
-	if err := service.deleteDeletedAccount(ctx, accountID, 0); err == nil {
-		t.Fatal("credential version change unexpectedly allowed deletion")
-	}
-	if requests.Load() != 0 {
-		t.Fatalf("remote requests = %d, want 0", requests.Load())
-	}
-}
-
-func TestDeleteDeletedAccountHoldsAccountLeaseAcrossRemoteDelete(t *testing.T) {
-	history, accountID := testOAuthStore(t)
-	ctx := context.Background()
-	task, _, err := history.CreateOrGetSub2Import(ctx, "test", accountID, "operation", "idempotency-lease", []byte("{}"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := history.UpdateSub2Import(ctx, task.ID, "imported", true, 42, ""); err != nil {
-		t.Fatal(err)
-	}
-	version, err := history.GetAccountCredentialVersion(ctx, accountID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	getStarted := make(chan struct{})
-	allowGet := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.Method + " " + r.URL.Path {
-		case http.MethodGet + " /api/v1/admin/accounts/42":
-			close(getStarted)
-			<-allowGet
-			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
-				"id": 42, "platform": "openai", "type": "oauth",
-				"credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": "chatgpt-1"},
-				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID}},
-			}})
-		case http.MethodDelete + " /api/v1/admin/accounts/42":
-			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"message": "deleted"}})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-	service := &sub2ImportService{store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client()}
-	deleteDone := make(chan error, 1)
-	go func() { deleteDone <- service.deleteDeletedAccount(ctx, accountID, version) }()
-	select {
-	case <-getStarted:
-	case <-time.After(time.Second):
-		t.Fatal("remote verification did not start")
-	}
-	if _, _, err := history.BeginAttempt(ctx, store.Credentials{Email: "sub2@example.com", Password: "new-password"}); !errors.Is(err, store.ErrAccountBusy) {
-		t.Fatalf("login was allowed during destructive cleanup: %v", err)
-	}
-	close(allowGet)
-	if err := <-deleteDone; err != nil {
-		t.Fatal(err)
+	service := &sub2ImportService{store: history, baseURL: server.URL, adminAPIKey: "fixture", destinationKey: "test", client: server.Client()}
+	if err := service.deleteDeletedAccount(context.Background(), binding.AccountID, binding.CredentialVersion+1); !errors.Is(err, store.ErrAccountRecoveryVersionChanged) {
+		t.Fatalf("stale credential version returned %v", err)
 	}
 }
 
@@ -777,6 +907,22 @@ func TestSyncSub2AccountAssociation(t *testing.T) {
 			}
 			mutations := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost && r.URL.Path == "/api/v1/admin/accounts/usage/batch" {
+					var body struct {
+						AccountIDs []int64 `json:"account_ids"`
+						Force      bool    `json:"force"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.AccountIDs) != 1 || body.Force {
+						t.Errorf("unexpected read-only usage request: %+v, err=%v", body, err)
+					}
+					usage := make(map[string]any, len(body.AccountIDs))
+					for _, id := range body.AccountIDs {
+						usage[strconv.FormatInt(id, 10)] = map[string]any{"source": "cached", "five_hour": map[string]any{"utilization": 0}}
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"usage": usage}})
+					return
+				}
 				if r.Method != http.MethodGet {
 					mutations++
 					t.Error("association mutated Sub2")
@@ -850,6 +996,61 @@ func TestSyncSub2AccountStatusesFailureIncludesEveryAccount(t *testing.T) {
 		if !exists || !status.Unknown || !status.Stale || status.Error == "" || status.Exists {
 			t.Fatalf("failed status omitted or reported absent: %d, %+v", id, status)
 		}
+	}
+}
+
+func TestSyncSub2AccountStatusesAttachesBatchUsage(t *testing.T) {
+	history, accountID := testOAuthStore(t)
+	ctx := context.Background()
+	task, _, err := history.CreateOrGetSub2Import(ctx, "test", accountID, "linked-operation", "idempotency", []byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.UpdateSub2Import(ctx, task.ID, "imported", true, 42, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	var usageRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case http.MethodGet + " /api/v1/admin/accounts/42":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"id":42,"platform":"openai","type":"oauth","status":"active","schedulable":true,"credentials":{"email":"sub2@example.com","chatgpt_account_id":"chatgpt-1"}}}`))
+		case http.MethodPost + " /api/v1/admin/accounts/usage/batch":
+			usageRequests.Add(1)
+			var body struct {
+				AccountIDs []int64 `json:"account_ids"`
+				Force      bool    `json:"force"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body.AccountIDs) != 1 || body.AccountIDs[0] != 42 || body.Force {
+				t.Fatalf("unexpected usage request: %+v", body)
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"usage":{"42":{"source":"cached","updated_at":"2026-10-29T12:00:00Z","five_hour":{"utilization":77}}}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	service := &sub2ImportService{
+		store: history, baseURL: server.URL + "/api/v1", adminAPIKey: "secret", destinationKey: "test", client: server.Client(),
+	}
+	imports, statuses, err := service.syncAccountStatuses(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(imports) != 1 || usageRequests.Load() != 1 {
+		t.Fatalf("imports=%+v usage requests=%d", imports, usageRequests.Load())
+	}
+	status := statuses[accountID]
+	if !status.Exists || status.Unknown || status.Stale || status.UsageUnknown || status.UsageStale {
+		t.Fatalf("status = %+v", status)
+	}
+	if status.Quota == nil || status.Quota.FiveHour == nil || status.Quota.FiveHour.UsedPercent == nil || *status.Quota.FiveHour.UsedPercent != 77 {
+		t.Fatalf("batch usage was not attached: %+v", status.Quota)
 	}
 }
 

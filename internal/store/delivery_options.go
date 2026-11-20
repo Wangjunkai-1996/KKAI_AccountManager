@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"sort"
@@ -13,11 +15,12 @@ import (
 )
 
 type DeliveryOptions struct {
-	GroupIDs    []int64 `json:"group_ids"`
-	Priority    int     `json:"priority"`
-	Concurrency int     `json:"concurrency"`
-	Merchant    string  `json:"merchant,omitempty"`
-	Deadline    string  `json:"deadline,omitempty"`
+	GroupIDs       []int64 `json:"group_ids"`
+	EgressRouteIDs []int64 `json:"egress_route_ids,omitempty"`
+	Priority       int     `json:"priority"`
+	Concurrency    int     `json:"concurrency"`
+	Merchant       string  `json:"merchant,omitempty"`
+	Deadline       string  `json:"deadline,omitempty"`
 }
 
 func DefaultDeliveryOptions() DeliveryOptions {
@@ -35,6 +38,21 @@ func (o *DeliveryOptions) Validate() error {
 	if o.Priority < 0 || int64(o.Priority) > 2147483647 || o.Concurrency < 1 || o.Concurrency > 10000 || len(o.GroupIDs) > 100 {
 		return errors.New("优先级应为非负整数，并发应为 1–10000，分组最多 100 个")
 	}
+	if len(o.EgressRouteIDs) > 32 {
+		return errors.New("出口最多选择 32 个")
+	}
+	var routes []int64
+	seenRoutes := map[int64]bool{}
+	for _, id := range o.EgressRouteIDs {
+		if id <= 0 {
+			return errors.New("出口 ID 必须为正整数")
+		}
+		if !seenRoutes[id] {
+			seenRoutes[id] = true
+			routes = append(routes, id)
+		}
+	}
+	o.EgressRouteIDs = routes
 	seen := map[int64]bool{}
 	ids := make([]int64, 0, len(o.GroupIDs))
 	for _, id := range o.GroupIDs {
@@ -141,6 +159,16 @@ func (s *Store) QueueAccountDelivery(ctx context.Context, accountID int64, desti
 	if err := options.Validate(); err != nil {
 		return AccountDelivery{}, err
 	}
+	account, err := s.GetAccountByID(ctx, accountID)
+	if err != nil {
+		return AccountDelivery{}, err
+	}
+	if err := account.Sub2EligibilityError(); err != nil {
+		return AccountDelivery{}, err
+	}
+	if !IsSub2PaidPlan(account.PlanType) {
+		return AccountDelivery{}, ErrSub2PlanIneligible
+	}
 	version, err := s.GetAccountCredentialVersion(ctx, accountID)
 	if err != nil {
 		return AccountDelivery{}, err
@@ -158,8 +186,35 @@ func (s *Store) QueueAccountDelivery(ctx context.Context, accountID int64, desti
 		return AccountDelivery{}, err
 	}
 	defer tx.Rollback()
+	missing, err := sub2AccountMissing(ctx, tx, destination, accountID)
+	if err != nil {
+		return AccountDelivery{}, err
+	}
+	if missing {
+		return AccountDelivery{}, ErrSub2AccountMissing
+	}
+	var bound bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sub2_imports WHERE destination_key=? AND account_id=?)`, destination, accountID).Scan(&bound); err != nil {
+		return AccountDelivery{}, err
+	}
 	existing, lookupErr := scanAccountDelivery(tx.QueryRowContext(ctx, accountDeliverySelect+` WHERE destination_key=? AND account_id=? AND credential_version=?`, destination, accountID, version))
 	if lookupErr == nil {
+		// An explicit first import can replace an update-only repair intent that
+		// never acquired a remote binding. A new operation fences old workers.
+		if !bound && existing.RecoveryTaskID == 0 && !existing.AllowCreate && (existing.State == "canceled" || existing.State == "requires_action") {
+			nonce := make([]byte, 16)
+			if _, err := rand.Read(nonce); err != nil {
+				return AccountDelivery{}, err
+			}
+			operation := "delivery-" + hex.EncodeToString(nonce)
+			if _, err := tx.ExecContext(ctx, `UPDATE account_deliveries SET state='queued',allow_create=1,import_operation_id=?,options_json=?,last_error='',manual_action='',next_retry_at=NULL,retry_count=0,updated_at=? WHERE id=?`, operation, string(raw), now, existing.ID); err != nil {
+				return AccountDelivery{}, err
+			}
+			if err := tx.Commit(); err != nil {
+				return AccountDelivery{}, err
+			}
+			return s.GetAccountDelivery(ctx, existing.ID)
+		}
 		if existing.State == "canceled" {
 			return existing, ErrAccountDeliverySettled
 		}
@@ -205,7 +260,7 @@ func (s *Store) QueueAccountDelivery(ctx context.Context, accountID int64, desti
 	}
 	// Keep the unique-key race idempotent: another request may have inserted
 	// the same intent after our lookup but before this insert.
-	if _, err = tx.ExecContext(ctx, `INSERT INTO account_deliveries(account_id,credential_version,destination_key,state,created_at,updated_at,options_json) VALUES(?,?,?,'queued',?,?,?) ON CONFLICT(destination_key,account_id,credential_version) DO NOTHING`, accountID, version, destination, now, now, string(raw)); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO account_deliveries(account_id,credential_version,destination_key,state,created_at,updated_at,options_json,allow_create) VALUES(?,?,?,'queued',?,?,?,?) ON CONFLICT(destination_key,account_id,credential_version) DO NOTHING`, accountID, version, destination, now, now, string(raw), boolInt(!bound)); err != nil {
 		return AccountDelivery{}, err
 	}
 	if err := tx.Commit(); err != nil {

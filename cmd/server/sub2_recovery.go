@@ -14,6 +14,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,8 @@ import (
 
 const recoveryClientID = sub2OAuthClientID
 
+const recoveryAuthPageTimeoutMaxFailures = 3
+
 var (
 	errRecoveryNotCandidate = errors.New("账号没有可恢复的最新认证失败检测结果")
 	errRecoveryManualReview = errors.New("上次恢复未能确认结果，Sub2 调度仍处于暂停状态，请先人工核对")
@@ -35,6 +38,7 @@ var (
 type sub2RecoveryService struct {
 	store            *store.Store
 	loginWithProxies func(context.Context, string, string, string, string, string) (*login.LoginResult, error)
+	checkLoginProxy  func(context.Context, string) (login.ProxyCheckResult, error)
 	sub2             *sub2ImportService
 
 	timeout      time.Duration
@@ -51,7 +55,10 @@ type sub2RecoveryService struct {
 }
 
 type sub2RecoveryRequest struct {
-	AccountID int64 `json:"account_id"`
+	AccountID          int64  `json:"account_id"`
+	ManualAttempt      bool   `json:"manual_attempt"`
+	ExpectedTaskID     *int64 `json:"expected_task_id"`
+	ExpectedRetryCount *int   `json:"expected_retry_count"`
 }
 
 type recoveryOAuthCredentials struct {
@@ -98,6 +105,7 @@ func newSub2RecoveryService(history *store.Store, loginService *login.Service, i
 	}
 	if loginService != nil {
 		service.loginWithProxies = loginService.LoginWithProxiesContext
+		service.checkLoginProxy = loginService.CheckProxy
 	}
 	return service
 }
@@ -213,14 +221,22 @@ func (s *sub2RecoveryService) handleCollection(w http.ResponseWriter, r *http.Re
 			recoveryAPIError(w, http.StatusBadRequest, "invalid_account_id", "account_id 必须是正整数")
 			return
 		}
-		task, created, err := s.enqueue(r.Context(), req.AccountID)
+		if req.ManualAttempt && (req.ExpectedTaskID == nil || req.ExpectedRetryCount == nil) {
+			recoveryAPIError(w, http.StatusBadRequest, "recovery_snapshot_required", "请刷新账号状态后重试")
+			return
+		}
+		task, created, err := s.enqueueWithIntent(r.Context(), req.AccountID, req.ManualAttempt, false, req)
 		if err != nil {
 			status, code := http.StatusInternalServerError, "recovery_failed"
 			switch {
+			case errors.Is(err, store.ErrAccountDiscarded):
+				status, code = http.StatusGone, "account_discarded"
 			case errors.Is(err, store.ErrAccountBusy):
 				status, code = http.StatusConflict, "recovery_busy"
 			case errors.Is(err, store.ErrAccountRecoveryVersionChanged):
 				status, code = http.StatusConflict, "recovery_version_changed"
+			case errors.Is(err, store.ErrAccountRecoveryStale):
+				status, code = http.StatusConflict, "recovery_state_changed"
 			case errors.Is(err, store.ErrAccountNotFound):
 				status, code = http.StatusNotFound, "account_not_found"
 			case errors.Is(err, errRecoveryNotCandidate):
@@ -311,6 +327,15 @@ func (s *sub2RecoveryService) handleAction(w http.ResponseWriter, r *http.Reques
 		}
 		return
 	}
+	if strings.HasSuffix(path, "/recheck") {
+		id, err := strconv.ParseInt(strings.TrimSuffix(path, "/recheck"), 10, 64)
+		if err != nil || id <= 0 {
+			recoveryAPIError(w, http.StatusBadRequest, "invalid_task_id", "恢复任务 ID 无效")
+			return
+		}
+		s.handleRecheckRetry(w, r, id)
+		return
+	}
 	if strings.HasSuffix(path, "/groups") {
 		rawID := strings.TrimSuffix(path, "/groups")
 		id, err := strconv.ParseInt(strings.Trim(rawID, "/"), 10, 64)
@@ -343,6 +368,18 @@ func (s *sub2RecoveryService) handleAction(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, automatic ...bool) (store.AccountRecoveryTask, bool, error) {
+	return s.enqueueWithIntent(ctx, accountID, false, len(automatic) > 0 && automatic[0])
+}
+
+func (s *sub2RecoveryService) enqueueWithIntent(ctx context.Context, accountID int64, manual, automatic bool, expected ...sub2RecoveryRequest) (store.AccountRecoveryTask, bool, error) {
+	if failure, err := s.automationFailure(ctx, accountID); err != nil {
+		return store.AccountRecoveryTask{}, false, err
+	} else if failure != nil && !(manual && manualLoginRetryAllowed(failure.Code)) {
+		if failure.Code == "account_discarded" {
+			return store.AccountRecoveryTask{}, false, store.ErrAccountDiscarded
+		}
+		return store.AccountRecoveryTask{}, false, failure
+	}
 	account, err := s.store.GetAccountByID(ctx, accountID)
 	if err != nil {
 		return store.AccountRecoveryTask{}, false, err
@@ -370,18 +407,32 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, auto
 	if previousErr != nil && !errors.Is(previousErr, store.ErrAccountRecoveryNotFound) {
 		return previous, false, previousErr
 	}
+	if manual && len(expected) > 0 && (expected[0].ExpectedTaskID == nil || expected[0].ExpectedRetryCount == nil || *expected[0].ExpectedTaskID != previous.ID || *expected[0].ExpectedRetryCount != previous.RetryCount) {
+		return previous, false, store.ErrAccountRecoveryStale
+	}
+	superseded, err := s.successfulLoginSupersedesFailure(ctx, previous)
+	if err != nil {
+		return previous, false, err
+	}
 	if previousErr == nil && previous.Sub2AccountID == binding.Sub2AccountID &&
-		(previous.Resumable || previous.RetryAction == "relogin") && (previous.State == store.RecoveryFailed || previous.State == store.RecoveryUnknown) {
+		!superseded && (previous.Resumable || previous.RetryAction == "relogin" || manual && manualLoginRetryAllowed(previous.ErrorCode)) && (previous.State == store.RecoveryFailed || previous.State == store.RecoveryUnknown) {
 		// Resume is independent of the original 401 and current Sub2 error flag:
 		// the successful apply may already have made the account active/paused.
 		retryTask := previous
-		if retryTask.RetryAction != "relogin" {
+		if previous.ResultCredentialAttemptID == 0 {
+			retryTask.RetryAction = "relogin"
+		} else if retryTask.RetryAction != "relogin" {
 			retryTask.RetryAction = "resume"
 		}
 		if err := s.verifyRecoveryRetry(ctx, retryTask, detail, account, binding); err != nil {
 			return previous, false, err
 		}
-		task, err := s.store.RetryAccountRecoveryTask(ctx, previous.ID, retryTask.RetryAction == "relogin")
+		var task store.AccountRecoveryTask
+		if manual {
+			task, err = s.store.RetryManualAccountRecoveryTask(ctx, previous, retryTask.RetryAction == "relogin")
+		} else {
+			task, err = s.store.RetryAccountRecoveryTask(ctx, previous.ID, retryTask.RetryAction == "relogin")
+		}
 		if err == nil {
 			s.notify()
 		} else if errors.Is(err, store.ErrAccountRecoveryNotResumable) {
@@ -394,7 +445,12 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, auto
 		}
 		return task, false, err
 	}
-	if len(automatic) > 0 && automatic[0] {
+	if previousErr == nil && previous.RetryAction == "manual" {
+		if !superseded {
+			return previous, false, errRecoveryManualReview
+		}
+	}
+	if automatic {
 		status, _ := detail["status"].(string)
 		if !s.autoRecovery.Load() || !strings.EqualFold(status, "error") {
 			return store.AccountRecoveryTask{}, false, errRecoveryNotCandidate
@@ -423,7 +479,13 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, auto
 		}
 
 	}
-	task, created, err := s.store.CreateOrGetAccountRecoveryTask(ctx, accountID, checkID, binding.Sub2AccountID, original, s.sub2.destinationKey)
+	var task store.AccountRecoveryTask
+	var created bool
+	if manual {
+		task, created, err = s.store.CreateOrGetManualAccountRecoveryTask(ctx, accountID, checkID, binding.Sub2AccountID, original, s.sub2.destinationKey, previous.ID)
+	} else {
+		task, created, err = s.store.CreateOrGetAccountRecoveryTask(ctx, accountID, checkID, binding.Sub2AccountID, original, s.sub2.destinationKey)
+	}
 	if err == nil && created {
 		s.notify()
 	}
@@ -433,6 +495,10 @@ func (s *sub2RecoveryService) enqueue(ctx context.Context, accountID int64, auto
 func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.timeout)
 	defer cancel()
+	if task.ManualAttempt() {
+		ctx = login.WithSingleAttempt(ctx)
+		task.RetryAction = task.ExecutionRetryAction()
+	}
 	fail := func(stage string, err error) { s.recordRecoveryFailure(task, stage, err) }
 	require := func(stage, code string) { fail(stage, &recoveryOperationError{Code: code, RequiresAction: true}) }
 	lease, err := s.store.AcquireAccountRecovery(ctx, task.AccountID)
@@ -447,6 +513,13 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		return
 	}
 	defer lease.Release()
+	if failure, err := s.recoveryAutomationFailure(ctx, task.AccountID, task.ID); err != nil {
+		s.pauseRecovery(task.ID, err)
+		return
+	} else if failure != nil {
+		fail(store.RecoveryValidating, failure)
+		return
+	}
 	account, err := s.store.GetAccountByID(ctx, task.AccountID)
 	if err != nil {
 		if errors.Is(err, store.ErrAccountNotFound) {
@@ -475,6 +548,23 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 	if err != nil || binding.State != "imported" || binding.Sub2AccountID != task.Sub2AccountID {
 		require(store.RecoveryValidating, "identity_changed")
 		return
+	}
+	if task.Purpose == "delivery" && task.DeliveryID > 0 {
+		delivery, err := s.store.GetAccountDelivery(ctx, task.DeliveryID)
+		if err != nil {
+			fail(store.RecoveryValidating, err)
+			return
+		}
+		if !delivery.MatchesOriginalBinding(binding) {
+			require(store.RecoveryValidating, "identity_changed")
+			return
+		}
+		if delivery.OriginalBindingID > 0 {
+			if err := s.processBoundLifecycleOAuth(ctx, lease, task, delivery, account, binding); err != nil {
+				fail(store.RecoveryValidating, err)
+			}
+			return
+		}
 	}
 	if !s.setState(task.ID, store.RecoveryValidating, "正在核对账号绑定和调度状态") {
 		return
@@ -546,24 +636,84 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		require(store.RecoveryIdentityVerified, "identity_changed")
 		return
 	}
+	// A successfully saved unsupported or unconfirmed plan is local-only.
+	// Free retirement may already have settled this task in the login transaction.
+	if !store.IsSub2PaidPlan(oauth.PlanType) {
+		if task, err := s.store.GetAccountRecoveryTaskByID(ctx, task.ID); err == nil && task.State != store.RecoveryCanceled {
+			s.setState(task.ID, store.RecoveryCanceled, "当前登录未确认付费套餐，凭据仅保留在 AUTH")
+		}
+		return
+	}
 	account.ChatGPTAccountID = oauth.ChatGPTAccountID
-	account.OrganizationID, account.PlanType, account.ExpiresAt = oauth.OrganizationID, oauth.PlanType, oauth.ExpiresAt
+	account.OrganizationID, account.ExpiresAt = oauth.OrganizationID, oauth.ExpiresAt
+	if strings.TrimSpace(oauth.PlanType) != "" {
+		account.PlanType = oauth.PlanType
+	}
 	savedTask, err := s.store.GetAccountRecoveryTaskByID(ctx, task.ID)
 	if err != nil {
 		s.pauseRecovery(task.ID, err)
 		return
 	}
 	task = savedTask
-	if s.store.ValidateAccountRecoveryVersion(ctx, task.ID) != nil {
-		require(store.RecoveryIdentityVerified, "version_changed")
+	if err := s.store.ValidateAccountRecoveryVersion(ctx, task.ID); err != nil {
+		if errors.Is(err, store.ErrAccountRecoveryVersionChanged) {
+			require(store.RecoveryIdentityVerified, "version_changed")
+		} else {
+			s.pauseRecovery(task.ID, err)
+		}
 		return
 	}
 	if !s.setState(task.ID, store.RecoveryIdentityVerified, "新凭据身份已核对") {
 		return
 	}
+	// Login can take minutes. Re-read the binding and remote ownership before
+	// writing; the earlier snapshot cannot authorize overwriting an operator's
+	// changes. The API has no conditional write, so retain the post-write gates.
+	currentBinding, err := s.sub2.store.GetSub2Import(ctx, s.sub2.destinationKey, task.AccountID)
+	if err != nil && !errors.Is(err, store.ErrSub2ImportNotFound) {
+		s.pauseRecovery(task.ID, err)
+		return
+	}
+	if err != nil || currentBinding.State != "imported" || currentBinding.ID != binding.ID ||
+		currentBinding.Sub2AccountID != binding.Sub2AccountID || currentBinding.OperationID != binding.OperationID {
+		require(store.RecoveryIdentityVerified, "identity_changed")
+		return
+	}
+	beforeApply, err := s.sub2Account(withSub2StatusFresh(ctx), task.Sub2AccountID)
+	if err != nil {
+		fail(store.RecoveryIdentityVerified, err)
+		return
+	}
+	if verifySub2RecoveryIdentity(beforeApply, task.Sub2AccountID, task.AccountID, account, currentBinding) != nil {
+		require(store.RecoveryIdentityVerified, "identity_changed")
+		return
+	}
+	if recoveryAccountDisabled(beforeApply) {
+		require(store.RecoveryIdentityVerified, "account_unavailable")
+		return
+	}
+	if value, ok := boolField(beforeApply, "schedulable"); !ok || value {
+		require(store.RecoveryIdentityVerified, "manual_pause")
+		return
+	}
+	previousExtra, _ := detail["extra"].(map[string]any)
+	currentExtra, _ := beforeApply["extra"].(map[string]any)
+	if !reflect.DeepEqual(previousExtra["kkai_auth_import"], currentExtra["kkai_auth_import"]) ||
+		!recoveryMarkerMatches(beforeApply, task) && !reflect.DeepEqual(previousExtra["kkai_auth_recovery"], currentExtra["kkai_auth_recovery"]) {
+		require(store.RecoveryIdentityVerified, "identity_changed")
+		return
+	}
+	if s.store.ValidateAccountRecoveryVersion(ctx, task.ID) != nil {
+		require(store.RecoveryIdentityVerified, "version_changed")
+		return
+	}
 	// A verified remote checkpoint already contains this version. Re-probe it
 	// without rewriting credentials or clearing an error raised by Sub2.
-	alreadyApplied := recoveryMarkerMatches(detail, task) && verifySub2RecoveryMetadata(detail, task.Sub2AccountID, task.AccountID, account, binding) == nil
+	alreadyApplied := recoveryMarkerMatches(beforeApply, task)
+	if alreadyApplied && verifySub2RecoveryMetadata(beforeApply, task.Sub2AccountID, task.AccountID, account, binding) != nil {
+		require(store.RecoveryIdentityVerified, "identity_changed")
+		return
+	}
 	if !alreadyApplied {
 		if !s.setState(task.ID, store.RecoveryApplyingCredentials, "正在写回原 Sub2 账号") {
 			return
@@ -594,6 +744,11 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		return
 	}
 	if err := s.verifySub2AccountProbe(ctx, task.Sub2AccountID); err != nil {
+		failure := classifyRecoveryError(err)
+		if accountDeactivationConfirmed(failure.Code) {
+			s.handleOfficialSub2Probe(ctx, lease, binding, task.ResultCredentialAttemptID, failure)
+			return
+		}
 		fail(store.RecoveryCredentialsApplied, err)
 		return
 	}
@@ -610,10 +765,23 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		require(store.RecoveryEnablingSchedule, "version_changed")
 		return
 	}
-	if task.Purpose == "delivery" {
-		if err := s.sub2.applyDeliveryGroups(ctx, task, binding, beforeEnable); err != nil {
+	if task.Purpose == "delivery" && task.DeliveryID > 0 {
+		delivery, err := s.store.GetAccountDelivery(ctx, task.DeliveryID)
+		if err != nil {
 			fail(store.RecoveryEnablingSchedule, err)
 			return
+		}
+		latestBinding, err := s.store.GetSub2Import(ctx, s.sub2.destinationKey, task.AccountID)
+		if err != nil || latestBinding.ID != binding.ID || latestBinding.Sub2AccountID != binding.Sub2AccountID ||
+			latestBinding.OperationID != binding.OperationID || !delivery.MatchesOriginalBinding(latestBinding) {
+			require(store.RecoveryEnablingSchedule, "identity_changed")
+			return
+		}
+		if delivery.AllowCreate {
+			if err := s.sub2.applyDeliveryGroups(ctx, task, binding, beforeEnable); err != nil {
+				fail(store.RecoveryEnablingSchedule, err)
+				return
+			}
 		}
 	}
 	if !task.OriginalSchedulable {
@@ -642,8 +810,41 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		require(store.RecoveryEnablingSchedule, "checkpoint_unconfirmed")
 		return
 	}
-	if !s.setState(task.ID, store.RecoveryCompleted, "凭据已更新，Sub2 检测通过并已开启调度") {
+	completion := "凭据已更新，Sub2 检测通过并已开启调度"
+	now := time.Now()
+	status, _ := enabled["status"].(string)
+	expiry, expires := remoteStatusTime(enabled["expires_at"])
+	if !strings.EqualFold(status, "active") || expires && !expiry.After(now) {
+		completion = "凭据已更新，调度开关已开启，当前不可调度"
+	}
+	for _, field := range []string{"rate_limit_reset_at", "overload_until", "temp_unschedulable_until"} {
+		if until, ok := remoteStatusTime(enabled[field]); ok && until.After(now) {
+			completion = "凭据已更新，调度开关已开启，冷却期间不可调度"
+			break
+		}
+	}
+	if !s.setState(task.ID, store.RecoveryCompleted, completion) {
 		s.pauseSchedule(task.Sub2AccountID)
+	}
+}
+
+func (s *sub2RecoveryService) handleOfficialSub2Probe(ctx context.Context, lease *store.AccountRecoveryLease, binding store.Sub2Import, version int64, failure *recoveryOperationError) {
+	if version <= 0 || !accountDeactivationConfirmed(failure.Code) {
+		return
+	}
+	event := store.LifecycleEvent{
+		Source: "official", Status: "deleted_or_deactivated", Code: failure.Code, HTTPStatus: failure.HTTPStatus,
+		Reason: failure.Error(), DedupeKey: binding.OfficialCleanupEvidenceKey(version),
+	}
+	if err := s.store.MarkOfficialUnavailable(ctx, binding.AccountID, version, binding, event); err != nil {
+		log.Printf("无法保存官方终态证据: account_id=%d", binding.AccountID)
+		return
+	}
+	binding.State = "cleanup_pending"
+	if binding.CredentialVersion == version {
+		if err := s.sub2.deleteDeletedAccountWithLease(ctx, lease, binding.AccountID, version, binding); err != nil {
+			log.Printf("官方终态清理未确认: account_id=%d", binding.AccountID)
+		}
 	}
 }
 
@@ -657,6 +858,11 @@ func (s *sub2RecoveryService) pauseSchedule(id int64) {
 
 func (s *sub2RecoveryService) loginAgain(ctx context.Context, taskID int64, account store.Account, lease *store.AccountRecoveryLease) (recoveryOAuthCredentials, error) {
 	var out recoveryOAuthCredentials
+	if failure, err := s.recoveryAutomationFailure(ctx, account.ID, taskID); err != nil {
+		return out, err
+	} else if failure != nil {
+		return out, failure
+	}
 	if s.loginWithProxies == nil {
 		return out, &recoveryOperationError{Code: "configuration", RequiresAction: true}
 	}
@@ -666,6 +872,10 @@ func (s *sub2RecoveryService) loginAgain(ctx context.Context, taskID int64, acco
 	}
 	if strings.TrimSpace(credentials.Password) == "" {
 		return out, &recoveryOperationError{Code: "login_required", RequiresAction: true}
+	}
+	credentials.Proxy, err = s.recoveryLoginProxy(ctx, account, taskID, credentials.Proxy)
+	if err != nil {
+		return out, err
 	}
 	expectedCredentialVersion, err := s.store.GetAccountCredentialVersion(ctx, account.ID)
 	if err != nil {
@@ -677,7 +887,7 @@ func (s *sub2RecoveryService) loginAgain(ctx context.Context, taskID int64, acco
 	}
 	defer release()
 	persistCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	_, attempt, err := lease.BeginAttempt(persistCtx, store.Credentials{Email: credentials.Email, Password: credentials.Password, TOTPSecret: credentials.TOTPSecret, Proxy: credentials.Proxy, ExistingAccountID: account.ID})
+	_, attempt, err := lease.BeginAttempt(persistCtx, store.Credentials{Email: credentials.Email, Password: credentials.Password, TOTPSecret: credentials.TOTPSecret, Proxy: credentials.Proxy, ExistingAccountID: account.ID, SingleAttempt: login.IsSingleAttempt(ctx)})
 	cancel()
 	if err != nil {
 		return out, err
@@ -686,6 +896,9 @@ func (s *sub2RecoveryService) loginAgain(ctx context.Context, taskID int64, acco
 	result, loginErr := s.loginWithProxies(ctx, credentials.Email, credentials.Password, credentials.TOTPSecret, credentials.Proxy, "")
 	finishCtx, finishCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer finishCancel()
+	if loginErr == nil && result != nil {
+		loginErr = verifyStoredOAuthSubject(finishCtx, s.store, account.ID, result.AccessToken)
+	}
 	if loginErr != nil {
 		info := describeLoginError(loginErr)
 		if err := lease.FinishAttempt(finishCtx, taskID, attempt.ID, false, nil, &store.Failure{Stage: info.Stage, Code: info.Code, HTTPStatus: info.HTTPStatus, Retryable: info.Retryable, Message: info.Message, AccountStatus: info.AccountStatus}); err != nil {
@@ -773,8 +986,34 @@ func (s *sub2RecoveryService) validateCandidate(ctx context.Context, accountID i
 }
 
 func (s *sub2RecoveryService) sub2Account(ctx context.Context, id int64) (map[string]any, error) {
+	// Capture ownership before the request: a late 404 cannot retire a new
+	// operation which happens to reuse the same remote ID.
+	bindings, err := s.store.ListSub2ImportsForRemoteID(ctx, s.sub2.destinationKey, id)
+	if err != nil {
+		return nil, err
+	}
+	if len(bindings) > 1 {
+		return nil, &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
+	}
+	var snapshot *store.Sub2Import
+	for _, binding := range bindings {
+		if binding.DestinationKey == s.sub2.destinationKey && binding.Sub2AccountID == id {
+			if binding.State == store.Sub2RemoteMissing {
+				return nil, &recoveryOperationError{Code: "sub2_account_missing", RequiresAction: true}
+			}
+			if binding.State == "imported" {
+				snapshot = &binding
+			}
+		}
+	}
 	var detail map[string]any
 	status, err := s.sub2.apiJSONStatus(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(id, 10), nil, &detail)
+	if isSub2NotFound(err) && snapshot != nil {
+		if markErr := s.sub2.markBindingRemoteMissing(ctx, *snapshot); markErr != nil {
+			return nil, markErr
+		}
+		return nil, &recoveryOperationError{Code: "sub2_account_missing", HTTPStatus: http.StatusNotFound, RequiresAction: true}
+	}
 	if err != nil && status > 0 {
 		var classified *recoveryOperationError
 		if !errors.As(err, &classified) {
@@ -785,12 +1024,29 @@ func (s *sub2RecoveryService) sub2Account(ctx context.Context, id int64) (map[st
 }
 
 func (s *sub2RecoveryService) setSchedulable(ctx context.Context, id int64, enabled bool) error {
+	bindings, err := s.store.ListSub2ImportsForRemoteID(ctx, s.sub2.destinationKey, id)
+	if err != nil {
+		return err
+	}
+	for _, binding := range bindings {
+		if binding.State == store.Sub2RemoteMissing {
+			return &recoveryOperationError{Code: "sub2_account_missing", RequiresAction: true}
+		}
+	}
 	return s.sub2JSONBody(ctx, http.MethodPost, "/admin/accounts/"+strconv.FormatInt(id, 10)+"/schedulable", map[string]any{"schedulable": enabled}, nil)
 }
 
 func (s *sub2RecoveryService) applyCredentials(ctx context.Context, task store.AccountRecoveryTask, credentials recoveryOAuthCredentials) error {
+	if failure, err := s.automationFailure(ctx, task.AccountID); err != nil {
+		return err
+	} else if failure != nil {
+		return failure
+	}
 	values := map[string]any{"access_token": credentials.AccessToken, "refresh_token": credentials.RefreshToken, "client_id": recoveryClientID,
-		"organization_id": credentials.OrganizationID, "plan_type": credentials.PlanType}
+		"organization_id": credentials.OrganizationID}
+	if strings.TrimSpace(credentials.PlanType) != "" {
+		values["plan_type"] = credentials.PlanType
+	}
 	if credentials.Email != "" {
 		values["email"] = credentials.Email
 	}
@@ -836,7 +1092,7 @@ func recoveryTaskRetryDelay(task store.AccountRecoveryTask, failure *recoveryOpe
 func recoveryRetryDelay(failure *recoveryOperationError, previousFailures int) time.Duration {
 	delay := time.Minute
 	switch failure.Code {
-	case "rate_limited", "probe_failed", "protocol_error", "login_failed", login.LoginErrorBrowserRuntimePermission:
+	case "rate_limited", "probe_failed", "protocol_error", "login_failed", "auth_page_timeout", login.LoginErrorBrowserRuntimePermission:
 		delay = 5 * time.Minute
 	case "upstream_error":
 		delay = 2 * time.Minute
@@ -874,6 +1130,13 @@ func classifyRecoveryLoginError(err error) *recoveryOperationError {
 		return classified
 	}
 	info := describeLoginError(err)
+	// The overall login deadline is joined with its last attempt error. Keep
+	// the page-wait classification so repeated waits cannot escape its budget.
+	if errors.Is(err, login.ErrAuthPageTimeout) && !errors.Is(err, context.Canceled) &&
+		info.AccountStatus == "" && info.HTTPStatus == 0 && info.Retryable &&
+		(info.Code == login.LoginErrorTimeout || info.Code == login.LoginErrorUnexpectedPage) {
+		info.Code = login.LoginErrorUnexpectedPage
+	}
 	retryAfter := 0
 	var retry interface{ RetryAfterDuration() time.Duration }
 	if errors.As(err, &retry) {
@@ -883,8 +1146,12 @@ func classifyRecoveryLoginError(err error) *recoveryOperationError {
 }
 
 func classifyRecoveryLoginInfo(info login.LoginErrorInfo, retryAfter int) *recoveryOperationError {
-	if info.AccountStatus != "" {
+	info = login.NormalizeErrorInfo(info)
+	if accountDeactivationConfirmed(info.Code) || accountDeactivationConfirmed(info.AccountStatus) {
 		return &recoveryOperationError{Code: "account_unavailable", HTTPStatus: info.HTTPStatus, RequiresAction: true}
+	}
+	if login.IsDeterministicFailure(info) {
+		return &recoveryOperationError{Code: info.Code, HTTPStatus: info.HTTPStatus, RequiresAction: true}
 	}
 	isChallenge := info.Code == login.LoginErrorCloudflareChallenge
 	if info.HTTPStatus == http.StatusRequestTimeout {
@@ -907,8 +1174,13 @@ func classifyRecoveryLoginInfo(info login.LoginErrorInfo, retryAfter int) *recov
 		return &recoveryOperationError{Code: "network_error"}
 	case login.LoginErrorCloudflareChallenge:
 		return &recoveryOperationError{Code: "challenge", HTTPStatus: info.HTTPStatus, RetryAfterSeconds: retryAfter}
+	case login.LoginErrorUnexpectedPage:
+		if info.Retryable && info.HTTPStatus == 0 {
+			return &recoveryOperationError{Code: "auth_page_timeout"}
+		}
+		return &recoveryOperationError{Code: "login_required", HTTPStatus: info.HTTPStatus, RequiresAction: true}
 	case login.LoginErrorUnsupportedRegion, login.LoginErrorConfiguration, login.LoginErrorIdentity,
-		login.LoginErrorOAuth, login.LoginErrorTokenExchange, login.LoginErrorUnexpectedPage,
+		login.LoginErrorOAuth, login.LoginErrorTokenExchange,
 		"invalid_password", "incorrect_password", "invalid_otp", "invalid_totp", "invalid_mfa", "mfa_required", "identity_mismatch", "invalid_credentials":
 		return &recoveryOperationError{Code: "login_required", HTTPStatus: info.HTTPStatus, RequiresAction: true}
 	}
@@ -924,7 +1196,7 @@ func classifyRecoveryLoginInfo(info login.LoginErrorInfo, retryAfter int) *recov
 }
 
 func recoveryTaskGone(err error) bool {
-	return errors.Is(err, store.ErrAccountRecoveryNotFound) || errors.Is(err, store.ErrAccountNotFound)
+	return errors.Is(err, store.ErrAccountRecoveryNotFound) || errors.Is(err, store.ErrAccountNotFound) || errors.Is(err, store.ErrAccountRecoveryNotResumable)
 }
 
 func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTask, stage string, err error) {
@@ -946,6 +1218,12 @@ func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTa
 		return
 	}
 	failure := classifyRecoveryError(err)
+	if failure.Code == "auth_page_timeout" && current.RetryCount >= recoveryAuthPageTimeoutMaxFailures-1 {
+		failure = &recoveryOperationError{Code: "auth_page_timeout_exhausted", RequiresAction: true}
+	}
+	if current.ManualAttempt() {
+		failure.RequiresAction = true
+	}
 	record := store.RecoveryFailure{State: store.RecoveryUnknown, Stage: stage, Code: failure.Code, Message: failure.Error(), HTTPStatus: failure.HTTPStatus, Diagnostic: failure.Diagnostic}
 	if failure.RequiresAction {
 		record.RetryAction, record.ManualAction = "manual", failure.Error()
@@ -962,6 +1240,9 @@ func (s *sub2RecoveryService) recordRecoveryFailure(task store.AccountRecoveryTa
 	}
 	if failure.Code == "manual_pause" {
 		record.State = store.RecoveryCanceled
+	}
+	if failure.Code == "account_discarded" {
+		record.State, record.RetryAction, record.ManualAction, record.NextRetryAt = store.RecoveryCanceled, "", "", nil
 	}
 	record.ExpectedState = current.State
 	record.ExpectedUpdatedAt = current.UpdatedAt.UnixMilli()
@@ -984,6 +1265,18 @@ func (s *sub2RecoveryService) verifyRecoveryRetry(ctx context.Context, task stor
 	}
 	if err := s.store.ValidateAccountRecoveryVersion(ctx, task.ID); err != nil {
 		return &recoveryOperationError{Code: "version_changed", RequiresAction: true}
+	}
+	if task.Purpose == "delivery" && task.DeliveryID > 0 {
+		delivery, err := s.store.GetAccountDelivery(ctx, task.DeliveryID)
+		if err != nil {
+			return err
+		}
+		if delivery.OriginalBindingID > 0 {
+			if !delivery.MatchesOriginalBinding(binding) {
+				return &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
+			}
+			return nil
+		}
 	}
 	if !task.OriginalSchedulable || recoveryAccountDisabled(detail) {
 		return &recoveryOperationError{Code: "manual_pause", RequiresAction: true}
@@ -1106,6 +1399,19 @@ func (s *sub2RecoveryService) sub2JSONBody(ctx context.Context, method, path str
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if method == http.MethodPost && strings.HasSuffix(path, "/lifecycle-oauth") && resp.StatusCode == http.StatusBadGateway {
+			var envelope struct {
+				Reason   string            `json:"reason"`
+				Metadata map[string]string `json:"metadata"`
+			}
+			if json.NewDecoder(io.LimitReader(resp.Body, 16<<10)).Decode(&envelope) == nil && envelope.Reason == "LIFECYCLE_PROBE_FAILED" {
+				status, _ := strconv.Atoi(envelope.Metadata["upstream_status"])
+				code := envelope.Metadata["upstream_code"]
+				if (status == http.StatusUnauthorized || status == http.StatusForbidden) && accountDeactivationConfirmed(code) {
+					return &recoveryOperationError{Code: code, HTTPStatus: status}
+				}
+			}
+		}
 		return recoveryHTTPError(resp.StatusCode, recoveryRetryAfter(resp.Header.Get("Retry-After")))
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
@@ -1143,6 +1449,10 @@ func recoveryStageMessage(err error) string {
 }
 
 func safeRecoveryMessage(err error) string {
+	var failure *recoveryOperationError
+	if errors.As(err, &failure) {
+		return failure.Error()
+	}
 	if errors.Is(err, store.ErrAccountBusy) {
 		return "账号已有登录或恢复任务，请稍后重试"
 	}

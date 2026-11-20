@@ -38,6 +38,8 @@ type Credentials struct {
 	// ExistingAccountID makes BeginAttempt require this identity, preventing a
 	// stale history login from recreating a deleted account. Zero allows creation.
 	ExistingAccountID int64
+	// SingleAttempt records explicit one-shot intent before the browser starts.
+	SingleAttempt bool
 }
 
 // Result contains values returned by a successful OAuth login.
@@ -64,9 +66,11 @@ type Failure struct {
 // Account contains safe account metadata. It never contains passwords, TOTP,
 // access tokens, refresh tokens, or proxy credentials.
 type Account struct {
+	CredentialVersion    int64     `json:"credential_version"`
 	ID                   int64     `json:"id"`
 	Email                string    `json:"email"`
 	Status               string    `json:"status"`
+	Sub2Policy           string    `json:"sub2_policy"`
 	ChatGPTAccountID     string    `json:"chatgpt_account_id,omitempty"`
 	OrganizationID       string    `json:"organization_id,omitempty"`
 	PlanType             string    `json:"plan_type,omitempty"`
@@ -96,18 +100,19 @@ type Attempt struct {
 // AttemptRecord is a safe historical login event. It contains no credentials
 // or token values.
 type AttemptRecord struct {
-	ID         int64     `json:"id"`
-	AccountID  int64     `json:"account_id"`
-	Email      string    `json:"email"`
-	Status     string    `json:"status"`
-	Stage      string    `json:"stage,omitempty"`
-	Code       string    `json:"code,omitempty"`
-	Message    string    `json:"message,omitempty"`
-	HTTPStatus int       `json:"http_status,omitempty"`
-	Retryable  bool      `json:"retryable"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at,omitempty"`
-	DurationMS int64     `json:"duration_ms"`
+	ID            int64     `json:"id"`
+	AccountID     int64     `json:"account_id"`
+	Email         string    `json:"email"`
+	Status        string    `json:"status"`
+	Stage         string    `json:"stage,omitempty"`
+	Code          string    `json:"code,omitempty"`
+	Message       string    `json:"message,omitempty"`
+	HTTPStatus    int       `json:"http_status,omitempty"`
+	Retryable     bool      `json:"retryable"`
+	SingleAttempt bool      `json:"single_attempt"`
+	StartedAt     time.Time `json:"started_at"`
+	FinishedAt    time.Time `json:"finished_at,omitempty"`
+	DurationMS    int64     `json:"duration_ms"`
 }
 
 // Sub2Import describes a persisted AUTH -> Sub2API import task. It never
@@ -208,6 +213,14 @@ func Open(dbPath, keyPath string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err = s.convergeTerminalCredentials(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err = s.convergeDiscardedAttempts(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err = s.RecoverInterrupted(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -291,6 +304,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   plan_type TEXT,
   expires_at INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'new',
+	sub2_policy TEXT NOT NULL DEFAULT 'unknown',
   last_error_code TEXT,
   last_error TEXT,
   last_http_status INTEGER NOT NULL DEFAULT 0,
@@ -308,6 +322,11 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   error_message TEXT,
   http_status INTEGER NOT NULL DEFAULT 0,
   retryable INTEGER NOT NULL DEFAULT 0,
+  single_attempt INTEGER NOT NULL DEFAULT 0,
+	plan_type TEXT,
+	chatgpt_account_id TEXT,
+	organization_id TEXT,
+	observation_source TEXT,
   started_at INTEGER NOT NULL,
   finished_at INTEGER NOT NULL DEFAULT 0,
   duration_ms INTEGER NOT NULL DEFAULT 0
@@ -327,6 +346,17 @@ CREATE TABLE IF NOT EXISTS account_lifecycle_events (
 );
 CREATE INDEX IF NOT EXISTS account_lifecycle_events_account_observed ON account_lifecycle_events(account_id, observed_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS account_lifecycle_events_email_observed ON account_lifecycle_events(email, observed_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS lifecycle_request_bindings (
+  request_key TEXT NOT NULL,
+  binding_id INTEGER NOT NULL,
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  sub2_id INTEGER NOT NULL,
+  destination TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  binding_version INTEGER NOT NULL,
+  source_version INTEGER NOT NULL,
+  PRIMARY KEY(request_key,binding_id)
+);
 CREATE TABLE IF NOT EXISTS store_meta (
   key TEXT PRIMARY KEY,
   value_cipher BLOB NOT NULL
@@ -381,7 +411,47 @@ CREATE INDEX IF NOT EXISTS sub2_imports_state_updated ON sub2_imports(state, upd
 			return fmt.Errorf("add sub2 import credential version: %w", err)
 		}
 	}
-	return nil
+	var hasSingleAttempt int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('login_attempts') WHERE name='single_attempt'`).Scan(&hasSingleAttempt); err != nil {
+		return fmt.Errorf("inspect login attempt intent: %w", err)
+	}
+	if hasSingleAttempt == 0 {
+		if _, err := s.db.Exec(`ALTER TABLE login_attempts ADD COLUMN single_attempt INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add login attempt intent: %w", err)
+		}
+	}
+	for _, column := range []struct {
+		name string
+		ddl  string
+	}{
+		{name: "sub2_policy", ddl: "ALTER TABLE accounts ADD COLUMN sub2_policy TEXT NOT NULL DEFAULT 'unknown'"},
+		{name: "plan_type", ddl: "ALTER TABLE login_attempts ADD COLUMN plan_type TEXT"},
+		{name: "chatgpt_account_id", ddl: "ALTER TABLE login_attempts ADD COLUMN chatgpt_account_id TEXT"},
+		{name: "organization_id", ddl: "ALTER TABLE login_attempts ADD COLUMN organization_id TEXT"},
+		{name: "observation_source", ddl: "ALTER TABLE login_attempts ADD COLUMN observation_source TEXT"},
+	} {
+		var exists int
+		table := "accounts"
+		if column.name != "sub2_policy" {
+			table = "login_attempts"
+		}
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, table, column.name).Scan(&exists); err != nil {
+			return fmt.Errorf("inspect %s.%s migration: %w", table, column.name, err)
+		}
+		if exists == 0 {
+			if _, err := s.db.Exec(column.ddl); err != nil {
+				return fmt.Errorf("add %s.%s: %w", table, column.name, err)
+			}
+		}
+	}
+	_, err = s.db.Exec(`UPDATE login_attempts AS la SET
+		plan_type=a.plan_type,chatgpt_account_id=a.chatgpt_account_id,organization_id=a.organization_id,observation_source='legacy_oauth_login'
+		FROM accounts a WHERE la.account_id=a.id AND la.status='success' AND la.observation_source IS NULL
+		AND trim(COALESCE(la.plan_type,''))='' AND COALESCE(la.stage,'')<>'token_refresh'
+		AND trim(COALESCE(a.plan_type,''))<>'' AND la.finished_at=a.last_success_at AND a.last_success_at>0
+		AND la.id=(SELECT MAX(id) FROM login_attempts WHERE account_id=a.id AND status='success')
+		AND NOT EXISTS (SELECT 1 FROM login_attempts WHERE account_id=a.id AND observation_source IS NOT NULL)`)
+	return err
 }
 
 func (s *Store) verifyKey() error {
@@ -496,10 +566,20 @@ func (s *Store) UpsertCredentials(ctx context.Context, credentials Credentials) 
 		return Account{}, err
 	}
 	now := time.Now().Unix()
-	_, err = s.db.ExecContext(ctx, `INSERT INTO accounts(email,password_cipher,totp_cipher,proxy_cipher,created_at,updated_at) VALUES(?,?,?,?,?,?)
-ON CONFLICT(email) DO UPDATE SET password_cipher=excluded.password_cipher, totp_cipher=excluded.totp_cipher, proxy_cipher=excluded.proxy_cipher, updated_at=excluded.updated_at`, credentials.Email, password, totp, proxy, now, now)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO accounts(email,password_cipher,totp_cipher,proxy_cipher,created_at,updated_at) VALUES(?,?,?,?,?,?)
+ON CONFLICT(email) DO UPDATE SET password_cipher=excluded.password_cipher, totp_cipher=excluded.totp_cipher, proxy_cipher=excluded.proxy_cipher, updated_at=excluded.updated_at
+WHERE accounts.status NOT IN ('deleted','deactivated','deleted_or_deactivated','discarded') AND accounts.sub2_policy NOT IN ('official_unavailable','discarded')`, credentials.Email, password, totp, proxy, now, now)
 	if err != nil {
 		return Account{}, fmt.Errorf("save account: %w", err)
+	}
+	if count, err := result.RowsAffected(); err != nil {
+		return Account{}, err
+	} else if count == 0 {
+		account, err := s.GetAccount(ctx, credentials.Email)
+		if err != nil {
+			return Account{}, err
+		}
+		return Account{}, account.terminalError()
 	}
 	return s.GetAccount(ctx, credentials.Email)
 }
@@ -519,11 +599,11 @@ func (s *Store) BeginAttempt(ctx context.Context, credentials Credentials) (Acco
 	}
 	s.active[credentials.Email] = struct{}{}
 	s.activeMu.Unlock()
-	release := func() {
+	release := sync.OnceFunc(func() {
 		s.activeMu.Lock()
 		delete(s.active, credentials.Email)
 		s.activeMu.Unlock()
-	}
+	})
 	return s.beginAttemptLocked(ctx, credentials, release)
 }
 
@@ -551,16 +631,24 @@ func (s *Store) beginAttemptLocked(ctx context.Context, credentials Credentials,
 		return Account{}, Attempt{}, err
 	}
 	defer tx.Rollback()
-	if credentials.ExistingAccountID > 0 {
-		var existingID int64
-		err = tx.QueryRowContext(ctx, `SELECT id FROM accounts WHERE id=? AND email=?`, credentials.ExistingAccountID, credentials.Email).Scan(&existingID)
-		if err != nil {
+	var existingID int64
+	var existingStatus, existingPolicy string
+	existingErr := tx.QueryRowContext(ctx, `SELECT id,status,COALESCE(sub2_policy,'unknown') FROM accounts WHERE email=?`, credentials.Email).Scan(&existingID, &existingStatus, &existingPolicy)
+	if existingErr == nil {
+		if credentials.ExistingAccountID > 0 && existingID != credentials.ExistingAccountID {
 			release()
-			if errors.Is(err, sql.ErrNoRows) {
-				err = ErrAccountNotFound
-			}
+			return Account{}, Attempt{}, ErrAccountNotFound
+		}
+		if err := (Account{Status: existingStatus, Sub2Policy: existingPolicy}).terminalError(); err != nil {
+			release()
 			return Account{}, Attempt{}, err
 		}
+	} else if !errors.Is(existingErr, sql.ErrNoRows) {
+		release()
+		return Account{}, Attempt{}, existingErr
+	} else if credentials.ExistingAccountID > 0 {
+		release()
+		return Account{}, Attempt{}, ErrAccountNotFound
 	}
 	now := time.Now().Unix()
 	if _, err = tx.ExecContext(ctx, `INSERT INTO accounts(email,password_cipher,totp_cipher,proxy_cipher,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(email) DO UPDATE SET password_cipher=excluded.password_cipher,totp_cipher=excluded.totp_cipher,proxy_cipher=excluded.proxy_cipher,updated_at=excluded.updated_at`, credentials.Email, password, totp, proxy, now, now); err != nil {
@@ -572,7 +660,15 @@ func (s *Store) beginAttemptLocked(ctx context.Context, credentials Credentials,
 		release()
 		return Account{}, Attempt{}, err
 	}
-	if err = tx.QueryRowContext(ctx, `INSERT INTO login_attempts(account_id,status,started_at) VALUES(?,'running',?) RETURNING id`, accountID, now).Scan(&attemptID); err != nil {
+	if err = tx.QueryRowContext(ctx, `INSERT INTO login_attempts(account_id,status,started_at,single_attempt) VALUES(?,'running',?,?) RETURNING id`, accountID, now, boolInt(credentials.SingleAttempt)).Scan(&attemptID); err != nil {
+		release()
+		return Account{}, Attempt{}, err
+	}
+	if err = consumeCredentialRepairRecoveryTx(ctx, tx, accountID, attemptID); err != nil {
+		release()
+		return Account{}, Attempt{}, err
+	}
+	if err = freezeLifecycleBindingsTx(ctx, tx, fmt.Sprintf("login_attempt:%d", attemptID), accountID); err != nil {
 		release()
 		return Account{}, Attempt{}, err
 	}
@@ -606,12 +702,16 @@ func (s *Store) GetOAuthResultByID(ctx context.Context, id int64) (string, Resul
 	var email string
 	var access, refresh []byte
 	var result Result
-	err := s.db.QueryRowContext(ctx, `SELECT email,access_token_cipher,refresh_token_cipher,COALESCE(chatgpt_account_id,''),COALESCE(organization_id,''),COALESCE(plan_type,''),expires_at FROM accounts WHERE id=?`, id).Scan(&email, &access, &refresh, &result.ChatGPTAccountID, &result.OrganizationID, &result.PlanType, &result.ExpiresAt)
+	var status, policy string
+	err := s.db.QueryRowContext(ctx, `SELECT email,status,COALESCE(sub2_policy,'unknown'),access_token_cipher,refresh_token_cipher,COALESCE(chatgpt_account_id,''),COALESCE(organization_id,''),COALESCE(plan_type,''),expires_at FROM accounts WHERE id=?`, id).Scan(&email, &status, &policy, &access, &refresh, &result.ChatGPTAccountID, &result.OrganizationID, &result.PlanType, &result.ExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", Result{}, ErrAccountNotFound
 	}
 	if err != nil {
 		return "", Result{}, err
+	}
+	if err := (Account{Status: status, Sub2Policy: policy}).terminalError(); err != nil {
+		return email, Result{}, err
 	}
 	var openErr error
 	if result.AccessToken, openErr = s.open(access); openErr != nil {
@@ -629,6 +729,13 @@ func (s *Store) GetOAuthResultByID(ctx context.Context, id int64) (string, Resul
 // UpdateOAuthResultByID replaces the encrypted OAuth tokens after a refresh.
 // Empty identity fields from a refresh response preserve the existing values.
 func (s *Store) UpdateOAuthResultByID(ctx context.Context, id int64, result Result) error {
+	account, err := s.GetAccountByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := account.terminalError(); err != nil {
+		return err
+	}
 	lease, err := s.AcquireAccountRecovery(ctx, id)
 	if err != nil {
 		return err
@@ -664,6 +771,23 @@ func (s *Store) CreateOrGetSub2Import(ctx context.Context, destinationKey string
 	if strings.TrimSpace(destinationKey) == "" || accountID <= 0 || strings.TrimSpace(operationID) == "" || strings.TrimSpace(idempotencyKey) == "" || len(payload) == 0 {
 		return Sub2Import{}, false, errors.New("invalid sub2 import task")
 	}
+	account, err := s.GetAccountByID(ctx, accountID)
+	if err != nil {
+		return Sub2Import{}, false, err
+	}
+	if err := account.Sub2EligibilityError(); err != nil {
+		return Sub2Import{}, false, err
+	}
+	if !IsSub2PaidPlan(account.PlanType) {
+		return Sub2Import{}, false, ErrSub2PlanIneligible
+	}
+	missing, err := s.Sub2AccountMissing(ctx, destinationKey, accountID)
+	if err != nil {
+		return Sub2Import{}, false, err
+	}
+	if missing {
+		return Sub2Import{}, false, ErrSub2AccountMissing
+	}
 	ciphertext, err := s.seal(string(payload))
 	if err != nil {
 		return Sub2Import{}, false, err
@@ -671,7 +795,7 @@ func (s *Store) CreateOrGetSub2Import(ctx context.Context, destinationKey string
 	now := time.Now().Unix()
 	// The account can be deleted after the caller builds its OAuth snapshot.
 	// Check existence in the insert itself so a stale request cannot orphan a task.
-	result, err := s.db.ExecContext(ctx, `INSERT INTO sub2_imports(destination_key,account_id,credential_version,operation_id,idempotency_key,payload_cipher,state,created_at,updated_at) SELECT ?,id,COALESCE((SELECT MAX(la.id) FROM login_attempts la WHERE la.account_id=accounts.id AND la.status='success'),0),?,?,?,'queued',?,? FROM accounts WHERE id=? ON CONFLICT(destination_key,account_id) DO NOTHING`, destinationKey, operationID, idempotencyKey, ciphertext, now, now, accountID)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO sub2_imports(destination_key,account_id,credential_version,operation_id,idempotency_key,payload_cipher,state,created_at,updated_at) SELECT ?,id,COALESCE((SELECT MAX(la.id) FROM login_attempts la WHERE la.account_id=accounts.id AND la.status='success'),0),?,?,?,'queued',?,? FROM accounts WHERE id=? AND status<>'discarded' AND sub2_policy<>'discarded' ON CONFLICT(destination_key,account_id) DO NOTHING`, destinationKey, operationID, idempotencyKey, ciphertext, now, now, accountID)
 	if err != nil {
 		return Sub2Import{}, false, fmt.Errorf("create sub2 import: %w", err)
 	}
@@ -689,6 +813,23 @@ func (s *Store) GetSub2Import(ctx context.Context, destinationKey string, accoun
 
 func (s *Store) GetSub2ImportByID(ctx context.Context, id int64) (Sub2Import, error) {
 	return scanSub2Import(s.db.QueryRowContext(ctx, sub2ImportSelect+` WHERE i.id=?`, id))
+}
+
+func (s *Store) ListSub2ImportsForRemoteID(ctx context.Context, destination string, remoteID int64) ([]Sub2Import, error) {
+	rows, err := s.db.QueryContext(ctx, sub2ImportSelect+` WHERE i.destination_key=? AND i.sub2_account_id=?`, destination, remoteID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var bindings []Sub2Import
+	for rows.Next() {
+		binding, err := scanSub2Import(rows)
+		if err != nil {
+			return nil, err
+		}
+		bindings = append(bindings, binding)
+	}
+	return bindings, rows.Err()
 }
 
 func (s *Store) ListSub2ImportStatuses(ctx context.Context) ([]Sub2Import, error) {
@@ -757,9 +898,11 @@ func (s *Store) ListPendingSub2Cleanup(ctx context.Context, destination string, 
 	return items, rows.Err()
 }
 
+const sub2ImportNotDiscarded = ` AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id=sub2_imports.account_id AND (a.status='discarded' OR a.sub2_policy='discarded'))`
+
 func (s *Store) GetSub2ImportPayload(ctx context.Context, id int64) ([]byte, error) {
 	var ciphertext []byte
-	if err := s.db.QueryRowContext(ctx, `SELECT payload_cipher FROM sub2_imports WHERE id=?`, id).Scan(&ciphertext); errors.Is(err, sql.ErrNoRows) {
+	if err := s.db.QueryRowContext(ctx, `SELECT payload_cipher FROM sub2_imports WHERE id=?`+sub2ImportNotDiscarded, id).Scan(&ciphertext); errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrSub2ImportNotFound
 	} else if err != nil {
 		return nil, err
@@ -772,7 +915,7 @@ func (s *Store) GetSub2ImportPayload(ctx context.Context, id int64) ([]byte, err
 }
 
 func (s *Store) MarkSub2ImportSending(ctx context.Context, id int64) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state='sending',updated_at=? WHERE id=? AND state='queued'`, time.Now().Unix(), id)
+	result, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state='sending',updated_at=? WHERE id=? AND state='queued'`+sub2ImportNotDiscarded, time.Now().Unix(), id)
 	if err != nil {
 		return err
 	}
@@ -784,7 +927,7 @@ func (s *Store) MarkSub2ImportSending(ctx context.Context, id int64) error {
 }
 
 func (s *Store) MarkSub2ImportSendingForVersion(ctx context.Context, id, credentialVersion int64) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state='sending',updated_at=? WHERE id=? AND state='queued' AND credential_version=?`, time.Now().Unix(), id, credentialVersion)
+	result, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state='sending',updated_at=? WHERE id=? AND state='queued' AND credential_version=?`+sub2ImportNotDiscarded, time.Now().Unix(), id, credentialVersion)
 	if err != nil {
 		return err
 	}
@@ -796,12 +939,52 @@ func (s *Store) MarkSub2ImportSendingForVersion(ctx context.Context, id, credent
 }
 
 func (s *Store) UpdateSub2Import(ctx context.Context, id int64, state string, acknowledged bool, sub2AccountID int64, lastError string) error {
+	return s.updateSub2Import(ctx, id, nil, state, acknowledged, sub2AccountID, lastError)
+}
+
+// Worker results carry the operation observed before making a remote request.
+func (s *Store) UpdateSub2ImportForOperation(ctx context.Context, binding Sub2Import, state string, acknowledged bool, sub2AccountID int64, lastError string) error {
+	return s.updateSub2Import(ctx, binding.ID, &binding.OperationID, state, acknowledged, sub2AccountID, lastError)
+}
+
+func (s *Store) updateSub2Import(ctx context.Context, id int64, operation *string, state string, acknowledged bool, sub2AccountID int64, lastError string) error {
 	state = strings.TrimSpace(state)
-	if state == "" {
-		return errors.New("sub2 import state is required")
+	if state == "" || state == Sub2RemoteMissing {
+		return errors.New("invalid sub2 import state")
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state=?,create_acknowledged=?,sub2_account_id=CASE WHEN ? > 0 THEN ? ELSE sub2_account_id END,last_error=?,updated_at=? WHERE id=?`, state, boolInt(acknowledged), sub2AccountID, sub2AccountID, strings.TrimSpace(lastError), time.Now().Unix(), id)
-	return err
+	query := `UPDATE sub2_imports SET state=?,create_acknowledged=?,sub2_account_id=CASE WHEN ? > 0 THEN ? ELSE sub2_account_id END,last_error=?,updated_at=? WHERE id=? AND state<>'remote_missing'` + sub2ImportNotDiscarded
+	args := []any{state, boolInt(acknowledged), sub2AccountID, sub2AccountID, strings.TrimSpace(lastError), time.Now().Unix(), id}
+	if operation != nil {
+		query += " AND operation_id=?"
+		args = append(args, *operation)
+	}
+	result, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrAccountRecoveryStale
+	}
+	return nil
+}
+
+func (s *Store) MarkSub2ImportSendingForOperation(ctx context.Context, binding Sub2Import) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state='sending',updated_at=? WHERE id=? AND operation_id=? AND credential_version=? AND state='queued'`+sub2ImportNotDiscarded, time.Now().Unix(), binding.ID, binding.OperationID, binding.CredentialVersion)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrAccountRecoveryStale
+	}
+	return nil
 }
 
 // MarkSub2ImportCleanupPending records the credential version that produced
@@ -811,12 +994,12 @@ func (s *Store) MarkSub2ImportCleanupPending(ctx context.Context, id, credential
 	if id <= 0 || credentialVersion < 0 || sub2AccountID <= 0 {
 		return errors.New("invalid Sub2 cleanup task")
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state='cleanup_pending',credential_version=?,create_acknowledged=1,sub2_account_id=?,last_error=?,updated_at=? WHERE id=? AND state IN ('imported','cleanup_pending')`, credentialVersion, sub2AccountID, strings.TrimSpace(lastError), time.Now().Unix(), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state='cleanup_pending',credential_version=?,create_acknowledged=1,sub2_account_id=?,last_error=?,updated_at=? WHERE id=? AND state IN ('imported','cleanup_pending')`+sub2ImportNotDiscarded, credentialVersion, sub2AccountID, strings.TrimSpace(lastError), time.Now().Unix(), id)
 	return err
 }
 
 func (s *Store) RequeueSub2Import(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state='queued',last_error='',updated_at=? WHERE id=? AND state='failed'`, time.Now().Unix(), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state='queued',last_error='',updated_at=? WHERE id=? AND state='failed'`+sub2ImportNotDiscarded, time.Now().Unix(), id)
 	return err
 }
 
@@ -831,7 +1014,7 @@ func (s *Store) RefreshSub2ImportPayload(ctx context.Context, id int64, payload 
 	if err != nil {
 		return err
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET payload_cipher=?,state='queued',last_error='',updated_at=? WHERE id=? AND state='failed'`, ciphertext, time.Now().Unix(), id)
+	result, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET payload_cipher=?,state='queued',last_error='',updated_at=? WHERE id=? AND state='failed'`+sub2ImportNotDiscarded, ciphertext, time.Now().Unix(), id)
 	if err != nil {
 		return err
 	}
@@ -850,7 +1033,7 @@ func (s *Store) RefreshSub2ImportPayloadForVersion(ctx context.Context, id, cred
 	if err != nil {
 		return err
 	}
-	query := `UPDATE sub2_imports SET payload_cipher=?,credential_version=?,state='queued',last_error='',updated_at=? WHERE id=? AND state IN ('failed','queued')`
+	query := `UPDATE sub2_imports SET payload_cipher=?,credential_version=?,state='queued',last_error='',updated_at=? WHERE id=? AND state IN ('failed','queued')` + sub2ImportNotDiscarded
 	args := []any{ciphertext, credentialVersion, time.Now().Unix(), id}
 	if requireVersion {
 		query += ` AND credential_version<>?`
@@ -868,13 +1051,16 @@ func (s *Store) RefreshSub2ImportPayloadForVersion(ctx context.Context, id, cred
 }
 
 func (s *Store) getCredentials(ctx context.Context, where string, arg interface{}) (Credentials, error) {
-	var email string
+	var account Account
 	var password, totp, proxy []byte
-	err := s.db.QueryRowContext(ctx, `SELECT email,password_cipher,totp_cipher,proxy_cipher FROM accounts `+where, arg).Scan(&email, &password, &totp, &proxy)
+	err := s.db.QueryRowContext(ctx, `SELECT email,status,sub2_policy,password_cipher,totp_cipher,proxy_cipher FROM accounts `+where, arg).Scan(&account.Email, &account.Status, &account.Sub2Policy, &password, &totp, &proxy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Credentials{}, ErrAccountNotFound
 	}
 	if err != nil {
+		return Credentials{}, err
+	}
+	if err := account.terminalError(); err != nil {
 		return Credentials{}, err
 	}
 	p, err := s.open(password)
@@ -889,7 +1075,7 @@ func (s *Store) getCredentials(ctx context.Context, where string, arg interface{
 	if err != nil {
 		return Credentials{}, err
 	}
-	return Credentials{Email: email, Password: p, TOTPSecret: t, Proxy: pr}, nil
+	return Credentials{Email: account.Email, Password: p, TOTPSecret: t, Proxy: pr}, nil
 }
 
 func (s *Store) GetAccount(ctx context.Context, email string) (Account, error) {
@@ -902,14 +1088,14 @@ func (s *Store) GetAccountByID(ctx context.Context, id int64) (Account, error) {
 	return scanAccount(row)
 }
 
-const accountSelect = `SELECT id,email,status,COALESCE(chatgpt_account_id,''),COALESCE(organization_id,''),COALESCE(plan_type,''),expires_at,COALESCE(last_error_code,''),COALESCE(last_error,''),last_http_status,attempt_count,(SELECT COALESCE(MAX(started_at),0) FROM login_attempts la WHERE la.account_id=accounts.id),last_success_at,created_at,updated_at,COALESCE((SELECT COUNT(*) FROM account_recovery_tasks rt WHERE rt.account_id=accounts.id AND rt.purpose='recovery'),0),COALESCE((SELECT COUNT(*) FROM account_recovery_tasks rt WHERE rt.account_id=accounts.id AND rt.purpose='recovery' AND rt.state='completed'),0) FROM accounts`
+const accountSelect = `SELECT id,email,status,COALESCE(sub2_policy,'unknown'),COALESCE(chatgpt_account_id,''),COALESCE(organization_id,''),COALESCE(plan_type,''),expires_at,COALESCE(last_error_code,''),COALESCE(last_error,''),last_http_status,attempt_count,(SELECT COALESCE(MAX(started_at),0) FROM login_attempts la WHERE la.account_id=accounts.id),last_success_at,created_at,updated_at,COALESCE((SELECT COUNT(*) FROM account_recovery_tasks rt WHERE rt.account_id=accounts.id AND rt.purpose='recovery'),0),COALESCE((SELECT COUNT(*) FROM account_recovery_tasks rt WHERE rt.account_id=accounts.id AND rt.purpose='recovery' AND rt.state='completed'),0),(SELECT COALESCE(MAX(la.id),0) FROM login_attempts la WHERE la.account_id=accounts.id AND la.status='success') FROM accounts`
 
 type scanner interface{ Scan(...interface{}) error }
 
 func scanAccount(row scanner) (Account, error) {
 	var a Account
 	var lastAttempt, lastSuccess, created, updated int64
-	if err := row.Scan(&a.ID, &a.Email, &a.Status, &a.ChatGPTAccountID, &a.OrganizationID, &a.PlanType, &a.ExpiresAt, &a.LastErrorCode, &a.LastError, &a.LastHTTPStatus, &a.AttemptCount, &lastAttempt, &lastSuccess, &created, &updated, &a.RecoveryAttemptCount, &a.RecoveryCount); err != nil {
+	if err := row.Scan(&a.ID, &a.Email, &a.Status, &a.Sub2Policy, &a.ChatGPTAccountID, &a.OrganizationID, &a.PlanType, &a.ExpiresAt, &a.LastErrorCode, &a.LastError, &a.LastHTTPStatus, &a.AttemptCount, &lastAttempt, &lastSuccess, &created, &updated, &a.RecoveryAttemptCount, &a.RecoveryCount, &a.CredentialVersion); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Account{}, ErrAccountNotFound
 		}
@@ -955,7 +1141,7 @@ func (s *Store) ListAttempts(ctx context.Context, email string, limit int) ([]At
 	if limit > 1000 {
 		limit = 1000
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT la.id,la.account_id,a.email,la.status,COALESCE(la.stage,''),COALESCE(la.error_code,''),COALESCE(la.error_message,''),la.http_status,la.retryable,la.started_at,la.finished_at,la.duration_ms FROM login_attempts la JOIN accounts a ON a.id=la.account_id WHERE a.email=? ORDER BY la.started_at DESC,la.id DESC LIMIT ?`, normalizeEmail(email), limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT la.id,la.account_id,a.email,la.status,COALESCE(la.stage,''),COALESCE(la.error_code,''),COALESCE(la.error_message,''),la.http_status,la.retryable,la.started_at,la.finished_at,la.duration_ms,la.single_attempt FROM login_attempts la JOIN accounts a ON a.id=la.account_id WHERE a.email=? ORDER BY la.started_at DESC,la.id DESC LIMIT ?`, normalizeEmail(email), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -964,11 +1150,12 @@ func (s *Store) ListAttempts(ctx context.Context, email string, limit int) ([]At
 	for rows.Next() {
 		var record AttemptRecord
 		var started, finished int64
-		var retryable int
-		if err := rows.Scan(&record.ID, &record.AccountID, &record.Email, &record.Status, &record.Stage, &record.Code, &record.Message, &record.HTTPStatus, &retryable, &started, &finished, &record.DurationMS); err != nil {
+		var retryable, singleAttempt int
+		if err := rows.Scan(&record.ID, &record.AccountID, &record.Email, &record.Status, &record.Stage, &record.Code, &record.Message, &record.HTTPStatus, &retryable, &started, &finished, &record.DurationMS, &singleAttempt); err != nil {
 			return nil, err
 		}
 		record.Retryable = retryable != 0
+		record.SingleAttempt = singleAttempt != 0
 		record.StartedAt, record.FinishedAt = unixTime(started), unixTime(finished)
 		result = append(result, record)
 	}
@@ -995,7 +1182,14 @@ func (s *Store) StartAttempt(ctx context.Context, email string) (Attempt, error)
 		s.activeMu.Unlock()
 	}
 	var id, accountID int64
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM accounts WHERE email=?`, email).Scan(&accountID)
+	var status, policy string
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		release()
+		return Attempt{}, err
+	}
+	defer tx.Rollback()
+	err = tx.QueryRowContext(ctx, `SELECT id,status,COALESCE(sub2_policy,'unknown') FROM accounts WHERE email=?`, email).Scan(&accountID, &status, &policy)
 	if errors.Is(err, sql.ErrNoRows) {
 		release()
 		return Attempt{}, ErrAccountNotFound
@@ -1004,12 +1198,28 @@ func (s *Store) StartAttempt(ctx context.Context, email string) (Attempt, error)
 		release()
 		return Attempt{}, err
 	}
-	now := time.Now().Unix()
-	if err = s.db.QueryRowContext(ctx, `INSERT INTO login_attempts(account_id,status,started_at) VALUES(?,'running',?) RETURNING id`, accountID, now).Scan(&id); err != nil {
+	if err := (Account{Status: status, Sub2Policy: policy}).terminalError(); err != nil {
 		release()
 		return Attempt{}, err
 	}
-	if _, err = s.db.ExecContext(ctx, `UPDATE accounts SET status='running', attempt_count=attempt_count+1, updated_at=? WHERE id=?`, now, accountID); err != nil {
+	now := time.Now().Unix()
+	if err = tx.QueryRowContext(ctx, `INSERT INTO login_attempts(account_id,status,started_at) VALUES(?,'running',?) RETURNING id`, accountID, now).Scan(&id); err != nil {
+		release()
+		return Attempt{}, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE accounts SET status='running', attempt_count=attempt_count+1, updated_at=? WHERE id=?`, now, accountID); err != nil {
+		release()
+		return Attempt{}, err
+	}
+	if err = consumeCredentialRepairRecoveryTx(ctx, tx, accountID, id); err != nil {
+		release()
+		return Attempt{}, err
+	}
+	if err = freezeLifecycleBindingsTx(ctx, tx, fmt.Sprintf("login_attempt:%d", id), accountID); err != nil {
+		release()
+		return Attempt{}, err
+	}
+	if err = tx.Commit(); err != nil {
 		release()
 		return Attempt{}, err
 	}
@@ -1017,9 +1227,8 @@ func (s *Store) StartAttempt(ctx context.Context, email string) (Attempt, error)
 }
 
 // FinishAttempt records the result and updates account metadata atomically.
-// Officially deleted accounts remain as a local tombstone until the verified
-// Sub2 binding is removed. This prevents the remote cleanup from losing the
-// account identity immediately after the failed login is recorded.
+// Officially deleted accounts remain as a local tombstone. The verified Sub2
+// cleanup later clears their credentials while retaining the safe table row.
 func (s *Store) FinishAttempt(ctx context.Context, id int64, success bool, result *Result, failure *Failure) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1034,11 +1243,14 @@ func (s *Store) FinishAttempt(ctx context.Context, id int64, success bool, resul
 
 func (s *Store) finishAttemptTx(ctx context.Context, tx *sql.Tx, id int64, success bool, result *Result, failure *Failure) error {
 	var accountID, started int64
-	var email, status string
-	err := tx.QueryRowContext(ctx, `SELECT la.account_id,a.email,la.started_at,la.status FROM login_attempts la JOIN accounts a ON a.id=la.account_id WHERE la.id=?`, id).Scan(&accountID, &email, &started, &status)
+	var email, status, accountStatus, policy string
+	err := tx.QueryRowContext(ctx, `SELECT la.account_id,a.email,la.started_at,la.status,a.status,COALESCE(a.sub2_policy,'unknown') FROM login_attempts la JOIN accounts a ON a.id=la.account_id WHERE la.id=?`, id).Scan(&accountID, &email, &started, &status, &accountStatus, &policy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrAttemptNotFound
 	} else if err != nil {
+		return err
+	}
+	if err := (Account{Status: accountStatus, Sub2Policy: policy}).terminalError(); err != nil {
 		return err
 	}
 	if status != "running" {
@@ -1061,31 +1273,51 @@ func (s *Store) finishAttemptTx(ctx context.Context, tx *sql.Tx, id int64, succe
 		if e != nil {
 			return e
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE accounts SET status='active',access_token_cipher=?,refresh_token_cipher=?,chatgpt_account_id=?,organization_id=?,plan_type=?,expires_at=?,last_error_code='',last_error='',last_http_status=0,last_success_at=?,updated_at=? WHERE id=?`, access, refresh, result.ChatGPTAccountID, result.OrganizationID, result.PlanType, result.ExpiresAt, now, now, accountID); err != nil {
+		nextPolicy := nextSub2Policy(result.PlanType, policy)
+		if _, err = tx.ExecContext(ctx, `UPDATE accounts SET status='active',sub2_policy=?,access_token_cipher=?,refresh_token_cipher=?,chatgpt_account_id=?,organization_id=?,plan_type=?,expires_at=?,last_error_code='',last_error='',last_http_status=0,last_success_at=?,updated_at=? WHERE id=?`, nextPolicy, access, refresh, result.ChatGPTAccountID, result.OrganizationID, result.PlanType, result.ExpiresAt, now, now, accountID); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE login_attempts SET status='success',finished_at=?,duration_ms=? WHERE id=?`, now, duration, id); err != nil {
+		if nextPolicy == Sub2PolicyFreeLocal {
+			if err := cancelSub2ForFreeTx(ctx, tx, accountID, id, fmt.Sprintf("login_attempt:%d", id), result.PlanType); err != nil {
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE login_attempts SET status='success',plan_type=?,chatgpt_account_id=?,organization_id=?,observation_source='oauth_login',finished_at=?,duration_ms=? WHERE id=?`, result.PlanType, result.ChatGPTAccountID, result.OrganizationID, now, duration, id); err != nil {
 			return err
 		}
 	} else {
 		if failure == nil {
 			failure = &Failure{Code: "login_failed", Message: "login failed"}
 		}
-		status := strings.ToLower(strings.TrimSpace(failure.AccountStatus))
+		status := lifecycleStatusFromFailure(failure.AccountStatus, failure.Code)
 		if status == "" {
 			status = "failed"
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE accounts SET status=?,last_error_code=?,last_error=?,last_http_status=?,updated_at=? WHERE id=?`, status, failure.Code, failure.Message, failure.HTTPStatus, now, accountID); err != nil {
+		policyValue := policy
+		source := "official"
+		if isOfficialLifecycleStatus(status) {
+			policyValue = Sub2PolicyOfficialUnavailable
+		} else if !failure.Retryable && isDiscardedLoginFailure(failure.Code, failure.Stage, failure.HTTPStatus) {
+			var superseded bool
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM login_attempts WHERE account_id=? AND status='success' AND id>?)`, accountID, id).Scan(&superseded); err != nil {
+				return err
+			}
+			if superseded {
+				return ErrAccountRecoveryVersionChanged
+			}
+			status, policyValue, source = "discarded", Sub2PolicyDiscarded, "login_discarded"
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE accounts SET status=?,sub2_policy=?,last_error_code=?,last_error=?,last_http_status=?,updated_at=? WHERE id=?`, status, policyValue, failure.Code, failure.Message, failure.HTTPStatus, now, accountID); err != nil {
 			return err
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE login_attempts SET status='failed',stage=?,error_code=?,error_message=?,http_status=?,retryable=?,finished_at=?,duration_ms=? WHERE id=?`, failure.Stage, failure.Code, failure.Message, failure.HTTPStatus, boolInt(failure.Retryable), now, duration, id); err != nil {
 			return err
 		}
-		if isOfficialLifecycleStatus(status) {
+		if IsTerminalLifecycleStatus(status) {
 			if err := recordLifecycleEventTx(ctx, tx, LifecycleEvent{
 				AccountID:  accountID,
 				Email:      email,
-				Source:     "official",
+				Source:     source,
 				Status:     status,
 				Reason:     failure.Message,
 				Code:       failure.Code,
@@ -1095,9 +1327,16 @@ func (s *Store) finishAttemptTx(ctx context.Context, tx *sql.Tx, id int64, succe
 			}); err != nil {
 				return err
 			}
+			if err := authorizeFrozenCleanupTx(ctx, tx, fmt.Sprintf("login_attempt:%d", id)); err != nil {
+				return err
+			}
+			if err := finalizeTerminalUnavailableTx(ctx, tx, accountID, failure.Message, id, policyValue); err != nil {
+				return err
+			}
 		}
 	}
-	return nil
+	_, err = tx.ExecContext(ctx, `DELETE FROM lifecycle_request_bindings WHERE request_key=?`, fmt.Sprintf("login_attempt:%d", id))
+	return err
 }
 
 func boolInt(value bool) int {
@@ -1142,18 +1381,21 @@ func (s *Store) DeleteAccountByID(ctx context.Context, id int64) error {
 	// while unwinding a transaction, so waiting for DB under activeMu can deadlock.
 	s.activeMu.Lock()
 	defer s.activeMu.Unlock()
-	var email, status string
-	err = tx.QueryRowContext(ctx, `SELECT email,status FROM accounts WHERE id=?`, id).Scan(&email, &status)
+	var account Account
+	err = tx.QueryRowContext(ctx, `SELECT email,status,sub2_policy FROM accounts WHERE id=?`, id).Scan(&account.Email, &account.Status, &account.Sub2Policy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrAccountNotFound
 	} else if err != nil {
 		return err
 	}
-	if _, active := s.active[email]; active || status == "running" {
+	if err := account.terminalError(); err != nil {
+		return err
+	}
+	if _, active := s.active[account.Email]; active || account.Status == "running" {
 		return ErrAccountBusy
 	}
 	var importPending bool
-	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sub2_imports WHERE account_id=? AND state NOT IN ('imported','failed'))`, id).Scan(&importPending); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sub2_imports WHERE account_id=? AND state NOT IN ('imported','failed','remote_missing'))`, id).Scan(&importPending); err != nil {
 		return err
 	}
 	if importPending {
@@ -1172,46 +1414,6 @@ func (s *Store) DeleteAccountByID(ctx context.Context, id int64) error {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM accounts WHERE id=?`, id); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// FinalizeDeletedAccount removes a deleted local tombstone after its verified
-// remote binding has already been removed. Callers must hold the account
-// recovery lease so a new login cannot race the final local deletion.
-func (s *Store) FinalizeDeletedAccount(ctx context.Context, id int64) error {
-	if id <= 0 {
-		return ErrAccountNotFound
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	var email, status string
-	if err := tx.QueryRowContext(ctx, `SELECT email,status FROM accounts WHERE id=?`, id).Scan(&email, &status); errors.Is(err, sql.ErrNoRows) {
-		return ErrAccountNotFound
-	} else if err != nil {
-		return err
-	}
-	if status != "deleted" {
-		return nil
-	}
-	s.activeMu.Lock()
-	_, active := s.active[email]
-	s.activeMu.Unlock()
-	if !active {
-		return ErrAccountBusy
-	}
-	var bindingExists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sub2_imports WHERE account_id=?)`, id).Scan(&bindingExists); err != nil {
-		return err
-	}
-	if bindingExists {
-		return ErrAccountBusy
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM accounts WHERE id=? AND status='deleted'`, id); err != nil {
 		return err
 	}
 	return tx.Commit()

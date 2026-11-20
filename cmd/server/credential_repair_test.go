@@ -24,7 +24,7 @@ func TestCredentialRepairUsesNewCredentialsAndQueuesDelivery(t *testing.T) {
 		if gotPassword != password {
 			t.Fatal("worker did not use saved corrected password")
 		}
-		return &login.LoginResult{Email: email, AccessToken: "repaired-at", RefreshToken: "repaired-rt", ChatGPTAccountID: "workspace"}, nil
+		return &login.LoginResult{Email: email, AccessToken: "repaired-at", RefreshToken: "repaired-rt", ChatGPTAccountID: "workspace", PlanType: "plus"}, nil
 	}
 	if !f.service.processNextCredentialRepair() {
 		t.Fatal("durable edit not processed")
@@ -64,7 +64,7 @@ func TestCredentialRepairResumesFailedRecoveryWithNewPassword(t *testing.T) {
 		if gotPassword != password {
 			t.Fatal("recovery used old password")
 		}
-		return &login.LoginResult{Email: email, AccessToken: "repaired-at", RefreshToken: "repaired-rt", ChatGPTAccountID: "workspace"}, nil
+		return &login.LoginResult{Email: email, AccessToken: "repaired-at", RefreshToken: "repaired-rt", ChatGPTAccountID: "workspace", PlanType: "plus"}, nil
 	}
 	f.service.process(queued)
 	if f.state(t).State != store.RecoveryCompleted || !f.schedule {
@@ -165,7 +165,7 @@ func TestCredentialRepairTemporaryLoginFailureRetriesWithoutManualAlert(t *testi
 		if gotPassword != password {
 			t.Fatal("retry lost corrected password")
 		}
-		return &login.LoginResult{Email: email, AccessToken: "corrected-at", RefreshToken: "corrected-rt", ChatGPTAccountID: "workspace"}, nil
+		return &login.LoginResult{Email: email, AccessToken: "corrected-at", RefreshToken: "corrected-rt", ChatGPTAccountID: "workspace", PlanType: "plus"}, nil
 	}
 	f.service.processNextCredentialRepair()
 	repair, _ = f.store.GetCredentialRepair(context.Background(), f.account.ID)

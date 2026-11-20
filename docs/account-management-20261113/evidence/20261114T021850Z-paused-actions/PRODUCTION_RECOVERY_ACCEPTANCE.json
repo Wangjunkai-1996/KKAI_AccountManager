@@ -1,0 +1,61 @@
+{
+  "release_id": "20261114T021850Z-paused-actions",
+  "accounts": [
+    {
+      "account_id": 1579,
+      "sub2_account_id": 17353,
+      "task_id": 1304,
+      "request_status": 200,
+      "prior_code": "auth_page_timeout_exhausted",
+      "manual_attempt": true,
+      "state": "completed",
+      "code": "",
+      "failure_stage": "",
+      "new_attempt_count": 1,
+      "new_successful_attempt": true,
+      "attempt_id": 1590,
+      "binding_unchanged": true,
+      "sub2_import_count_unchanged": true,
+      "tokens_persisted": true,
+      "account_status": "active",
+      "remote_status": {
+        "sub2_account_id": 17353,
+        "status": "active",
+        "schedulable": true,
+        "effective_schedulable": true,
+        "exists": true,
+        "unknown": null,
+        "stale": null
+      }
+    },
+    {
+      "account_id": 1580,
+      "sub2_account_id": 17352,
+      "task_id": 1305,
+      "request_status": 200,
+      "prior_code": "auth_page_timeout_exhausted",
+      "manual_attempt": true,
+      "state": "completed",
+      "code": "",
+      "failure_stage": "",
+      "new_attempt_count": 1,
+      "new_successful_attempt": true,
+      "attempt_id": 1591,
+      "binding_unchanged": true,
+      "sub2_import_count_unchanged": true,
+      "tokens_persisted": true,
+      "account_status": "active",
+      "remote_status": {
+        "sub2_account_id": 17352,
+        "status": "active",
+        "schedulable": true,
+        "effective_schedulable": true,
+        "exists": true,
+        "unknown": null,
+        "stale": null
+      }
+    }
+  ],
+  "success": true,
+  "completed_at": "2026-11-14T02:24:06.995591+00:00"
+}

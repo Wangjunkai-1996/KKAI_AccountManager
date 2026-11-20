@@ -1,0 +1,18 @@
+{
+  "single_attempts": [
+    {
+      "attempt_id": 1590,
+      "account_id": 1579,
+      "status": "success",
+      "single_attempt": 1
+    },
+    {
+      "attempt_id": 1591,
+      "account_id": 1580,
+      "status": "success",
+      "single_attempt": 1
+    }
+  ],
+  "active_manual_rounds": 0,
+  "schema_verified": true
+}

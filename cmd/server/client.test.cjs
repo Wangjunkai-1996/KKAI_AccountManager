@@ -55,6 +55,7 @@ class Element {
     querySelectorAll() { return []; }
 }
 const indexHTML = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+assert.doesNotMatch(indexHTML, /id="(?:proxyInput|credentialsProxy|proxyCheckBtn)"/, 'proxy addresses are selected from Sub2 instead of typed into AUTH');
 assert.match(indexHTML, /<section[^>]*role="dialog"[^>]*aria-modal="true"[^>]*tabindex="-1"/,
     'history details dialog must be keyboard focusable and modal');
 assert.match(indexHTML, /<dialog[^>]*id="actionConfirmDialog"[^>]*role="dialog"[^>]*aria-modal="true"[^>]*aria-labelledby="actionConfirmTitle"[^>]*aria-describedby="actionConfirmMessage"[^>]*tabindex="-1"/,
@@ -92,10 +93,15 @@ let importSettings = { defaults: { group_ids: [], priority: 1, concurrency: 3 },
 let settingsReadFailure = false, settingsReadGate = null, importSettingsSaveFailure = false, credentialsFailure = false;
 const intervals = [];
 let imports = [], lifecycleEvents = {}, historyFailure = false, historyGate = null, deleteGate = null;
+const costFixture = amount => ({ days: 90, total_cost: amount, total_standard_cost: amount * 2, total_requests: 18, total_tokens: 2400, checked_at: '2026-10-05T10:00:00Z' });
+let costStats = { 1: costFixture(12.34), 2: costFixture(0), 4: costFixture(8.2), 21: costFixture(44), 1000: costFixture(56.78) };
+let costsFailure = false, costsGate = null;
 let deletionFailures = new Map(), missingIDs = new Set(), acceptedImportIDs = null, importGate = null;
 let confirmations = [], confirmResult = true, requests = [];
 let groupActions = [];
 let detailGate = null, detailFailure = false, recoveryHistoryAvailable = true, recoveryHistoryTruncated = false;
+let credentialsMeta = null, revealGate = null, revealReply = null;
+const credentialCopies = [];
 let recoveryHistory = [{ id: 3, state: 'unknown', created_at: '2026-10-07T06:08:41Z', updated_at: '2026-10-07T06:08:59Z', last_error: '<img src=x onerror=alert(1)>身份待核对' },
     { id: 2, state: 'completed', created_at: '2026-10-06T01:00:00Z', updated_at: '2026-10-06T01:01:00Z' }];
 let recoveryFailures = [];
@@ -107,6 +113,7 @@ Object.assign(window, { alert: () => {},
     localStorage: { getItem: key => browserPreferences.get(key) ?? null, setItem: (key, value) => browserPreferences.set(key, value) },
     history: { state: null, pushState(_state, _title, hash) { location.hash = hash; } } });
 const context = vm.createContext({ document, window, location, console, Event, CustomEvent, AbortController, AbortSignal, TextDecoder, setTimeout, clearTimeout, clearInterval() {},
+    navigator: { clipboard: { writeText: async value => { credentialCopies.push(value); } } },
     setInterval: (callback, delay) => { intervals.push({ callback, delay }); return intervals.length; }, CSS: { escape: String },
     fetch: async (url, options = {}) => {
         requests.push({ url, options });
@@ -118,6 +125,17 @@ const context = vm.createContext({ document, window, location, console, Event, C
             return response(importSettings);
         }
         if (url.endsWith('/credentials') && options.method === 'PATCH') return response(credentialsFailure ? { message: '账号正在处理，请稍后再试' } : { success: true }, credentialsFailure ? 409 : 200);
+        if (/^\/api\/history\/\d+\/credentials\/reveal$/.test(url) && options.method === 'POST') {
+            const id = Number(url.split('/')[3]), { field } = JSON.parse(options.body);
+            assert.ok(['password', 'totp_secret'].includes(field));
+            assert.equal(options.headers['Content-Type'], 'application/json');
+            assert.equal(options.headers['X-Requested-With'], 'XMLHttpRequest');
+            assert.equal(options.cache, 'no-store');
+            assert.ok(options.signal);
+            const reply = revealReply || response({ success: true, account_id: id, field, value: field === 'password' ? 'fixture-revealed-password' : 'fixture-revealed-totp' });
+            if (revealGate) { const pending = revealGate; revealGate = null; await pending.promise; }
+            return reply;
+        }
         if (url === '/health') return response({ max_concurrent: 10, sub2_configured: sub2Configured });
         if (url === '/api/login/stream') {
             if (loginStreamGate) { const pending = loginStreamGate; loginStreamGate = null; await pending.promise; }
@@ -153,12 +171,27 @@ const context = vm.createContext({ document, window, location, console, Event, C
             groupActions.push({ url, body: JSON.parse(options.body) });
             return response({ success: true, queued: true });
         }
+        if (/^\/api\/account-recovery\/\d+\/recheck$/.test(url) && options.method === 'POST') {
+            const taskID = Number(url.split('/')[3]);
+            const task = Object.values(rechecks).find(item => item.task_id === taskID);
+            if (!task || task.state !== 'requires_action') return response({ success: false }, 409);
+            task.state = 'pending'; task.requires_action = false;
+            return response({ success: true, task_id: taskID }, 202);
+        }
+        if (url.startsWith('/api/history/usage?') && !options.method) {
+            const ids = url.split('account_ids=')[1].split(',').map(decodeURIComponent);
+            const stats = Object.fromEntries(ids.map(id => [id, structuredClone(costStats[id] || { days: 90, unknown: true })]));
+            assert.ok(ids.length <= 100, 'usage reads are bounded to the current page');
+            assert.ok(options.signal, 'usage reads have a timeout');
+            if (costsGate) { const pending = costsGate; costsGate = null; await pending.promise; }
+            return costsFailure ? response({ message: 'usage unavailable' }, 503) : response({ success: true, sub2_configured: sub2Configured, stats });
+        }
         if (url.startsWith('/api/history/') && !options.method) {
             if (detailGate) { const gate = detailGate; detailGate = null; await gate.promise; }
             if (detailFailure) return response({ message: 'fixture detail unavailable' }, 503);
             const id = Number(url.split('/').pop());
             const account = rows.find(row => row.id === id);
-            return response({ account, attempts: [], recovery_history: recoveryHistory, recovery_history_available: recoveryHistoryAvailable, recovery_history_truncated: recoveryHistoryTruncated, recovery_failures: recoveryFailures, recovery_failures_available: true, lifecycle_events: lifecycleEvents[id] || [], lifecycle_events_available: true });
+            return response({ account, attempts: [], credentials_meta: credentialsMeta, recovery_history: recoveryHistory, recovery_history_available: recoveryHistoryAvailable, recovery_history_truncated: recoveryHistoryTruncated, recovery_failures: recoveryFailures, recovery_failures_available: true, lifecycle_events: lifecycleEvents[id] || [], lifecycle_events_available: true });
         }
         if (url.startsWith('/api/history/') && options.method === 'DELETE') {
             if (deleteGate) { const gate = deleteGate; deleteGate = null; await gate.promise; }
@@ -172,10 +205,12 @@ const context = vm.createContext({ document, window, location, console, Event, C
         }
         if (url === '/api/sub2/import') {
             if (importGate) { const gate = importGate; importGate = null; await gate.promise; }
-            const ids = JSON.parse(options.body).account_ids;
+            const request = JSON.parse(options.body);
+            const ids = request.account_ids;
             assert.ok(ids.length <= 100);
             const accepted = ids.filter(id => acceptedImportIDs === null || acceptedImportIDs.has(id));
             const tasks = accepted.map(id => ({ account_id: id, state: 'imported' }));
+            if (request.reimport) accepted.forEach(id => { deliveries[id] = { state: 'completed' }; });
             imports.push(...tasks);
             return response({ success: true, imports: tasks });
         }
@@ -199,10 +234,55 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.equal(el('historyActionBar').hidden, true);
     await click('tab-history');
     assert.equal(location.hash, '#panel-history');
+    const costRequests = () => requests.filter(item => item.url.startsWith('/api/history/usage?'));
+    assert.equal(costRequests().length, 1, 'initial cost read is independent from repeated history rendering');
+    assert.equal(costRequests()[0].url.split('account_ids=')[1].split(',').length, 20, 'costs are queried only for the visible page, not all 25 accounts');
+    const costRow = id => el('historyGrid').innerHTML.match(new RegExp(`<article[^>]*data-history-card="${id}"[^>]*>.*?<\\/article>`, 's'))?.[0] || '';
+    assert.match(costRow(1), /近90天 \$12\.34/);
+    assert.match(costRow(2), /近90天 \$0\.00/, 'a verified zero is displayed');
+    assert.match(costRow(3), /近90天 —.*待核对/);
+    assert.doesNotMatch(costRow(3), /\$0\.00/, 'unknown usage must not look like zero spending');
+    assert.match(costRow(4), /近90天 \$8\.20/, 'officially deleted accounts still show their recorded usage');
+    run("historyRecentCosts.get('2').stats.total_cost = 0.001");
+    assert.match(run("renderHistoryCost(historyAccounts.find(account => account.id === '2'))"), /&lt;\$0\.01/, 'small positive costs do not round down to a verified zero');
+    run("historyRecentCosts.get('2').stats.total_cost = 0");
+    run('renderHistory(); renderHistory()'); await flush();
+    assert.equal(costRequests().length, 1, 'cached rendering does not trigger a request loop');
+    costsFailure = true;
+    run("historyRecentCosts.get('1').expiresAt = 0");
+    await run("loadHistoryCosts([historyAccounts.find(account => account.id === '1')])");
+    assert.match(costRow(1), /近90天 \$12\.34.*上次数据/, 'a failed refresh retains the last verified amount');
+    assert.equal(run("historyRecentCosts.get('1').stats.checked_at"), '2026-10-05T10:00:00Z', 'a stale amount retains its original timestamp');
+    costsFailure = false;
+    costStats[1] = { days: 90, unknown: true };
+    run("historyRecentCosts.get('1').expiresAt = 0");
+    await run("loadHistoryCosts([historyAccounts.find(account => account.id === '1')])");
+    assert.match(costRow(1), /近90天 \$12\.34.*上次数据/, 'an unverified read preserves prior data until the binding changes');
+    costStats[1] = costFixture(12.34);
+    run("historyRecentCosts.get('1').expiresAt = 0");
+    await run("loadHistoryCosts([historyAccounts.find(account => account.id === '1')])");
+    const delayedPage = gate(); costsGate = delayedPage;
+    run('historyPage = 2; renderHistory()'); await flush();
+    assert.equal(costRequests().at(-1).url.split('account_ids=')[1].split(',').length, 5, 'the second page requests only its five rows');
+    run('historyPage = 1; renderHistory()');
+    delayedPage.release(); await flush();
+    assert.doesNotMatch(el('historyGrid').innerHTML, /data-history-card="21"/, 'late usage responses do not change the selected page');
+    assert.match(costRow(1), /近90天 \$12\.34/);
+    const delayedBinding = gate(); costsGate = delayedBinding;
+    run("historyAccounts.find(account => account.id === '1').sub2Status.sub2AccountID = '601'; renderHistory()");
+    await flush();
+    costStats[1] = costFixture(99);
+    run("historyAccounts.find(account => account.id === '1').sub2Status.sub2AccountID = '602'; renderHistory()");
+    await flush();
+    assert.match(costRow(1), /近90天 \$99\.00/, 'a changed binding invalidates cached costs');
+    delayedBinding.release(); await flush();
+    assert.match(costRow(1), /近90天 \$99\.00/, 'a late response for the prior binding cannot overwrite the new amount');
+    costStats[1] = costFixture(12.34);
+    run("historyAccounts.find(account => account.id === '1').sub2Status.sub2AccountID = ''; renderHistory()"); await flush();
     // Pool membership is independent from credential health, and unknown reads stay unknown.
     assert.equal(run("historyPoolState(normalizeHistoryAccount({id: 1}, normalizeSub2Status({imported: true, exists: true, status: 'error'}))).kind"), 'present');
     assert.equal(run("historyPoolState(normalizeHistoryAccount({id: 1}, normalizeSub2Status(null))).kind"), 'unknown');
-    assert.equal(run("historyPoolState(normalizeHistoryAccount({id: 1}, normalizeSub2Status({exists: false}))).kind"), 'absent');
+    assert.equal(run("historyPoolState(normalizeHistoryAccount({id: 1}, normalizeSub2Status({exists: false}))).kind"), 'unknown', 'exists=false alone is not proof of a missing association');
     assert.equal(run("historyPoolState(normalizeHistoryAccount({id: 1}, normalizeSub2Status({exists: false, stale: true}))).kind"), 'unknown');
     assert.equal(run("historyPoolState(normalizeHistoryAccount({id: 1}, normalizeSub2Status({association_status: 'conflict', exists: false}))).kind"), 'unknown');
     run('historyImportsAvailable = false');
@@ -367,6 +447,30 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.equal(intervals.length, 1, 'history has one background polling loop');
     assert.equal(intervals[0].delay, 5000);
     assert.equal(run('historyRefreshDelay()'), 60000, 'enabled idle polling is once per minute');
+    rechecks[2] = { task_id: 992, state: 'requires_action', requires_action: true, manual_action: '管理鉴权已修正' };
+    await click('refreshHistoryBtn');
+    assert.match(el('historyGrid').innerHTML, /data-history-action="recheck" data-history-id="2" data-recheck-task="992"[^>]*>重新复检/);
+    const recheckPosts = () => requests.filter(item => /\/recheck$/.test(item.url));
+    await run("retryHistoryRecheck('2', '991')");
+    assert.equal(recheckPosts().length, 0, 'stale task buttons cannot retry a replacement task');
+    const recheckClick = new Element();
+    recheckClick.dataset = { historyAction: 'recheck', historyId: '2', recheckTask: '992' };
+    recheckClick.closest = selector => selector === '[data-history-action]' ? recheckClick : null;
+    await el('historyGrid').emit('click', recheckClick);
+    await flush();
+    assert.equal(recheckPosts().length, 1);
+    assert.equal(recheckPosts()[0].url, '/api/account-recovery/992/recheck');
+    assert.equal(recheckPosts()[0].options.method, 'POST');
+    assert.equal(run('historyRefreshDelay()'), 5000, 'accepted follow-up stays visible while queued');
+    assert.doesNotMatch(el('historyGrid').innerHTML, /data-recheck-task="992"/);
+    await run("retryHistoryRecheck('2', '992')");
+    assert.equal(recheckPosts().length, 1, 'pending rechecks cannot be submitted twice');
+    rechecks[2].state = 'canceled'; rechecks[2].requires_action = true;
+    await click('refreshHistoryBtn');
+    await run("retryHistoryRecheck('2', '992')");
+    assert.equal(recheckPosts().length, 1, 'canceled rechecks remain stopped');
+    rechecks = {};
+    await click('refreshHistoryBtn');
     assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '1')).disabled"), true, 'healthy account cannot be recovered');
     assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '1')).reason"), 'Sub2 正常，无需恢复');
     assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), true, 'disabled account cannot be recovered');
@@ -379,7 +483,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), false);
     await run("checkAndRecoverHistory('2')");
     assert.equal(requests.filter(item => item.url === '/api/account-recovery/check').length, 1);
-    assert.deepEqual(JSON.parse(requests.find(item => item.url === '/api/account-recovery/check').options.body), { account_id: 2 });
+    assert.deepEqual(JSON.parse(requests.find(item => item.url === '/api/account-recovery/check').options.body), { account_id: 2, manual_attempt: true, expected_task_id: 0, expected_retry_count: 0 });
     assert.match(el('historyGrid').innerHTML, /检测已排队/);
     assert.doesNotMatch(el('historyGrid').innerHTML, /恢复完成/, 'queued checks must not claim successful recovery');
     assert.equal(run('historyRefreshDelay()'), 5000, 'active tasks are refreshed promptly');
@@ -434,7 +538,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), false, 'a checkpointed recovery can continue while scheduling is paused');
     assert.match(el('historyGrid').innerHTML, />继续恢复/);
     await run("checkAndRecoverHistory('2')");
-    assert.deepEqual(JSON.parse(requests.find(item => item.url === '/api/account-recovery' && item.options.method === 'POST').options.body), { account_id: 2 });
+    assert.deepEqual(JSON.parse(requests.find(item => item.url === '/api/account-recovery' && item.options.method === 'POST').options.body), { account_id: 2, manual_attempt: true, expected_task_id: 0, expected_retry_count: 0 });
     recoveries[2] = { state: 'failed' };
     checks[2] = { latest_task: { state: 'skipped', skip_reason: 'cooldown' }, last_result: { outcome: 'ok', freshness: 'stale' } };
     await click('refreshHistoryBtn');
@@ -443,13 +547,16 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.doesNotMatch(el('historyGrid').innerHTML, /当前凭据调用正常/);
     sub2Statuses[2].exists = false;
     await click('refreshHistoryBtn');
-    assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).reason"), '该账号已从 Sub2 删除');
+    assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).reason"), 'Sub2 状态待核对');
+    sub2Statuses[2].association_status = 'missing';
+    await click('refreshHistoryBtn');
+    assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).reason"), 'Sub2 关联账号不存在 · 已停止自动检测和恢复');
     const sub2DeletedRow = el('historyGrid').innerHTML.match(/<article[^>]*data-history-card="2"[^>]*>.*?<\/article>/s)?.[0];
-    assert.match(sub2DeletedRow || '', /Sub2 已删除/, 'Sub2 deletion is shown separately from official status');
-    for (const [association, label] of [['unmatched', '未找到关联'], ['ambiguous', '多条匹配待确认'], ['conflict', '身份不一致']]) {
+    assert.match(sub2DeletedRow || '', /Sub2 关联账号不存在/, 'Sub2 absence is shown separately from official status');
+    for (const [association, label] of [['unmatched', '未找到 Sub2 关联'], ['ambiguous', 'Sub2 多条匹配待确认'], ['conflict', 'Sub2 身份不一致']]) {
         sub2Statuses[2] = { imported: false, exists: false, unknown: true, association_status: association, error: '<reason>' };
         await click('refreshHistoryBtn');
-        assert.match(el('historyGrid').innerHTML, new RegExp(`Sub2 ${label}`));
+        assert.match(el('historyGrid').innerHTML, new RegExp(label));
         assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), true);
     }
     sub2Statuses[2] = null;
@@ -499,7 +606,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     run('historyRecoveryNotices.clear()');
     await change('autoRecoveryToggle', false);
     assert.equal(run('historyRefreshDelay()'), 300000, 'disabled idle polling returns to five minutes');
-    for (const state of ['queued', 'checking']) {
+    for (const state of ['queued', 'checking', 'recovery_queued']) {
         repairs = { 2: { state } };
         await run('loadHistory()');
         assert.equal(run('historyRefreshDelay()'), 5000, `${state} credential repairs refresh promptly with automatic recovery off`);
@@ -566,8 +673,8 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     confirmResult = false;
     await click('historyBatchDeleteBtn');
     assert.equal(deletes().length, beforeCancel, 'cancel must issue no delete requests');
-    assert.match(confirmations.at(-1), /20 个账号/);
-    assert.match(confirmations.at(-1), /19 个不在当前页/);
+    assert.match(confirmations.at(-1), /16 个账号/);
+    assert.match(confirmations.at(-1), /15 个不在当前页/);
     assert.match(confirmations.at(-1), /不会删除 Sub2/);
     assert.equal(el('actionConfirmAccept').textContent, '确认删除');
     confirmResult = true;
@@ -654,6 +761,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     // Successful re-login clears only successes, retaining ineligible and failed choices.
     rows = [{ id: 201, email: 'a@example.test', status: 'active' }, { id: 202, email: 'b@example.test', status: 'error' }, { id: 203, email: 'c@example.test', status: 'error' }];
     imports = []; await click('refreshHistoryBtn'); await change('historySelectAll', true);
+    const originalHistoryRelogin = run('performHistoryRelogin');
     run("globalThis.reloginCalls = []; performHistoryRelogin = async id => { reloginCalls.push(id); return { success: id === '202' }; }");
     confirmResult = false;
     await run('batchReloginHistory()');
@@ -737,7 +845,13 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     run("historySelectedIDs.add('1000'); renderHistory()");
     el('historyBatchDeleteBtn').disabled = false;
     el('historyBatchDeleteBtn').dataset.historyId = '1000';
-    await run("openHistoryDetails('1000', historyBatchDeleteBtn)");
+    const detailCosts = gate(); costsGate = detailCosts;
+    run("historyRecentCosts.delete('1000')");
+    const openingCostDetail = run("openHistoryDetails('1000', historyBatchDeleteBtn)");
+    await flush();
+    assert.match(el('historyDetailBody').innerHTML, /正在加载详情/, 'details wait for the pending usage read');
+    detailCosts.release();
+    await openingCostDetail;
     assert.equal(el('historyDetail').hidden, false);
     assert.match(el('historyDetailBody').innerHTML, /Sub2 检测失败证据/);
     assert.match(el('historyDetailBody').innerHTML, /任务 #224/);
@@ -745,6 +859,15 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.match(el('historyDetailBody').innerHTML, /Sub2 状态 \/ 调度/);
     assert.match(el('historyDetailBody').innerHTML, /状态来源/);
     assert.match(el('historyDetailBody').innerHTML, /Sub2 最近同步/);
+    assert.match(el('historyDetailBody').innerHTML, /近90天账号费用/);
+    assert.match(el('historyDetailBody').innerHTML, /\$56\.78/);
+    assert.match(el('historyDetailBody').innerHTML, /18 次请求 · 2,400 Token/);
+    assert.match(el('historyDetailBody').innerHTML, /Sub2 账号统计费用（USD）/);
+    run("historyRecentCosts.get('1000').stats.checked_at = '<img src=x onerror=alert(1)>'");
+    const escapedCost = run("renderHistoryCost(historyAccounts.find(account => account.id === '1000'), true)");
+    assert.doesNotMatch(escapedCost, /<img/, 'usage metadata is escaped');
+    assert.match(escapedCost, /&lt;img/);
+    run("historyRecentCosts.get('1000').stats.checked_at = '2026-10-05T10:00:00Z'");
     assert.match(el('historyDetailBody').innerHTML, /7 天 Sonnet/);
     assert.match(el('historyDetailBody').innerHTML, /7 天 Fable/);
     assert.match(el('historyDetailBody').innerHTML, /30 天使用额度/);
@@ -832,6 +955,29 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.equal(el('deliveryOptionsApply').disabled, true, 'unavailable group catalog cannot submit a grouped batch');
     await click('deliveryOptionsCancel'); await unavailableGroups; importSettings.groups_available = true;
     await run('loadDeliverySettings()');
+    const savedChooserBatch = run('JSON.stringify(deliveryBatchOptions)');
+    run('deliveryBatchOptions = null');
+    importSettings.groups_available = false;
+    const isolatedOptions = { group_ids: [], priority: 6, concurrency: 2, merchant: '独立账号', deadline: '2026-12-31' };
+    const isolatedChooser = run(`chooseDeliveryOptions('重新导入参数', true, ${JSON.stringify(isolatedOptions)}, false)`); await flush();
+    assert.equal(el('deliveryOptionsApply').disabled, false, 'empty historical groups may submit even when the group catalog is unavailable');
+    assert.equal(el('deliverySaveDefault').disabled, true, 'account reimport cannot change platform defaults');
+    const defaultWrites = () => requests.filter(item => item.url === '/api/sub2/import-settings' && item.options.method === 'PUT').length;
+    const defaultsBeforeIsolated = defaultWrites();
+    el('deliverySaveDefault').checked = true;
+    await el('deliveryOptionsForm').emit('submit');
+    assert.deepEqual(JSON.parse(JSON.stringify(await isolatedChooser)), isolatedOptions, 'the submit fallback uses the dialog snapshot without a global batch');
+    assert.equal(run('deliveryBatchOptions'), null, 'isolated options neither initialize nor replace the global batch');
+    assert.equal(defaultWrites(), defaultsBeforeIsolated, 'even a stale checked value cannot save defaults in isolated mode');
+    const unavailableHistoricalGroups = run(`chooseDeliveryOptions('重新导入参数', true, ${JSON.stringify({ ...isolatedOptions, group_ids: [8] })}, false)`); await flush();
+    assert.equal(el('deliveryOptionsApply').disabled, true, 'unavailable historical groups cannot silently become ungrouped');
+    await el('deliveryOptionsCancel').emit('click'); await unavailableHistoricalGroups;
+    importSettings.groups_available = true;
+    run(`deliveryBatchOptions = ${JSON.stringify({ ...isolatedOptions, priority: 99 })}`);
+    const defaultsChooser = run("chooseDeliveryOptions('无历史参数', true, null, false)"); await flush();
+    assert.equal(el('deliveryPriority').value, String(importSettings.defaults.priority), 'reimport with no account options uses platform defaults, not another login batch');
+    await el('deliveryOptionsCancel').emit('click'); await defaultsChooser;
+    run(`deliveryBatchOptions = ${savedChooserBatch}`);
     // Automatic delivery is a persisted server task, distinct from login success.
     const manualImportsBeforeDelivery = requests.filter(item => item.url === '/api/sub2/import').length;
     assert.equal(el('autoDeliverToggle').checked, true, 'configured Sub2 defaults new batches to automatic delivery');
@@ -853,7 +999,6 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     run("accounts = [{ id: 0, email: 'first@example.test', password: 'synthetic-only', totp_secret: 'fixture' }, { id: 1, email: 'second@example.test', password: 'synthetic-only', totp_secret: 'fixture' }]; results = []");
     loginStreamGate = gate(); const firstLogin = loginStreamGate; loginFailures = 1;
     const loginRequestsBefore = requests.filter(item => item.url === '/api/login/stream').length;
-    el('proxyInput').value = 'direct';
     const batch = run('runAccounts(accounts)'); await flush();
     assert.equal(el('autoDeliverToggle').disabled, true);
     await change('autoDeliverToggle', false); // Simulate a preference change while the first request is in flight.
@@ -861,7 +1006,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     firstLogin.release(); await batch;
     assert.deepEqual(requests.filter(item => item.url === '/api/login/stream').slice(loginRequestsBefore).map(item => JSON.parse(item.options.body).auto_deliver), [true, true], 'every account uses its frozen batch choice');
     assert.deepEqual(requests.filter(item => item.url === '/api/login/stream').slice(loginRequestsBefore).map(item => JSON.parse(item.options.body).delivery_options), [importSettings.defaults, importSettings.defaults], 'all accounts keep the original batch groups and scheduling parameters');
-    assert.deepEqual(requests.filter(item => item.url === '/api/login/stream').slice(loginRequestsBefore).map(item => JSON.parse(item.options.body).proxy), ['direct', 'direct'], 'login batches preserve an explicit server IPv4 route');
+    assert.deepEqual(requests.filter(item => item.url === '/api/login/stream').slice(loginRequestsBefore).map(item => JSON.parse(item.options.body).proxy), ['', ''], 'login batches leave route selection to Sub2');
     await window.retryAccount(0);
     assert.equal(JSON.parse(requests.filter(item => item.url === '/api/login/stream').at(-1).options.body).auto_deliver, true, 'login retries retain the original delivery choice');
     assert.deepEqual(JSON.parse(requests.filter(item => item.url === '/api/login/stream').at(-1).options.body).delivery_options, importSettings.defaults, 'retries retain original options after defaults change');
@@ -959,13 +1104,11 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     run("openCredentialsEditor('9002')");
     assert.equal(el('credentialsPassword').value, '');
     assert.equal(el('credentialsTotp').value, '');
-    assert.equal(el('credentialsProxy').value, '', 'stored secrets are never read into the editor');
     await el('credentialsForm').emit('submit');
     assert.equal(requests.filter(item => item.url.endsWith('/credentials')).length, credentialsBefore, 'blank inputs preserve all values without a no-op request');
     el('credentialsPassword').value = ' synthetic replacement ';
     el('credentialsTotp').value = 'discarded fixture';
     el('credentialsClearTotp').checked = true;
-    el('credentialsClearProxy').checked = true;
     credentialsFailure = true;
     await el('credentialsForm').emit('submit');
     assert.equal(el('credentialsDialog').open, true);
@@ -973,14 +1116,10 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     credentialsFailure = false;
     const loginsBeforeSave = requests.filter(item => item.url === '/api/login/stream').length;
     await el('credentialsForm').emit('submit');
-    assert.deepEqual(JSON.parse(requests.filter(item => item.url.endsWith('/credentials')).at(-1).options.body), { password: ' synthetic replacement ', clear_totp: true, clear_proxy: true });
+    assert.deepEqual(JSON.parse(requests.filter(item => item.url.endsWith('/credentials')).at(-1).options.body), { password: ' synthetic replacement ', clear_totp: true });
     assert.equal(el('credentialsDialog').open, false);
     assert.equal(el('credentialsPassword').value, '', 'secrets are cleared immediately after a successful save');
     assert.equal(requests.filter(item => item.url === '/api/login/stream').length, loginsBeforeSave, 'resume is persisted by the server without a second browser login');
-    run("openCredentialsEditor('9002')");
-    el('credentialsProxy').value = 'direct';
-    await el('credentialsForm').emit('submit');
-    assert.deepEqual(JSON.parse(requests.filter(item => item.url.endsWith('/credentials')).at(-1).options.body), { proxy: 'direct' }, 'an explicit direct route must be saved, not treated as clearing or a malformed URL');
     const repairTime = new Date().toISOString();
     repairs = { 9002: { state: 'queued', updated_at: repairTime } };
     await run('loadHistory()');
@@ -1022,6 +1161,83 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.equal(el('deliveryMerchant').disabled, false, 'a successful read restores merchant editing');
     assert.equal(el('deliveryMerchant').value, '主池🌙');
     await click('deliveryOptionsCancel'); await identityDialog;
+    // Route selection keeps click order, and login-only requests use its first route.
+    importSettings.egress_available = true;
+    importSettings.egress_routes = [
+        { id: 104, kind: 'proxy', name: 'RN-104', public_ip: '104.x.x.1', eligible: true },
+        { id: 67, kind: 'proxy', name: '<img unsafe>RN-67', public_ip: '67.x.x.1', eligible: true },
+        { id: 1, kind: 'direct', name: '本机直连', eligible: false }
+    ];
+    const routeDialog = run('chooseDeliveryOptions()'); await flush();
+    assert.match(el('deliveryEgressRoutes').innerHTML, /&lt;img unsafe&gt;RN-67/);
+    assert.doesNotMatch(el('deliveryEgressRoutes').innerHTML, /<img unsafe>/);
+    assert.match(el('deliveryEgressRoutes').innerHTML, /data-delivery-route="1"[^>]*disabled/);
+    await el('deliveryEgressRoutes').emit('change', { dataset: { deliveryRoute: '67' }, checked: true });
+    await el('deliveryEgressRoutes').emit('change', { dataset: { deliveryRoute: '104' }, checked: true });
+    assert.deepEqual(Array.from(run('selectedEgressRouteIDs')), [67, 104]);
+    assert.match(el('deliveryEgressHint').textContent, /RN-67.*登录/);
+    el('deliveryMerchant').value = '手动号商'; el('deliveryDeadline').value = '2026-12-31';
+    await el('deliveryOptionsForm').emit('submit'); await routeDialog;
+    assert.deepEqual(Array.from(run('deliveryBatchOptions.egress_route_ids')), [67, 104]);
+    await change('autoDeliverToggle', false);
+    run("accounts = [{id:0,email:'first@example.test',password:'synthetic-only',totp_secret:'fixture'}]; results=[]");
+    await run('runAccounts(accounts)');
+    let selectedLogin = JSON.parse(requests.filter(item => item.url === '/api/login/stream').at(-1).options.body);
+    assert.equal(selectedLogin.auto_deliver, false);
+    assert.equal(selectedLogin.proxy, '');
+    assert.deepEqual(selectedLogin.delivery_options.egress_route_ids, [67, 104]);
+    const normalFetchBeforeRelogin = context.fetch;
+    context.fetch = (url, options) => url === '/api/history/login'
+        ? (requests.push({ url, options }), Promise.resolve({ ok: false, status: 400, headers: new Map([['content-type', 'application/json']]), json: async () => ({ message: 'synthetic stop' }) }))
+        : normalFetchBeforeRelogin(url, options);
+    context.performHistoryRelogin = originalHistoryRelogin;
+    await run("performHistoryRelogin('9001')");
+    context.fetch = normalFetchBeforeRelogin;
+    const historyLogin = JSON.parse(requests.filter(item => item.url === '/api/history/login').at(-1).options.body);
+    assert.equal(historyLogin.delivery_options, undefined, 'history revival uses its current Sub2 account route, not the next batch selection');
+    assert.equal(historyLogin.proxy, undefined, 'history relogin uses the saved route when no new selection is provided');
+    assert.equal(historyLogin.manual_attempt, true, 'an explicit history login permits one attempt');
+    importSettings.egress_routes[1].eligible = false;
+    const invalidRouteDialog = run('chooseDeliveryOptions()'); await flush();
+    assert.equal(el('deliveryOptionsApply').disabled, true, 'a saved route that becomes unavailable blocks submission');
+    assert.match(el('deliveryEgressRoutes').innerHTML, /data-delivery-route="67" checked(?! disabled)/, 'the unavailable selected route remains removable');
+    await el('deliveryEgressRoutes').emit('change', { dataset: { deliveryRoute: '67' }, checked: false });
+    assert.equal(el('deliveryOptionsApply').disabled, false, 'removing the unavailable route restores submission');
+    await el('deliveryOptionsForm').emit('submit'); await invalidRouteDialog;
+    importSettings.egress_routes[1].eligible = true;
+    run('deliveryBatchOptions = {group_ids:[],priority:1,concurrency:3,egress_route_ids:[104]}');
+    run("accounts[0].status = 'error'");
+    await window.retryAccount(0);
+    selectedLogin = JSON.parse(requests.filter(item => item.url === '/api/login/stream').at(-1).options.body);
+    assert.deepEqual(selectedLogin.delivery_options.egress_route_ids, [67, 104], 'retry keeps the original login route');
+    // A login-only batch waits for the settings request already started by page initialization.
+    const defaultsBeforeLoginRace = importSettings.defaults;
+    importSettings.defaults = { ...defaultsBeforeLoginRace, egress_route_ids: [67, 104] };
+    run("deliveryBatchOptions = null; deliverySettings = null; accounts = [{id:0,email:'first@example.test',password:'synthetic-only',totp_secret:'fixture'}]; results=[]");
+    settingsReadGate = gate(); const pendingLoginDefaults = settingsReadGate;
+    const loginDefaultsRead = run('loadDeliverySettings()');
+    const settingsBeforeLoginRace = requests.filter(item => item.url === '/api/sub2/import-settings').length;
+    const loginsBeforeLoginRace = requests.filter(item => item.url === '/api/login/stream').length;
+    const delayedLoginBatch = run('runAccounts(accounts)');
+    await flush();
+    assert.equal(requests.filter(item => item.url === '/api/login/stream').length, loginsBeforeLoginRace, 'login waits before freezing unresolved default exits');
+    assert.equal(requests.filter(item => item.url === '/api/sub2/import-settings').length, settingsBeforeLoginRace, 'login reuses the pending settings request');
+    pendingLoginDefaults.release();
+    await Promise.all([loginDefaultsRead, delayedLoginBatch]);
+    selectedLogin = JSON.parse(requests.filter(item => item.url === '/api/login/stream').at(-1).options.body);
+    assert.equal(selectedLogin.auto_deliver, false);
+    assert.deepEqual(selectedLogin.delivery_options.egress_route_ids, [67, 104], 'login-only batch retains defaults that arrive during initialization');
+    importSettings.defaults = defaultsBeforeLoginRace;
+    // An explicit empty exit selection must survive both the request and a later retry.
+    run("deliveryBatchOptions = {group_ids:[],priority:1,concurrency:3}; accounts = [{id:0,email:'first@example.test',password:'synthetic-only',totp_secret:'fixture'}]; results=[]");
+    loginFailures = 1;
+    await run('runAccounts(accounts)');
+    selectedLogin = JSON.parse(requests.filter(item => item.url === '/api/login/stream').at(-1).options.body);
+    assert.deepEqual(selectedLogin.delivery_options, { group_ids: [], priority: 1, concurrency: 3 }, 'an empty selection is sent explicitly instead of inheriting server defaults');
+    run('deliveryBatchOptions = {group_ids:[],priority:1,concurrency:3,egress_route_ids:[104]}');
+    await window.retryAccount(0);
+    selectedLogin = JSON.parse(requests.filter(item => item.url === '/api/login/stream').at(-1).options.body);
+    assert.deepEqual(selectedLogin.delivery_options, { group_ids: [], priority: 1, concurrency: 3 }, 'retry keeps its empty selection after the next batch chooses an exit');
     // Login-only batches do not depend on Sub2 settings; import asks for identity fields later.
     await change('autoDeliverToggle', false);
     run("deliveryBatchOptions = null; deliverySettings = null; accounts = [{id:0,email:'first@example.test',password:'synthetic-only',totp_secret:'fixture'}]; results=[]");
@@ -1085,7 +1301,6 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
         return id;
     };
     context.clearTimeout = id => connectionTimers.delete(id);
-    run('platformPauseUntil = 0');
     try {
         context.fetch = async (_url, options) => {
             connectionRequests++;
@@ -1125,6 +1340,18 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
         await assert.rejects(run('loginAccount({email:"reset@example.test"}, "direct", new AbortController().signal)'), /fixture connection reset/);
         assert.equal(connectionRequests, 3, 'network failure must not automatically replay a login POST');
         assert.equal(connectionTimers.size, 0, 'network failure releases the connection timer');
+
+        context.fetch = async () => {
+            connectionRequests++;
+            return { ...response({ code: 'upstream_rate_limit', message: '上游请求过多', retry_after: 120 }, 429),
+                headers: new Map([['content-type', 'application/json']]) };
+        };
+        await assert.rejects(run('loginAccount({email:"limited@example.test"}, "direct", new AbortController().signal)'), /上游请求过多/);
+        assert.equal(connectionRequests, 4, 'an upstream 429 remains an error without replaying the login POST');
+        assert.equal(connectionTimers.size, 0, 'an upstream 429 does not schedule a platform-wide pause');
+        context.fetch = savedFetch;
+        assert.equal((await run('loginAccount({email:"next@example.test"}, "direct", new AbortController().signal)')).success, true,
+            'the next account can start without a shared cooldown');
     } finally {
         context.fetch = savedFetch;
         context.setTimeout = savedSetTimeout;
@@ -1198,7 +1425,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
         await busyBatch;
         assert.equal(run('accounts[0].status'), 'stopped');
         assert.equal(requests.filter(item => item.url === '/api/login/stream').length, busyRequestsBefore + 1,
-            'Stop ends the rate-limit wait without replaying the login POST');
+            'Stop ends the concurrency wait without replaying the login POST');
     } finally {
         context.fetch = savedFetch;
     }
@@ -1283,6 +1510,385 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     });
     await run("resolveGroupConflict(historyDeliveries.get('9010'), 'apply_target')");
     assert.deepEqual(groupActions.at(-1).body, { action: 'apply_target', current_group_ids: [12, 13], target_group_ids: [12, 44] });
+    // Account identity and plan filtering preserve selection and unfamiliar raw plans.
+    rows = [
+        { id: 9101, email: 'prefix@example.test', status: 'active', plan_type: 'plus' },
+        { id: 9102, email: 'free@example.test', status: 'error', plan_type: 'free' },
+        { id: 9103, email: 'unknown@example.test', status: 'active' },
+        { id: 9104, email: 'new-plan@example.test', status: 'active', plan_type: 'self_serve_business_prolite' }
+    ];
+    sub2Statuses = { 9101: { exists: true, imported: true, association_status: 'linked', sub2_account_id: 5101, status: 'active', name: '自定义前缀 | 截止 | prefix@example.test', name_source: 'cached_remote', name_stale: true } };
+    imports = []; recoveries = {}; deliveries = {}; repairs = {}; rechecks = {}; checks = {}; lifecycleEvents = {};
+    run('historySelectedIDs.clear()');
+    await change('historyStatusFilter', 'all'); await change('historySearchInput', ''); await run('loadHistory()');
+    assert.match(el('historyGrid').innerHTML, /自定义前缀 \| 截止 \| prefix@example.test/);
+    assert.match(el('historyGrid').innerHTML, /AUTH #9101 · Sub2 #5101 · Plus/);
+    assert.match(el('historyGrid').innerHTML, /缓存名称 · 待同步/);
+    assert.match(el('historyPlanFilter').innerHTML, /value="free".*Free/);
+    assert.match(el('historyPlanFilter').innerHTML, /value="unknown".*未知（未识别）/);
+    assert.match(el('historyPlanFilter').innerHTML, /value="self_serve_business_prolite"/);
+    run("historySelectedIDs.add('9102'); historyPage = 2");
+    await change('historySearchInput', '自定义前缀');
+    await change('historyPlanFilter', 'plus');
+    assert.equal(run('historyPage'), 1);
+    assert.deepEqual(Array.from(run('getFilteredHistoryAccounts().map(item => item.id)')), ['9101']);
+    assert.match(el('historySelectionStatus').textContent, /1 个不在当前页/);
+    await change('historyStatusFilter', 'failed');
+    assert.equal(run('getFilteredHistoryAccounts().length'), 0, 'search, plan and status use their intersection');
+    await change('historyStatusFilter', 'all');
+    rows = rows.filter(row => row.id !== 9101);
+    await run('loadHistory()');
+    assert.equal(el('historyPlanFilter').value, 'plus');
+    assert.match(el('historyPlanFilter').innerHTML, /Plus（0 个匹配）/);
+    assert.equal(run('getFilteredHistoryAccounts().length'), 0, 'refresh never silently expands a selected plan to all');
+    await change('historySearchInput', ''); await change('historyPlanFilter', 'unknown');
+    assert.deepEqual(Array.from(run('getFilteredHistoryAccounts().map(item => item.id)')), ['9103']);
+    await change('historyPlanFilter', 'all');
+
+    // Canonical association and login stop reasons take precedence over stale queued work.
+    rows = [{ id: 9201, email: 'missing@example.test', status: 'error' }, { id: 9202, email: 'unmatched@example.test', status: 'error' },
+        { id: 9203, email: 'email-challenge@example.test', status: 'error', requires_action: true, retryable: false, manual_reason: 'email_verification_required', last_error: 'old timeout', last_attempt_at: '2026-11-13T10:00:00Z' }];
+    sub2Statuses = {
+        9201: { association_status: 'missing', sub2_account_id: 5201, exists: false, name: '保留前缀 | missing@example.test', name_source: 'historical_import', name_stale: true },
+        9202: { association_status: 'unmatched', exists: false },
+        9203: { association_status: 'linked', exists: true, imported: true, status: 'error', sub2_account_id: 5203 }
+    };
+    imports = [{ account_id: 9201, state: 'remote_missing', sub2_account_id: 5201 }];
+    checks = { 9201: { eligible: true }, 9202: { eligible: true }, 9203: { eligible: true } };
+    deliveries = { 9201: { state: 'retry_wait', next_retry_at: '2020-01-01T00:00:00Z', delivery_options: { group_ids: [], priority: 1, concurrency: 3 } }, 9203: { state: 'retry_wait', next_retry_at: '2020-01-01T00:00:00Z' } };
+    recoveries = { 9201: { state: 'unknown', resumable: true }, 9203: { id: 6301, retry_count: 2, state: 'unknown', resumable: true } };
+    await run('loadHistory()');
+    for (const id of ['9201', '9202', '9203']) {
+        const card = costRow(id);
+        assert.match(card, /自动处理已暂停/);
+        assert.match(card, /history-more-status/, 'paused accounts explain automatic pause and available manual actions');
+        assert.match(card, new RegExp(`data-history-action="details" data-history-id="${id}"`));
+        assert.match(card, /data-history-action="relogin"/, 'automatic pause keeps explicit relogin available');
+        assert.doesNotMatch(card, /data-history-action="(?:import|reconcile)"/);
+        assert.doesNotMatch(card, /下次自动|等待后台执行/);
+        assert.equal(run(`historyRecoveryAction(historyAccounts.find(item => item.id === '${id}')).disabled`), id !== '9203');
+        assert.equal(run(`canBatchRelogin(historyAccounts.find(item => item.id === '${id}'))`), true);
+        assert.equal(Boolean(run(`canCheckHistoryAccount(historyAccounts.find(item => item.id === '${id}'))`)), false, 'the hidden legacy check action keeps its automatic eligibility policy');
+    }
+    assert.match(costRow('9201'), /Sub2 关联账号不存在 · 已停止自动检测和恢复/);
+    assert.match(costRow('9201'), /保留前缀/);
+    assert.doesNotMatch(costRow('9201'), /官方删除/);
+    assert.match(costRow('9201'), /仅重新登录 AUTH/);
+    assert.doesNotMatch(costRow('9201'), /data-history-action="(?:credentials|recover|import|reconcile)"/);
+    assert.match(costRow('9201'), /data-history-action="reimport"[^>]*>重新登录并导入 Sub2/);
+    assert.match(costRow('9202'), /未找到 Sub2 关联 · 不参与自动恢复/);
+    assert.match(costRow('9202'), /data-history-action="credentials"/);
+    assert.match(run('renderHistoryCredentials(historyAccounts.find(a => a.id === "9202"), {})'), /data-history-detail-edit >修改资料/);
+    rows[1].status = 'active';
+    await run('loadHistory()');
+    assert.equal(run('canImportToSub2(historyAccounts.find(a => a.id === "9202"))'), true, 'unmatched permits explicit first import after login success');
+    assert.match(costRow('9202'), /data-history-action="import"/);
+    assert.equal(run('historyRecoveryAction(historyAccounts.find(a => a.id === "9202")).visible'), false, 'unmatched remains excluded from automatic recovery');
+    assert.doesNotMatch(costRow('9202'), /Sub2 已删除|官方删除/);
+    assert.match(costRow('9203'), /需要邮箱验证码 · 已停止自动重试/);
+    assert.match(costRow('9203'), /data-history-action="recover"/);
+    assert.match(costRow('9203'), /data-history-action="credentials"/);
+    assert.match(run("formatLoginError({error:{manual_reason:'password_rejected',code:'invalid_credentials',stage:'password',message:'generic'}},{})"), /密码错误 · 已停止自动重试/);
+    assert.match(run("formatLoginError({error:{code:'verification_code_rejected',upstream_code:'incorrect_code',stage:'mfa'}},{})"), /上游 incorrect_code/);
+    assert.doesNotMatch(run("formatLoginError({error:{code:'verification_code_rejected',upstream_code:'token=sensitive',stage:'mfa'}},{})"), /sensitive/);
+    assert.doesNotMatch(run("formatLoginError({error:{code:'incorrect_code',stage:'mfa',message:'验证码错误，验证类型待确认'}},{})"), /TOTP 密钥错误/);
+    assert.doesNotMatch(run("automaticTaskPolicy({state:'retry_wait',manual_reason:'totp_rejected',next_retry_at:'2020-01-01T00:00:00Z'})"), /下次自动|等待后台/);
+    const stoppedRequests = requests.length;
+    await run("checkAndRecoverHistory('9201')");
+    assert.equal(requests.length, stoppedRequests, 'missing association cannot start recovery');
+
+    // One parameter confirmation authorizes login followed by explicit reimport.
+    // Ordinary import and background recovery remain blocked for this binding.
+    const normalHistoryFetch = context.fetch;
+    const reimportPosts = () => requests.filter(item => item.url === '/api/sub2/import' && JSON.parse(item.options.body).reimport);
+    const historyLoginPosts = () => requests.filter(item => item.url === '/api/history/login');
+    const priorHistoryLogins = historyLoginPosts().length;
+    const savedMissingDelivery = structuredClone(deliveries[9201]);
+    const savedMissingImports = structuredClone(imports);
+    const savedAcceptedImports = acceptedImportIDs;
+    const reimportOptions = { group_ids: [8], priority: 9, concurrency: 4, merchant: '旧号商', deadline: '2026-12-31' };
+    deliveries[9201].delivery_options = reimportOptions;
+    imports[0].operation_id = 'missing-operation-9201';
+    await run('loadHistory()');
+    const originalBatchOptions = run('JSON.stringify(deliveryBatchOptions)');
+    const originalDefaults = structuredClone(importSettings.defaults);
+    selectedGroups = [8];
+    acceptedImportIDs = new Set([9201]);
+    confirmResult = null;
+    const canceledReimport = run("reimportRemoteMissingHistory('9201')"); await flush();
+    assert.equal(el('deliveryOptionsDialog').open, true);
+    assert.equal(el('deliveryOptionsApply').textContent, '重新登录并导入');
+    assert.equal(el('deliveryMerchant').value, '旧号商', 'reimport starts from account delivery options');
+    assert.equal(el('deliveryPriority').value, '9');
+    assert.match(el('deliveryGroups').innerHTML, /data-delivery-group="8" checked/);
+    await el('deliveryOptionsCancel').emit('click'); await canceledReimport;
+    assert.equal(historyLoginPosts().length, priorHistoryLogins, 'canceling parameters does not log in');
+    assert.equal(reimportPosts().length, 0, 'canceling parameters does not import');
+    assert.equal(run('JSON.stringify(deliveryBatchOptions)'), originalBatchOptions);
+
+    let reimportLoginSucceeded = false, afterReimportLogin = null, reimportLoginGate = null;
+    context.fetch = async (url, options = {}) => {
+        if (url !== '/api/history/login') return normalHistoryFetch(url, options);
+        requests.push({ url, options });
+        assert.equal(run('processing && historyBatchRunning'), true, 'the entire reimport operation owns the UI lock');
+        assert.deepEqual(JSON.parse(options.body), { account_id: 9201, auto_deliver: false, manual_attempt: true, delivery_options: reimportOptions });
+        if (reimportLoginGate) await reimportLoginGate.promise;
+        if (!reimportLoginSucceeded) {
+            rows[0].status = 'failed'; rows[0].last_error = '代理配置无效'; rows[0].last_error_code = 'invalid_configuration';
+            return { ok: false, status: 400, headers: new Map([['content-type', 'application/json']]), json: async () => ({ message: '代理配置无效' }) };
+        }
+        rows[0].last_error = rows[0].last_error_code = '';
+        rows[0].status = 'active'; rows[0].credential_version = (rows[0].credential_version || 122) + 1;
+        afterReimportLogin?.();
+        const payload = { type: 'result', success: true, data: { Email: 'missing@example.test', account_id: 9201 } };
+        return { ok: true, headers: new Map([['content-type', 'text/event-stream']]), body: new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(payload)}\n\n`)); controller.close(); } }) };
+    };
+    confirmResult = true;
+    await run("reimportRemoteMissingHistory('9201')");
+    assert.equal(reimportPosts().length, 0, 'failed login does not import');
+    assert.equal(run('processing || historyBatchRunning'), false, 'failure releases both locks');
+    assert.match(el('historyBatchStatus').textContent, /代理配置无效/);
+    assert.match(costRow('9201'), /<summary><span>Sub2 关联账号不存在 · 已停止自动检测和恢复；最近登录失败：代理配置无效<\/span>/, 'missing status must not hide the most recent login failure');
+    assert.match(costRow('9201'), /class="history-more-status"[^>]*>[^<]*最近登录失败：代理配置无效 · invalid_configuration/, 'More shows the concrete login failure beside the missing association explanation');
+    assert.match(costRow('9201'), /data-history-action="reimport" data-history-id="9201"\s*>/, 'failed reimport releases the per-account button after the final history refresh');
+    assert.equal(run('historyBusyID'), '');
+    assert.equal(run('historyActionsLocked()'), false);
+    assert.equal(run('JSON.stringify(deliveryBatchOptions)'), originalBatchOptions, 'account options do not replace batch options');
+    assert.deepEqual(importSettings.defaults, originalDefaults, 'account options do not silently save platform defaults');
+
+    reimportLoginSucceeded = true;
+    afterReimportLogin = () => { imports[0].operation_id = 'changed-operation'; };
+    await run("reimportRemoteMissingHistory('9201')");
+    assert.equal(reimportPosts().length, 0, 'changed binding after login cannot reuse the initial consent');
+    imports[0].operation_id = 'missing-operation-9201';
+    await run('loadHistory()');
+    afterReimportLogin = () => { historyFailure = true; };
+    await run("reimportRemoteMissingHistory('9201')");
+    assert.equal(reimportPosts().length, 0, 'failed fresh history read cannot authorize reimport');
+    historyFailure = false; afterReimportLogin = null;
+    await run('loadHistory()');
+    reimportLoginGate = gate();
+    const successfulReimport = run("reimportRemoteMissingHistory('9201')"); await flush();
+    const duringLogin = historyLoginPosts().length;
+    await run("reimportRemoteMissingHistory('9201')");
+    assert.equal(historyLoginPosts().length, duringLogin, 'duplicate clicks cannot start another login');
+    reimportLoginGate.release(); await successfulReimport;
+    assert.equal(reimportPosts().length, 1, 'successful confirmed flow sends exactly one reimport');
+    assert.deepEqual(JSON.parse(reimportPosts()[0].options.body), { account_ids: [9201], delivery_options: reimportOptions, reimport: true,
+        expected_credential_version: 125, expected_import_operation_id: 'missing-operation-9201' });
+    assert.match(el('historyBatchStatus').textContent, /重新登录并导入 Sub2 已完成/);
+    assert.equal(run('processing || historyBatchRunning'), false);
+    assert.equal(run('JSON.stringify(deliveryBatchOptions)'), originalBatchOptions);
+    assert.equal(el('actionConfirmDialog').open, false, 'reimport needs no second confirmation after login');
+    imports = [{ ...savedMissingImports[0], operation_id: 'missing-operation-9201' }];
+    deliveries[9201] = { ...savedMissingDelivery, delivery_options: reimportOptions };
+    await run('loadHistory()');
+    afterReimportLogin = () => { rows[0].credential_version--; };
+    await run("reimportRemoteMissingHistory('9201')");
+    assert.equal(reimportPosts().length, 1, 'SSE success without a newer stored credential version cannot authorize reimport');
+    afterReimportLogin = null;
+    const successFetch = context.fetch;
+    context.fetch = async (url, options = {}) => {
+        if (url === '/api/sub2/import') { requests.push({ url, options }); throw run('new TypeError("synthetic lost response")'); }
+        return successFetch(url, options);
+    };
+    const historyReadsBeforeUnknown = requests.filter(item => item.url === '/api/history').length;
+    await run("reimportRemoteMissingHistory('9201')");
+    assert.equal(reimportPosts().length, 2, 'uncertain reimport sends one request without automatic replay');
+    assert.match(el('historyBatchStatus').textContent, /提交结果暂未确认，请刷新核对/);
+    assert.ok(requests.filter(item => item.url === '/api/history').length > historyReadsBeforeUnknown, 'uncertain submission refreshes persisted state');
+    assert.equal(run('processing || historyBatchRunning'), false);
+    context.fetch = normalHistoryFetch;
+    selectedGroups = [7]; acceptedImportIDs = savedAcceptedImports;
+    imports = savedMissingImports; deliveries[9201] = savedMissingDelivery;
+    rows[0].status = 'error'; delete rows[0].credential_version;
+    await run('loadHistory()');
+    await run("performHistoryRelogin('9201')");
+    assert.deepEqual(JSON.parse(requests.at(-1).options.body), { account_id: 9201, auto_deliver: false, manual_attempt: true }, 'missing association may only log in to AUTH without recreating Sub2');
+    await run("checkAndRecoverHistory('9203')");
+    assert.deepEqual(JSON.parse(requests.findLast(item => item.url === '/api/account-recovery').options.body), { account_id: 9203, manual_attempt: true, expected_task_id: 6301, expected_retry_count: 2 }, 'canonical failures permit an explicit single resume fenced to the displayed task');
+    recoveries = {}; deliveries = {}; checks[9203] = { eligible: true };
+    for (const code of ['auth_page_timeout_exhausted', 'totp_rejected', 'password_rejected', 'phone_verification_required']) {
+        rows[2].manual_reason = code;
+        await run('loadHistory()');
+        assert.equal(run('historyRecoveryAction(historyAccounts.find(a => a.id === "9203")).disabled'), false, `${code} permits manual recovery`);
+        assert.equal(run('canReloginHistory(historyAccounts.find(a => a.id === "9203"))'), true);
+    }
+    rows[2].status = 'deleted';
+    await run('loadHistory()');
+    const deletedRequests = requests.length;
+    await run("performHistoryRelogin('9203'); checkAndRecoverHistory('9203')");
+    assert.equal(requests.length, deletedRequests, 'official deletion blocks relogin and recovery');
+    for (const status of ['deactivated', 'deleted_or_deactivated']) {
+        rows[2].status = status;
+        await run('loadHistory()');
+        assert.equal(run('canReloginHistory(historyAccounts.find(a => a.id === "9203"))'), false, 'deactivation is terminal');
+        assert.equal(run('historyRecoveryAction(historyAccounts.find(a => a.id === "9203")).disabled'), true);
+        assert.equal(run('historyRefreshTokens.has("9203")'), false);
+        assert.equal(run('historyAccountMatches(historyAccounts.find(a => a.id === "9203"), "attention")'), false);
+    }
+    rows[2].status = 'active';
+    rows[2].sub2_policy = 'free_local';
+    await run('loadHistory()');
+    assert.equal(run('canReloginHistory(historyAccounts.find(a => a.id === "9203"))'), true);
+    assert.equal(run('canImportToSub2(historyAccounts.find(a => a.id === "9203"))'), false);
+    rows[2].status = 'discarded';
+    rows[2].sub2_policy = 'discarded';
+    rows[2].last_error_code = 'invalid_username_or_password';
+    rows[2].last_error = 'raw upstream text must stay hidden';
+    checks[9203] = { eligible: true, last_result: { freshness: 'current', outcome: 'account_deleted' } };
+    run('historyRefreshTokens.set("9203", "fixture-token")');
+    await run('loadHistory()');
+    assert.match(costRow('9203'), /本地废弃/);
+    assert.match(costRow('9203'), /废弃原因：账密被拒绝/);
+    assert.doesNotMatch(costRow('9203'), /官方删除|raw upstream text|data-history-action="(?:relogin|credentials|recover)"/);
+    assert.equal(run('historyRefreshTokens.has("9203")'), false);
+    assert.equal(run('renderHistoryCredentials(historyAccounts.find(a => a.id === "9203"), {})'), '');
+    run('renderHistoryDetail(historyAccounts.find(a => a.id === "9203"), [{ code: "invalid_username_or_password", message: "raw upstream text" }], [], true, false, [{ status: "discarded", code: "invalid_username_or_password", reason: "raw upstream text" }])');
+    assert.match(el('historyDetailBody').innerHTML, /已废弃 · 账密被拒绝/);
+    assert.doesNotMatch(el('historyDetailBody').innerHTML, /invalid_username_or_password|raw upstream text/);
+    const discardedRequests = requests.length;
+    await run("performHistoryRelogin('9203'); checkAndRecoverHistory('9203'); reconcileHistoryImport('9203')");
+    assert.equal(requests.length, discardedRequests, 'discarded account blocks actions despite stale task data');
+    const nativeDetailsQuery = el('historyGrid').querySelectorAll;
+    el('historyGrid').querySelectorAll = () => ({ length: 0, [Symbol.iterator]: function* () {} });
+    assert.doesNotThrow(() => run('renderHistory()'), 'real NodeList collections have no Array.map method');
+    el('historyGrid').querySelectorAll = nativeDetailsQuery;
+    rows = [{ id: 9204, email: 'fresh-success@example.test', status: 'active', credential_version: 102, updated_at: '2026-11-13T12:00:00Z' }];
+    sub2Statuses = { 9204: { configured: true, imported: true, exists: true, status: 'active', schedulable: true, association_status: 'imported' } };
+    imports = [{ account_id: 9204, state: 'imported', sub2_account_id: 123 }];
+    recoveries = { 9204: { state: 'unknown', failure_stage: 'logging_in', retry_action: 'manual', requires_action: true, error_code: 'password_rejected', source_credential_attempt_id: 101, result_credential_attempt_id: 0, resumable: true, updated_at: '2026-11-13T12:00:00Z' } };
+    deliveries = {}; repairs = {}; checks = {}; rechecks = {};
+    await run('loadHistory()');
+    assert.equal(run('automationStopped(historyAccounts[0])'), null, 'new credential version supersedes old deterministic failure even within the same second');
+    assert.doesNotMatch(el('historyGrid').innerHTML, /自动处理已暂停|密码错误/);
+    assert.equal(run('historyRecoveryAction(historyAccounts[0]).resume'), false, 'old failed task is never resumed after newer credentials');
+    assert.equal(run('historyAccountMatches(historyAccounts[0], "attention")'), false);
+    recoveries[9204].result_credential_attempt_id = 102;
+    await run('loadHistory()');
+    assert.match(run('automationStopped(historyAccounts[0]).label'), /密码错误/, 'failure against current result credentials still blocks');
+    recoveries[9204].error_code = 'identity_mismatch'; recoveries[9204].result_credential_attempt_id = 0;
+    await run('loadHistory()');
+    assert.equal(run('historyAccountTasks(historyAccounts[0]).recovery.error_code'), 'identity_mismatch', 'new credential version does not dismiss identity or group work');
+    assert.equal(run('loginTaskSuperseded(historyAccounts[0], {error_code:"password_rejected"})'), false, 'missing task versions cannot prove a superseded failure');
+    const oldLoginFailure = { state: 'unknown', failure_stage: 'logging_in', retry_action: 'manual', error_code: 'auth_page_timeout_exhausted', source_credential_attempt_id: 101, result_credential_attempt_id: 0 };
+    const isSuperseded = task => run(`loginTaskSuperseded(historyAccounts[0], ${JSON.stringify(task)})`);
+    for (const error_code of ['email_verification_required', 'phone_verification_required', 'password_rejected', 'totp_rejected', 'verification_code_rejected', 'credentials_rejected', 'auth_page_timeout_exhausted']) {
+        assert.equal(isSuperseded({ ...oldLoginFailure, error_code }), true, 'new success supersedes a known login-stage failure');
+    }
+    for (const change of [{ failure_stage: '' }, { failure_stage: 'identity_verified' }, { failure_stage: 'enabling_schedule' },
+        { retry_action: 'relogin' }, { state: 'requires_action' }, { state: 'logging_in' }, { error_code: 'identity_mismatch' },
+        { error_code: 'group_conflict' }, { error_code: 'manual_pause' }, { error_code: 'identity_mismatch', manual_reason: 'totp_rejected' },
+        { source_credential_attempt_id: 102 }, { result_credential_attempt_id: 102 }]) {
+        assert.equal(isSuperseded({ ...oldLoginFailure, ...change }), false, 'new success cannot bypass other stages, projected delivery states or current credential failures');
+    }
+    recoveries[9204] = { ...oldLoginFailure, id: 6302, retry_count: 3, resumable: true };
+    await run('loadHistory()');
+    assert.equal(run('automationStopped(historyAccounts[0])'), null, 'old login-stage timeout no longer masks a newer successful login');
+    assert.equal(run('historyRecoveryAction(historyAccounts[0]).resume'), false);
+    repairs = { 9204: { state: 'recovery_queued' } }; recoveries = {};
+    rows[0].status = 'failed'; rows[0].last_error_code = 'password_rejected'; rows[0].requires_action = true;
+    await run('loadHistory()');
+    assert.match(el('historyGrid').innerHTML, /资料已保存，等待继续恢复/);
+    assert.equal(run('historyAccountMatches(historyAccounts[0], "working")'), true);
+    assert.equal(run('historyAccountMatches(historyAccounts[0], "attention")'), false, 'accepted repair handoff takes precedence over historical failed status');
+    assert.equal(run('automationStopped(historyAccounts[0])'), null);
+    repairs = {}; rows[0].status = 'running';
+    await run('loadHistory()');
+    assert.equal(run('automationStopped(historyAccounts[0])'), null, 'an in-progress new attempt is not paused by historical last_error_code');
+
+    // Single-field reveal is isolated from polling and discarded on close/switch/hide.
+    rows = [{ id: 9301, email: 'secret-a@example.test', status: 'active' }, { id: 9302, email: 'secret-b@example.test', status: 'active' }];
+    sub2Statuses = {}; imports = []; checks = {}; recoveries = {}; deliveries = {};
+    credentialsMeta = { password: { state: 'saved' }, totp_secret: { state: 'saved' } };
+    await run('loadHistory()');
+    const secretNodes = new Map();
+    const detailQuery = el('historyDetailBody').querySelector;
+    el('historyDetailBody').querySelector = selector => {
+        if (!selector.startsWith('[data-history-credential-')) return detailQuery.call(el('historyDetailBody'), selector);
+        if (!secretNodes.has(selector)) secretNodes.set(selector, new Element());
+        return secretNodes.get(selector);
+    };
+    const secretValue = field => el('historyDetailBody').querySelector(`[data-history-credential-value="${field}"]`);
+    const secretStatus = field => el('historyDetailBody').querySelector(`[data-history-credential-status="${field}"]`);
+    const secretButton = (field, action) => el('historyDetailBody').querySelector(`[data-history-credential-field="${field}"][data-history-credential-action="${action}"]`);
+    context.secretButton = secretButton;
+    const revealRequests = () => requests.filter(item => item.url.endsWith('/credentials/reveal'));
+    await run("openHistoryDetails('9301')");
+    assert.match(el('historyDetailBody').innerHTML, /登录资料/);
+    assert.equal(revealRequests().length, 0, 'opening details only fetches metadata');
+    await run("handleHistoryCredentialAction('password', 'show', secretButton('password','show'))");
+    assert.equal(secretValue('password').textContent, 'fixture-revealed-password');
+    assert.equal(secretButton('password', 'show').textContent, '隐藏');
+    assert.equal(revealRequests().at(-1).url, '/api/history/9301/credentials/reveal');
+    assert.deepEqual(JSON.parse(revealRequests().at(-1).options.body), { field: 'password' });
+    assert.doesNotMatch(el('historyDetailBody').innerHTML + el('historyGrid').innerHTML + run('JSON.stringify(historyAccounts)'), /fixture-revealed/, 'secrets only enter field text nodes');
+    await run('loadHistory()');
+    assert.equal(secretValue('password').textContent, 'fixture-revealed-password', 'list polling leaves an explicitly revealed detail untouched');
+    await run("handleHistoryCredentialAction('password', 'show', secretButton('password','show'))");
+    assert.equal(secretValue('password').textContent, '••••••••');
+    assert.equal(run('historyCredentialValues.size'), 0);
+    assert.equal(revealRequests().length, 1, 'hide never sends a second reveal');
+    await run("handleHistoryCredentialAction('totp_secret', 'copy', secretButton('totp_secret','copy'))");
+    assert.equal(credentialCopies.at(-1), 'fixture-revealed-totp');
+    assert.equal(run('historyCredentialValues.size'), 0, 'copy does not cache the value');
+    const delayedReveal = gate(); revealGate = delayedReveal;
+    const pendingReveal = run("handleHistoryCredentialAction('password', 'show', secretButton('password','show'))");
+    await flush();
+    const pendingSignal = revealRequests().at(-1).options.signal;
+    await run("openHistoryDetails('9302')");
+    assert.equal(pendingSignal.aborted, true);
+    delayedReveal.release(); await pendingReveal;
+    assert.equal(secretValue('password').textContent, '••••••••');
+    assert.equal(run('historyCredentialValues.size'), 0, 'account A cannot populate account B');
+    const delayedCopy = gate(); revealGate = delayedCopy;
+    const pendingCopy = run("handleHistoryCredentialAction('password', 'copy', secretButton('password','copy'))");
+    await flush(); const copyCount = credentialCopies.length;
+    run('closeHistoryDetails()'); delayedCopy.release(); await pendingCopy;
+    assert.equal(credentialCopies.length, copyCount, 'a response after close must not copy');
+    assert.equal(el('historyDetailBody').innerHTML, '');
+    await run("openHistoryDetails('9301')");
+    revealReply = response({ success: true, account_id: 9302, field: 'password', value: 'wrong-account-secret' });
+    await run("handleHistoryCredentialAction('password', 'show', secretButton('password','show'))");
+    assert.equal(secretStatus('password').textContent, '资料响应无效，请刷新详情');
+    assert.notEqual(secretValue('password').textContent, 'wrong-account-secret');
+    revealReply = response({ code: 'credential_read_failed', message: 'do-not-render-raw-secret' }, 500);
+    await run("handleHistoryCredentialAction('password', 'show', secretButton('password','show'))");
+    assert.equal(secretStatus('password').textContent, '资料读取失败');
+    revealReply = null;
+    await run("handleHistoryCredentialAction('password', 'show', secretButton('password','show'))");
+    document.hidden = true; await document.emit('visibilitychange'); document.hidden = false;
+    assert.equal(secretValue('password').textContent, '••••••••');
+    assert.equal(run('historyCredentialValues.size'), 0);
+    run('closeHistoryDetails()');
+    el('historyDetailBody').querySelector = detailQuery;
+    assert.equal(browserPreferences.has('fixture-revealed-password'), false);
+
+    const clipboard = context.navigator.clipboard, createElement = document.createElement, appendChild = document.body.appendChild;
+    let fallbackField;
+    context.navigator.clipboard = null;
+    document.createElement = () => fallbackField = { value: '', style: {}, setAttribute() {}, select() {}, remove() { this.removed = true; } };
+    document.body.appendChild = () => {};
+    document.execCommand = () => { throw new Error('clipboard blocked'); };
+    assert.equal(await run('copySecret("fixture-private-password", "密码")'), false);
+    assert.equal(fallbackField.value, '', 'failed legacy copy clears the temporary field');
+    assert.equal(fallbackField.removed, true, 'failed legacy copy never leaves a hidden secret in the DOM');
+    context.navigator.clipboard = clipboard; document.createElement = createElement; document.body.appendChild = appendChild;
+    delete document.execCommand;
+
+    let exportedBlob, downloadClicks = 0;
+    context.Blob = Blob;
+    context.URL = { createObjectURL(blob) { exportedBlob = blob; return 'blob:fixture'; }, revokeObjectURL() {} };
+    document.createElement = () => ({ click() { downloadClicks++; } });
+    run("results = [{Email:'export@example.test', AccessToken:'synthetic-access', RefreshToken:'synthetic-refresh'}]");
+    await click('exportBtn');
+    const exported = JSON.parse(await exportedBlob.text());
+    assert.equal(downloadClicks, 1);
+    assert.equal(exported.accounts[0].extra.codex_fingerprint_mode, 'full', 'exported accounts default to full fingerprint convergence');
+    assert.equal(Object.hasOwn(exported.accounts[0].extra, 'codex_fingerprint_seed'), false, 'Sub2 generates each account fingerprint seed');
+    console.log('Export checks passed: default full fingerprint convergence without a shared seed.');
+    console.log('Account management checks passed: trusted names, plan intersections/zero refresh, canonical Sub2 absence, deterministic stop actions, single-field reveal, metadata-only defaults and close/switch/hide races.');
+    console.log('Recent cost checks passed: page-only reads, cache deduplication, zero/unknown, deleted account history, stale values, binding changes, late responses and details.');
     console.log('Group conflict checks passed: redacted task diagnostics, explicit choices, confirmation and snapshot-bound requests.');
     console.log('History checks passed: Sub2 status/settings, ordinary/cross-page select, cancellation, delete locking/409/404/timeouts/refresh failures, partial/chunked import, relogin retention.');
     console.log('Tab checks passed: selection isolation, navigation, keyboard, focus, hash/back navigation, panel scrolling.');
@@ -1293,7 +1899,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     console.log('Delivery identity checks passed: Unicode/control validation, late defaults, safe summary, default save, automatic batch/retry freezing, login-only independence and manual-import fields.');
     console.log('Regression checks passed: double Start during settings load, preparation failure/cancel release, and active/waiting/completed credential repair polling.');
     console.log('Login connection checks passed: bounded setup, uncertain POST is not replayed, active SSE respects the server deadline, and timers are released.');
-    console.log('Batch Stop checks passed: sequential/parallel SSE cancellation, queued work, persisted success/failure reconciliation, retry gating and rate-limit wait.');
+    console.log('Batch Stop checks passed: sequential/parallel SSE cancellation, queued work, persisted success/failure reconciliation, retry gating and concurrency wait.');
     globalThis.__clientTestComplete = true;
 })().then(() => {
     assert.equal(globalThis.__clientTestComplete, true, 'client interaction checks did not reach completion');

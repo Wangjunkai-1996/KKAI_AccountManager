@@ -1,0 +1,16 @@
+{
+  "phase": "candidate",
+  "account_id": 1581,
+  "auto_deliver": false,
+  "http_status": 200,
+  "success": false,
+  "elapsed_ms": 180091,
+  "code": "timeout",
+  "stage": "oauth",
+  "account_status": "failed",
+  "tokens_persisted": true,
+  "new_successful_attempt": false,
+  "attempt_id": 1583,
+  "sub2_import_count_unchanged": true,
+  "database_integrity": "ok"
+}

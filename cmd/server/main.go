@@ -46,7 +46,7 @@ var (
 	// multiple OAuth browser sessions against the same exit. Operators can
 	// explicitly raise this with -max-concurrent after single-account checks.
 	maxConcurrent = flag.Int("max-concurrent", 1, "同时登录的最大账号数（1-10）")
-	rateLimit     = flag.Int("rate-limit", 30, "每个客户端 IP 每 10 分钟的请求上限")
+	_             = flag.Int("rate-limit", 30, "已弃用，仅兼容旧启动配置；账号登录不再限制累计请求次数")
 	loginTimeout  = flag.Duration("login-timeout", 3*time.Minute, "单个账号登录的总超时时间")
 	proxy         = flag.String("proxy", os.Getenv("OPENAI_LOGIN_PROXY"), "代理地址")
 	upstreamProxy = flag.String("upstream-proxy", "", "用于连接出口代理的前置 HTTP 代理")
@@ -103,7 +103,6 @@ func (rl *rateLimiter) reserve(ip string) time.Duration {
 }
 
 var (
-	limiter           = newRateLimiter(30, 10*time.Minute)
 	proxyCheckLimiter = newRateLimiter(10, time.Minute)
 	loginSlots        = make(chan struct{}, 1)
 	emailPattern      = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
@@ -145,10 +144,9 @@ func runServer() error {
 	if *maxConcurrent < 1 || *maxConcurrent > 10 {
 		return errors.New("最大并发数必须在 1 到 10 之间")
 	}
-	if *rateLimit < 1 || *loginTimeout <= 0 {
-		return errors.New("请求上限和登录总超时时间必须大于 0")
+	if *loginTimeout <= 0 {
+		return errors.New("登录总超时时间必须大于 0")
 	}
-	limiter = newRateLimiter(*rateLimit, 10*time.Minute)
 	loginSlots = make(chan struct{}, *maxConcurrent)
 	if err := login.ValidateHTTPProxy(*proxy); err != nil {
 		return fmt.Errorf("代理配置无效: %w", err)
@@ -208,6 +206,7 @@ func runServer() error {
 	http.HandleFunc("/api/login/stream", corsMiddleware(handleLoginStream(service)))
 	http.HandleFunc("/api/proxy-check", corsMiddleware(handleProxyCheck(service)))
 	http.HandleFunc("/api/history/login", corsMiddleware(handleHistoryLogin(service)))
+	http.HandleFunc("/api/history/usage", corsMiddleware(sub2Importer.handleRecentAccountCosts))
 	http.HandleFunc("/api/history/", corsMiddleware(handleHistoryDelete()))
 	http.HandleFunc("/api/history", corsMiddleware(handleHistory()))
 	http.HandleFunc("/api/sub2/import-settings", corsMiddleware(sub2Importer.handleImportSettings))
@@ -336,9 +335,6 @@ func handleLoginRequest(service *login.Service, stream bool) http.HandlerFunc {
 			return
 		}
 
-		// Acquire the login slot before reserving the IP budget. A request that
-		// cannot run because all slots are occupied must not turn into a rate
-		// limit hit after the client retries it.
 		req, status, err := decodeLoginRequest(w, r)
 		if err != nil {
 			respondJSONStatus(w, status, LoginResponse{
@@ -347,25 +343,21 @@ func handleLoginRequest(service *login.Service, stream bool) http.HandlerFunc {
 			})
 			return
 		}
-		if err := validateLoginRequest(&req); err != nil {
-			respondJSONStatus(w, http.StatusBadRequest, LoginResponse{
-				Success: false,
-				Message: err.Error(),
-			})
+		if err := validateLoginIdentity(&req); err != nil {
+			respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: err.Error()})
 			return
 		}
-
 		limitConcurrentLogins(loginSlots, func(w http.ResponseWriter, r *http.Request) {
-			// 速率限制检查
-			ip := getClientIP(r)
-			if delay := limiter.reserve(ip); delay > 0 {
-				seconds := int((delay + time.Second - 1) / time.Second)
-				w.Header().Set("Retry-After", strconv.Itoa(seconds))
-				respondJSONStatus(w, http.StatusTooManyRequests, LoginResponse{
-					Success: false,
-					Message: "平台请求达到上限，等待后继续",
-					Code:    "platform_rate_limit", RetryAfter: seconds,
-				})
+			if err := loadDefaultLoginDeliveryOptions(r.Context(), &req); err != nil {
+				respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: err.Error()})
+				return
+			}
+			if err := applyLoginEgress(r.Context(), &req); err != nil {
+				respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: err.Error()})
+				return
+			}
+			if err := validateLoginRequest(&req); err != nil {
+				respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: err.Error()})
 				return
 			}
 
@@ -435,6 +427,9 @@ func serveLoginJSON(w http.ResponseWriter, r *http.Request, service *login.Servi
 }
 
 func loginHTTPStatus(err error) int {
+	if errors.Is(err, store.ErrAccountDiscarded) {
+		return http.StatusGone
+	}
 	if errors.Is(err, store.ErrAccountBusy) {
 		return http.StatusConflict
 	}
@@ -675,7 +670,7 @@ func respondJSONStatus(w http.ResponseWriter, status int, data interface{}) {
 }
 
 // 验证登录请求
-func validateLoginRequest(req *LoginRequest) error {
+func validateLoginIdentity(req *LoginRequest) error {
 	// 验证邮箱格式
 	if !emailPattern.MatchString(req.Email) {
 		return fmt.Errorf("邮箱格式不正确")
@@ -689,6 +684,13 @@ func validateLoginRequest(req *LoginRequest) error {
 	// 验证 TOTP 密钥格式
 	if !login.ValidateTOTPSecret(req.TotpSecret) {
 		return fmt.Errorf("TOTP 密钥格式不正确（应为 Base32 格式）")
+	}
+	return nil
+}
+
+func validateLoginRequest(req *LoginRequest) error {
+	if err := validateLoginIdentity(req); err != nil {
+		return err
 	}
 	if err := login.ValidateLoginProxy(req.Proxy); err != nil {
 		return fmt.Errorf("代理配置无效: %w", err)

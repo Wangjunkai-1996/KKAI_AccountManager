@@ -63,9 +63,6 @@ function updateActionBar(selectedCount, hadFocus = historyActionBar.contains(doc
 }
 
 const accountsInput = document.getElementById('accountsInput');
-const proxyInput = document.getElementById('proxyInput');
-const proxyCheckBtn = document.getElementById('proxyCheckBtn');
-const proxyCheckStatus = document.getElementById('proxyCheckStatus');
 const accountCount = document.getElementById('accountCount');
 const modeSelect = document.getElementById('modeSelect');
 const concurrencyInput = document.getElementById('concurrency');
@@ -86,6 +83,8 @@ const deliveryOptionsStatus = document.getElementById('deliveryOptionsStatus');
 const deliveryOptionsApply = document.getElementById('deliveryOptionsApply');
 const deliveryOptionsCancel = document.getElementById('deliveryOptionsCancel');
 const deliveryGroups = document.getElementById('deliveryGroups');
+const deliveryEgressRoutes = document.getElementById('deliveryEgressRoutes');
+const deliveryEgressHint = document.getElementById('deliveryEgressHint');
 const deliveryPriority = document.getElementById('deliveryPriority');
 const deliveryConcurrency = document.getElementById('deliveryConcurrency');
 const deliverySaveDefault = document.getElementById('deliverySaveDefault');
@@ -93,9 +92,7 @@ const credentialsDialog = document.getElementById('credentialsDialog');
 const credentialsForm = document.getElementById('credentialsForm');
 const credentialsPassword = document.getElementById('credentialsPassword');
 const credentialsTotp = document.getElementById('credentialsTotp');
-const credentialsProxy = document.getElementById('credentialsProxy');
 const credentialsClearTotp = document.getElementById('credentialsClearTotp');
-const credentialsClearProxy = document.getElementById('credentialsClearProxy');
 const credentialsStatus = document.getElementById('credentialsStatus');
 const credentialsSave = document.getElementById('credentialsSave');
 const exportBtn = document.getElementById('exportBtn');
@@ -118,6 +115,7 @@ const historyAttentionSummary = document.getElementById('historyAttentionSummary
 const historyAttentionList = document.getElementById('historyAttentionList');
 const historySearchInput = document.getElementById('historySearchInput');
 const historyStatusFilter = document.getElementById('historyStatusFilter');
+const historyPlanFilter = document.getElementById('historyPlanFilter');
 const historySort = document.getElementById('historySort');
 const historyDetail = document.getElementById('historyDetail');
 const historyDetailPanel = historyDetail.querySelector('[role="dialog"]') || historyDetail;
@@ -202,7 +200,6 @@ let historyAccounts = [];
 let processing = false;
 let loginBatchController = null;
 let startBatchInFlight = false;
-let proxyChecking = false;
 let historyLoading = false;
 let historyLoadPromise = null;
 let historyRefreshRequested = false;
@@ -232,6 +229,7 @@ let deliveryBatchOptions = null;
 let deliverySettingsRequest = null;
 let pendingDeliveryOptions = null;
 let deliveryOptionsSaving = false;
+let selectedEgressRouteIDs = [];
 let credentialsAccountID = '';
 let credentialsTrigger = null;
 let credentialsSaving = false;
@@ -253,6 +251,14 @@ let historyRefreshPolling = false;
 let historyDetailID = '';
 let historyDetailAbort = null;
 let historyDetailTrigger = null;
+let historyDetailGeneration = 0;
+const historyCredentialValues = new Map();
+const historyCredentialRequests = new Map();
+// Recent Sub2 usage is loaded for the visible page only.  Keep this separate
+// from the history payload so a refresh never turns into one request per row.
+const historyRecentCosts = new Map();
+const historyRecentCostInflight = new Map();
+const historyRecentCostTTL = 30000;
 let historyRecoveryPopoverID = '';
 let historyRecoveryPopoverAbort = null;
 let historyRecoveryPopoverTrigger = null;
@@ -296,35 +302,10 @@ const stageProgressEstimates = {
 };
 const stageProgressOrder = ['queued', 'configuration', 'browser', 'authorize', 'email', 'password',
     'oauth', 'mfa', 'consent', 'token', 'identity', 'complete'];
-let platformPauseUntil = 0;
-const stageNames = {queued:'排队', browser:'启动浏览器', authorize:'打开授权页', email:'邮箱验证',
+const stageNames = {queued:'排队', browser:'启动浏览器', authorize:'打开授权页', email:'邮箱验证', phone:'手机验证',
     password:'密码验证', oauth:'等待登录确认', mfa:'二次验证', consent:'确认授权', token:'获取令牌',
     identity:'账号身份', proxy:'连接代理', challenge:'浏览器验证', configuration:'配置',
     retry_wait:'等待重试', complete:'完成', unknown:'登录'};
-
-proxyCheckBtn.addEventListener('click', async () => {
-    if (processing || proxyChecking) return;
-    proxyChecking = true;
-    proxyCheckBtn.disabled = true;
-    proxyCheckBtn.innerHTML = '<span class="spinner"></span> 测试中';
-    proxyCheckStatus.textContent = '正在测试当前网络...';
-    try {
-        const response = await fetch('/api/proxy-check', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ proxy: proxyInput.value.trim() })
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.message || '代理测试失败');
-        proxyCheckStatus.textContent = (data.mode === 'direct' ? '✅ 直连：' : '🌐 代理：') + data.message + ' (' + data.elapsed_ms + 'ms)';
-    } catch (error) {
-        proxyCheckStatus.textContent = '❌ ' + (error.message || '代理测试失败');
-    } finally {
-        proxyChecking = false;
-        proxyCheckBtn.disabled = processing;
-        proxyCheckBtn.textContent = '测试代理';
-    }
-});
 
 accountsInput.addEventListener('input', () => {
     renderAccountPreflight();
@@ -392,11 +373,11 @@ modeSelect.addEventListener('change', () => {
 });
 
 function renderLoginConnectionSummary() {
-    const proxy = proxyInput.value.trim();
+    const selectedRoute = deliveryBatchOptions?.egress_route_ids?.[0];
+    const routeName = deliverySettings?.egress_routes?.find(route => Number(route.id) === selectedRoute)?.name || `出口 #${selectedRoute}`;
     document.getElementById('loginConnectionSummary').textContent =
-        `${proxy && proxy.toLowerCase() !== 'direct' ? '自定义代理' : 'IPv4 直连'} · ${modeSelect.value === 'sequential' ? '顺序模式' : '并发模式'}`;
+        `${selectedRoute ? routeName : '服务器默认网络'} · ${modeSelect.value === 'sequential' ? '顺序模式' : '并发模式'}`;
 }
-proxyInput.addEventListener('input', renderLoginConnectionSummary);
 
 refreshHistoryBtn.addEventListener('click', () => Promise.all([loadHistory(), loadRecoverySettings()]));
 autoRecoveryToggle?.addEventListener('change', () => updateRecoverySetting(Boolean(autoRecoveryToggle.checked)));
@@ -420,6 +401,7 @@ historyAttentionList?.addEventListener('click', event => {
     if (!account) return;
     historySearchInput.value = account.email;
     historyStatusFilter.value = 'all';
+    historyPlanFilter.value = 'all';
     historyPage = 1;
     renderHistory();
     const card = historyGrid.querySelector(`[data-history-card="${CSS.escape(account.id)}"]`);
@@ -437,6 +419,11 @@ historySearchInput.addEventListener('input', () => {
     resetHistoryScroll();
 });
 historyStatusFilter.addEventListener('change', () => {
+    historyPage = 1;
+    renderHistory();
+    resetHistoryScroll();
+});
+historyPlanFilter.addEventListener('change', () => {
     historyPage = 1;
     renderHistory();
     resetHistoryScroll();
@@ -500,6 +487,8 @@ historyGrid.addEventListener('click', event => {
         toggleHistoryRecoveryPopover(id, button);
     } else if (button.dataset.historyAction === 'relogin') {
         reloginHistory(id);
+    } else if (button.dataset.historyAction === 'reimport') {
+        reimportRemoteMissingHistory(id);
     } else if (button.dataset.historyAction === 'import') {
         chooseDeliveryOptions('将此账号导入 Sub2。以下参数用于新建账号；已存在账号保留原配置。', true).then(options => {
             if (options) importHistoryAccounts([id], { deliveryOptions: options });
@@ -518,8 +507,13 @@ historyGrid.addEventListener('click', event => {
         window.AccountChecks?.startSingle(id);
     } else if (button.dataset.historyAction === 'recover') {
         checkAndRecoverHistory(id);
+    } else if (button.dataset.historyAction === 'recheck') {
+        retryHistoryRecheck(id, button.dataset.recheckTask);
     }
 });
+// Keep native <details> menus open across the usage refresh that follows a
+// history render. The toggle event does not bubble, so capture the summary
+// click and persist the state by account-specific details key.
 historyGrid.addEventListener('pointerover', event => {
     const button = event.target.closest('[data-history-action="recovery-history"]');
     if (event.pointerType !== 'touch' && button && !button.disabled) openHistoryRecoveryPopover(button.dataset.historyId, button);
@@ -556,6 +550,15 @@ historyGrid.addEventListener('change', event => {
 historyDetailClose.addEventListener('click', closeHistoryDetails);
 historyDetail.addEventListener('click', event => {
     if (event.target.closest('[data-history-detail-close]')) closeHistoryDetails();
+});
+historyDetailBody.addEventListener('click', event => {
+    const button = event.target.closest('[data-history-credential-action]');
+    if (button && !button.disabled) handleHistoryCredentialAction(button.dataset.historyCredentialField, button.dataset.historyCredentialAction, button);
+    const edit = event.target.closest('[data-history-detail-edit]');
+    if (edit && !edit.disabled) openCredentialsEditor(historyDetailID, edit);
+});
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) clearHistoryCredentials();
 });
 historyRecoveryPopoverClose?.addEventListener('click', () => closeHistoryRecoveryPopover(true));
 historyRecoveryPopover?.addEventListener('click', event => {
@@ -677,15 +680,19 @@ window.recheckStoppedAccount = async function(id) {
 };
 
 retryFailedBtn.addEventListener('click', () => {
-    return runAccounts(accounts.filter(account => ['error', 'stopped'].includes(account.status)));
+    return runAccounts(accounts.filter(canRetryLogin));
 });
 
 importSub2Btn.addEventListener('click', () => importLoginResultsToSub2());
 
 window.retryAccount = function(id) {
-    const account = accounts.find(account => account.id === id && ['error', 'stopped'].includes(account.status));
+    const account = accounts.find(account => account.id === id && canRetryLogin(account));
     if (account) return runAccounts([account]);
 };
+
+function canRetryLogin(account) {
+    return ['error', 'stopped'].includes(account.status) && !deterministicStopReason(account);
+}
 
 async function loadHistory() {
     if (historyLoading) {
@@ -751,11 +758,11 @@ async function loadHistorySnapshot() {
         historyAccounts = rows.map(row => {
             const id = String(row?.id ?? row?.account_id ?? '');
             return normalizeHistoryAccount({ ...row, lifecycle_events: historyLifecycleEvents.get(id) || row?.lifecycle_events }, historySub2Statuses.get(id));
-        })
-            .filter(account => account.id !== '').map(account => {
+        }).filter(account => account.id !== '');
+        for (const account of historyAccounts) {
+            if (terminalHistoryAccount(account)) historyRefreshTokens.delete(account.id);
             account.refreshToken = historyRefreshTokens.get(account.id) || '';
-            return account;
-        });
+        }
         reconcileStoppedAccounts();
         const availableIDs = new Set(historyAccounts.map(account => account.id));
         historySelectedIDs.forEach(id => {
@@ -763,6 +770,15 @@ async function loadHistorySnapshot() {
         });
         historyRefreshTokens.forEach((_, id) => {
             if (!availableIDs.has(id)) historyRefreshTokens.delete(id);
+        });
+        const detailAccount = historyAccounts.find(account => account.id === historyDetailID);
+        if (historyDetailID && (!detailAccount || terminalHistoryAccount(detailAccount) && historyDetailBody.querySelector('[data-history-credential-action]'))) closeHistoryDetails();
+        if (credentialsAccountID && !canReloginHistory(historyAccounts.find(account => account.id === credentialsAccountID))) {
+            credentialsPassword.value = credentialsTotp.value = '';
+            closeCredentialsEditor();
+        }
+        historyRecentCosts.forEach((_, id) => {
+            if (!availableIDs.has(id)) historyRecentCosts.delete(id);
         });
         renderHistory();
         syncLoginDeliveries();
@@ -784,9 +800,10 @@ function historyRefreshDelay() {
     const checking = [...historyChecks.values()].some(item => ['queued', 'running'].includes(item.latest_task?.state));
     const recovering = [...historyRecoveries.values()].some(item => historyRecoveryActive(item));
     const delivering = [...historyDeliveries.values()].some(item => ['queued', 'checking', 'importing', 'verifying', 'working'].includes(item.state));
-    const repairing = [...historyRepairs.values()].some(item => ['queued', 'checking'].includes(item.state));
+    const repairing = [...historyRepairs.values()].some(item => ['queued', 'checking', 'recovery_queued'].includes(item.state));
+    const rechecking = [...historyRechecks.values()].some(item => ['pending', 'checking'].includes(item.state));
     const waiting = [...historyRecoveries.values(), ...historyDeliveries.values(), ...historyRepairs.values()].filter(item => item.next_retry_at && !item.requires_action && !['completed', 'success', 'canceled'].includes(item.state));
-    if (checking || recovering || delivering || repairing || historyRecoveryRequests.size || recoverySettings.scanning) return 5000;
+    if (checking || recovering || delivering || repairing || rechecking || historyRecoveryRequests.size || recoverySettings.scanning) return 5000;
     if (waiting.length) {
         const nextRetry = Math.min(...waiting.map(item => Date.parse(item.next_retry_at)).filter(Number.isFinite));
         return Number.isFinite(nextRetry) ? Math.max(5000, Math.min(60000, nextRetry - Date.now())) : 60000;
@@ -918,6 +935,7 @@ function copyDeliveryOptions(options) {
     const deadline = normalizeDeliveryValue(options.deadline);
     return {
         group_ids: [...(options.group_ids || [])], priority: Number(options.priority), concurrency: Number(options.concurrency),
+        ...((options.egress_route_ids || []).length ? { egress_route_ids: [...options.egress_route_ids] } : {}),
         ...(merchant ? { merchant } : {}), ...(deadline ? { deadline } : {})
     };
 }
@@ -938,10 +956,32 @@ function renderDeliveryOptionsSummary() {
     const names = deliveryBatchOptions.group_ids.map(id => deliverySettings?.groups?.find(group => Number(group.id) === id)?.name || `分组 #${id}`);
     const batch = deliveryBatchOptions.merchant && deliveryBatchOptions.deadline
         ? ` · ${deliveryBatchOptions.merchant} | ${deliveryBatchOptions.deadline}` : '';
-    deliveryOptionsSummary.textContent = `${names.length ? names.join('、') : '未分组'} · 优先级 ${deliveryBatchOptions.priority} · 账号并发 ${deliveryBatchOptions.concurrency}${batch}`;
+    const routes = (deliveryBatchOptions.egress_route_ids || []).map(id => deliverySettings?.egress_routes?.find(route => Number(route.id) === id)?.name || `出口 #${id}`);
+    deliveryOptionsSummary.textContent = `${names.length ? names.join('、') : '未分组'} · ${routes.length ? `出口 ${routes.join('、')}（${routes[0]} 登录）` : '默认出口'} · 优先级 ${deliveryBatchOptions.priority} · 账号并发 ${deliveryBatchOptions.concurrency}${batch}`;
 }
 
-async function loadDeliverySettings() {
+function renderDeliveryEgressHint() {
+    const first = selectedEgressRouteIDs[0];
+    const route = deliverySettings?.egress_routes?.find(item => Number(item.id) === first);
+    deliveryEgressHint.textContent = first && deliverySettings?.egress_available === false
+        ? '暂时无法读取 Sub2 出口；已有选择恢复后才能提交。'
+        : first ? `${route?.name || `出口 #${first}`} 用于登录；其余出口由 Sub2 调度。`
+            : '不选时登录使用服务器默认网络；Sub2 使用其默认出口。';
+    deliveryEgressRoutes.querySelectorAll('[data-egress-primary]').forEach(marker => {
+        marker.hidden = Number(marker.dataset.egressPrimary) !== first;
+    });
+}
+
+function selectableDeliveryEgress(route) {
+    return route?.eligible === true && route.kind !== 'direct' && (!route.protocol || String(route.protocol).toLowerCase() === 'http');
+}
+
+function deliveryEgressSelectionInvalid(ids) {
+    return ids.length > 0 && (deliverySettings?.egress_available === false ||
+        ids.some(id => !deliverySettings?.egress_routes?.some(route => Number(route.id) === id && selectableDeliveryEgress(route))));
+}
+
+async function loadDeliverySettings(initializeBatch = true) {
     if (deliverySettingsRequest) return deliverySettingsRequest;
     deliverySettingsRequest = (async () => {
         try {
@@ -949,10 +989,11 @@ async function loadDeliverySettings() {
             const payload = await response.json().catch(() => ({}));
             if (!response.ok || !payload.defaults) throw new Error(payload.message || `交付参数读取失败（HTTP ${response.status}）`);
             deliverySettings = payload;
-            if (!deliveryBatchOptions) {
+            if (initializeBatch && !deliveryBatchOptions) {
                 deliveryBatchOptions = copyDeliveryOptions(payload.defaults);
             }
             renderDeliveryOptionsSummary();
+            renderLoginConnectionSummary();
             return true;
         } catch (error) {
             deliveryOptionsSummary.textContent = error.message || '交付参数读取失败，请打开“交付参数”重试';
@@ -973,6 +1014,10 @@ async function prepareDeliveryBatch() {
         window.alert('Sub2 分组暂时无法读取，当前带分组的交付暂不能提交，请打开“交付参数”刷新。');
         return false;
     }
+    if (deliveryEgressSelectionInvalid(deliveryBatchOptions.egress_route_ids || [])) {
+        window.alert('Sub2 出口暂时不可用，请打开“交付参数”重新选择。');
+        return false;
+    }
     return true;
 }
 
@@ -980,37 +1025,52 @@ function closeDeliveryOptions(options = null) {
     if (!pendingDeliveryOptions || deliveryOptionsSaving) return;
     const { resolve, trigger } = pendingDeliveryOptions;
     pendingDeliveryOptions = null;
+    deliverySaveDefault.disabled = false;
+    const defaultLabel = deliverySaveDefault.closest?.('label');
+    if (defaultLabel) defaultLabel.hidden = false;
     if (deliveryOptionsDialog.open) deliveryOptionsDialog.close();
     if (trigger?.isConnected !== false && !trigger?.disabled && !trigger?.closest?.('[hidden]')) trigger?.focus({ preventScroll: true });
     resolve(options);
 }
 
-function chooseDeliveryOptions(message = '为接下来的登录批次设置交付参数；已经开始的任务不受影响。', importBatch = false) {
+function chooseDeliveryOptions(message = '为接下来的登录批次设置交付参数；已经开始的任务不受影响。', importBatch = false, initialOptions = null, persistOptions = true) {
     if (pendingDeliveryOptions) return Promise.resolve(null);
     deliveryOptionsMessage.textContent = message;
     deliveryOptionsStatus.textContent = '正在读取 Sub2 分组…';
     deliveryOptionsStatus.classList.remove('error');
-    deliveryOptionsApply.textContent = importBatch ? '按此配置导入' : '用于接下来的批次';
+    deliveryOptionsApply.textContent = importBatch ? '按此配置导入' : '用于本批';
     deliveryOptionsApply.disabled = true;
     deliveryMerchant.disabled = true;
     deliveryDeadline.disabled = true;
     deliverySaveDefault.checked = false;
+    deliverySaveDefault.disabled = !persistOptions;
+    const defaultLabel = deliverySaveDefault.closest?.('label');
+    if (defaultLabel) defaultLabel.hidden = !persistOptions;
     deliveryGroups.innerHTML = '';
-    const promise = new Promise(resolve => { pendingDeliveryOptions = { resolve, trigger: document.activeElement }; });
+    deliveryEgressRoutes.innerHTML = '';
+    const promise = new Promise(resolve => { pendingDeliveryOptions = { resolve, trigger: document.activeElement, persistOptions,
+        initialOptions: initialOptions ? copyDeliveryOptions(initialOptions) : null }; });
     const pending = pendingDeliveryOptions;
     deliveryOptionsDialog.showModal();
-    loadDeliverySettings().then(loaded => {
+    loadDeliverySettings(persistOptions).then(loaded => {
         if (pendingDeliveryOptions !== pending) return;
         if (!loaded) {
             deliveryOptionsStatus.textContent = `${deliveryOptionsSummary.textContent}。关闭后重新打开可重试。`;
             deliveryOptionsStatus.classList.add('error');
             return;
         }
-        const options = deliveryBatchOptions;
+        const options = copyDeliveryOptions(pending.initialOptions || (persistOptions ? deliveryBatchOptions : deliverySettings.defaults)
+            || deliverySettings.defaults || { group_ids: [], priority: 1, concurrency: 1 });
+        pending.baseOptions = copyDeliveryOptions(options);
         const groups = [...(deliverySettings.groups || [])];
         for (const id of options.group_ids) if (!groups.some(group => Number(group.id) === id)) groups.push({ id, name: `分组 #${id}` });
         deliveryGroups.innerHTML = groups.map(group => `<label class="delivery-group-option"><input type="checkbox" data-delivery-group="${Number(group.id)}" ${options.group_ids.includes(Number(group.id)) ? 'checked' : ''} ${deliverySettings.groups_available === false ? 'disabled' : ''}><span>${escapeHTML(group.name)}</span></label>`).join('');
         document.getElementById('deliveryGroupsHint').textContent = deliverySettings.groups_available === false ? '暂时无法读取 Sub2 分组；已有选择仅供查看，分组恢复后才能提交带分组的任务。' : groups.length ? '可选多个分组；不选时进入未分组。' : 'Sub2 暂无可用分组，本批进入未分组。';
+        selectedEgressRouteIDs = [...(options.egress_route_ids || [])];
+        const routes = [...(deliverySettings.egress_routes || [])];
+        for (const id of selectedEgressRouteIDs) if (!routes.some(route => Number(route.id) === id)) routes.push({ id, name: `出口 #${id}`, eligible: false });
+        deliveryEgressRoutes.innerHTML = routes.map(route => `<label class="delivery-group-option"><input type="checkbox" data-delivery-route="${Number(route.id)}" ${selectedEgressRouteIDs.includes(Number(route.id)) ? 'checked' : ''} ${selectableDeliveryEgress(route) && deliverySettings.egress_available !== false || selectedEgressRouteIDs.includes(Number(route.id)) ? '' : 'disabled'}><span>${escapeHTML(route.name || `出口 #${route.id}`)}${route.public_ip ? ` · ${escapeHTML(route.public_ip)}` : ''}${selectableDeliveryEgress(route) ? '' : ' · 不可用'}</span><strong class="delivery-primary-badge" data-egress-primary="${Number(route.id)}" ${selectedEgressRouteIDs[0] === Number(route.id) ? '' : 'hidden'}>登录使用</strong></label>`).join('');
+        renderDeliveryEgressHint();
         deliveryPriority.value = String(options.priority);
         deliveryConcurrency.value = String(options.concurrency);
         deliveryMerchant.value = options.merchant || '';
@@ -1018,7 +1078,7 @@ function chooseDeliveryOptions(message = '为接下来的登录批次设置交�
         deliveryMerchant.disabled = false;
         deliveryDeadline.disabled = false;
         deliveryOptionsStatus.textContent = '';
-        deliveryOptionsApply.disabled = deliverySettings.groups_available === false && options.group_ids.length > 0;
+        deliveryOptionsApply.disabled = (deliverySettings.groups_available === false && options.group_ids.length > 0) || deliveryEgressSelectionInvalid(selectedEgressRouteIDs);
         deliveryMerchant.focus({ preventScroll: true });
     });
     return promise;
@@ -1028,11 +1088,24 @@ deliveryOptionsBtn.addEventListener('click', () => chooseDeliveryOptions());
 deliveryOptionsCancel.addEventListener('click', () => closeDeliveryOptions());
 deliveryOptionsDialog.addEventListener('cancel', event => { event.preventDefault(); closeDeliveryOptions(); });
 deliveryOptionsDialog.addEventListener('close', () => { if (!deliveryOptionsDialog.open) closeDeliveryOptions(); });
+deliveryEgressRoutes.addEventListener('change', event => {
+    const id = Number(event.target.dataset.deliveryRoute);
+    if (!Number.isSafeInteger(id) || id <= 0 || (event.target.checked &&
+        (deliverySettings.egress_available === false || !deliverySettings.egress_routes?.some(route => Number(route.id) === id && selectableDeliveryEgress(route))))) return;
+    selectedEgressRouteIDs = event.target.checked
+        ? [...selectedEgressRouteIDs.filter(selected => selected !== id), id]
+        : selectedEgressRouteIDs.filter(selected => selected !== id);
+    renderDeliveryEgressHint();
+    const baseOptions = pendingDeliveryOptions?.baseOptions || deliveryBatchOptions || deliverySettings?.defaults || { group_ids: [], priority: 1, concurrency: 1 };
+    deliveryOptionsApply.disabled = (deliverySettings.groups_available === false && baseOptions.group_ids.length > 0) || deliveryEgressSelectionInvalid(selectedEgressRouteIDs);
+});
 deliveryOptionsForm.addEventListener('submit', async event => {
     event.preventDefault();
     if (!pendingDeliveryOptions || deliveryOptionsSaving || deliveryOptionsApply.disabled) return;
+    const baseOptions = pendingDeliveryOptions.baseOptions || deliveryBatchOptions || deliverySettings?.defaults || { group_ids: [], priority: 1, concurrency: 1 };
     const options = {
-        group_ids: deliverySettings.groups_available === false ? [...deliveryBatchOptions.group_ids] : [...deliveryGroups.querySelectorAll('input:checked')].map(input => Number(input.dataset.deliveryGroup)),
+        group_ids: deliverySettings.groups_available === false ? [...baseOptions.group_ids] : [...deliveryGroups.querySelectorAll('input:checked')].map(input => Number(input.dataset.deliveryGroup)),
+        ...(selectedEgressRouteIDs.length ? { egress_route_ids: [...selectedEgressRouteIDs] } : {}),
         priority: Number(deliveryPriority.value), concurrency: Number(deliveryConcurrency.value),
         merchant: normalizeDeliveryValue(deliveryMerchant.value),
         deadline: normalizeDeliveryValue(deliveryDeadline.value)
@@ -1054,7 +1127,7 @@ deliveryOptionsForm.addEventListener('submit', async event => {
     deliveryOptionsApply.disabled = true;
     deliveryOptionsCancel.disabled = true;
     try {
-        if (deliverySaveDefault.checked) {
+        if (pendingDeliveryOptions.persistOptions && deliverySaveDefault.checked) {
             deliveryOptionsStatus.textContent = '正在保存平台默认参数…';
             const response = await fetch('/api/sub2/import-settings', {
                 method: 'PUT', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -1064,8 +1137,11 @@ deliveryOptionsForm.addEventListener('submit', async event => {
             if (!response.ok) throw new Error(payload.message || `默认参数保存失败（HTTP ${response.status}）`);
             deliverySettings.defaults = copyDeliveryOptions(options);
         }
-        deliveryBatchOptions = copyDeliveryOptions(options);
-        renderDeliveryOptionsSummary();
+        if (pendingDeliveryOptions.persistOptions) {
+            deliveryBatchOptions = copyDeliveryOptions(options);
+            renderDeliveryOptionsSummary();
+            renderLoginConnectionSummary();
+        }
         deliveryOptionsSaving = false;
         closeDeliveryOptions(copyDeliveryOptions(options));
     } catch (error) {
@@ -1080,15 +1156,15 @@ deliveryOptionsForm.addEventListener('submit', async event => {
 
 function openCredentialsEditor(id, trigger = document.activeElement) {
     const account = historyAccounts.find(item => item.id === String(id));
-    if (!account || credentialsSaving || historyActionsLocked()) return;
+    if (!account || terminalHistoryAccount(account) || credentialsSaving || historyActionsLocked()) return;
     credentialsAccountID = account.id;
     credentialsTrigger = trigger;
-    credentialsPassword.value = credentialsTotp.value = credentialsProxy.value = '';
-    credentialsClearTotp.checked = credentialsClearProxy.checked = false;
-    credentialsTotp.disabled = credentialsProxy.disabled = false;
+    credentialsPassword.value = credentialsTotp.value = '';
+    credentialsClearTotp.checked = false;
+    credentialsTotp.disabled = false;
     credentialsStatus.textContent = '';
     credentialsStatus.classList.remove('error');
-    document.getElementById('credentialsAccount').textContent = account.email;
+    document.getElementById('credentialsAccount').textContent = historyAccountName(account);
     credentialsDialog.showModal();
     credentialsPassword.focus({ preventScroll: true });
 }
@@ -1096,14 +1172,13 @@ function openCredentialsEditor(id, trigger = document.activeElement) {
 function closeCredentialsEditor() {
     if (credentialsSaving) return;
     credentialsAccountID = '';
-    credentialsPassword.value = credentialsTotp.value = credentialsProxy.value = '';
+    credentialsPassword.value = credentialsTotp.value = '';
     if (credentialsDialog.open) credentialsDialog.close();
     if (credentialsTrigger?.isConnected !== false && !credentialsTrigger?.disabled && !credentialsTrigger?.closest?.('[hidden]')) credentialsTrigger?.focus({ preventScroll: true });
     credentialsTrigger = null;
 }
 
 credentialsClearTotp.addEventListener('change', () => { credentialsTotp.disabled = credentialsClearTotp.checked; });
-credentialsClearProxy.addEventListener('change', () => { credentialsProxy.disabled = credentialsClearProxy.checked; });
 document.getElementById('credentialsCancel').addEventListener('click', closeCredentialsEditor);
 credentialsDialog.addEventListener('cancel', event => { event.preventDefault(); closeCredentialsEditor(); });
 credentialsDialog.addEventListener('close', () => { if (!credentialsDialog.open) closeCredentialsEditor(); });
@@ -1114,8 +1189,6 @@ credentialsForm.addEventListener('submit', async event => {
     if (credentialsPassword.value) changes.password = credentialsPassword.value;
     if (credentialsClearTotp.checked) changes.clear_totp = true;
     else if (credentialsTotp.value.trim()) changes.totp_secret = credentialsTotp.value.trim();
-    if (credentialsClearProxy.checked) changes.clear_proxy = true;
-    else if (credentialsProxy.value.trim()) changes.proxy = credentialsProxy.value.trim();
     if (!Object.keys(changes).length) {
         credentialsStatus.textContent = '请填写需要更新的资料，或明确选择要清除的项目。';
         credentialsStatus.classList.add('error');
@@ -1124,7 +1197,7 @@ credentialsForm.addEventListener('submit', async event => {
     credentialsSaving = true;
     credentialsSave.disabled = true;
     document.getElementById('credentialsCancel').disabled = true;
-    credentialsStatus.textContent = '正在保存，后台将自动继续…';
+    credentialsStatus.textContent = '正在保存资料…';
     credentialsStatus.classList.remove('error');
     try {
         const response = await fetch(`/api/history/${encodeURIComponent(credentialsAccountID)}/credentials`, {
@@ -1133,7 +1206,7 @@ credentialsForm.addEventListener('submit', async event => {
         });
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(payload.message || `资料保存失败（HTTP ${response.status}）`);
-        historyBatchSummary = '资料已保存，后台将自动重新登录并继续交付。';
+        historyBatchSummary = '资料已保存，请查看账号状态与处理进度。';
         credentialsSaving = false;
         closeCredentialsEditor();
         await loadHistory();
@@ -1158,6 +1231,7 @@ function normalizeSub2Statuses(value) {
 
 function normalizeSub2Status(value) {
     const source = value || {};
+    const associationStatus = String(source.association_status || source.associationStatus || '').toLowerCase();
     return {
         present: Boolean(value),
         configured: source.configured !== false,
@@ -1174,7 +1248,11 @@ function normalizeSub2Status(value) {
         tempUnschedulableUntil: source.temp_unschedulable_until || source.tempUnschedulableUntil || '',
         tempUnschedulableReason: String(source.temp_unschedulable_reason || source.tempUnschedulableReason || ''),
         expiresAt: source.expires_at ?? source.expiresAt ?? '',
-        associationStatus: String(source.association_status || ''),
+        associationStatus,
+        remoteMissing: source.remote_missing === true || source.remoteMissing === true || source.state === 'remote_missing' || associationStatus === 'missing',
+        name: String(source.name || '').trim(),
+        nameSource: String(source.name_source || source.nameSource || '').toLowerCase(),
+        nameStale: Boolean(source.name_stale ?? source.nameStale),
         quota: normalizeSub2Quota(source.quota || source.usage),
         checkedAt: source.checked_at || source.checkedAt || '',
         stale: Boolean(source.stale),
@@ -1263,6 +1341,7 @@ function normalizeHistoryAccount(row, sub2Status = null) {
         id: String(source.id ?? source.account_id ?? ''),
         email: String(source.email || ''),
         status,
+        sub2Policy: String(source.sub2_policy || source.sub2Policy || 'unknown').toLowerCase(),
         lastSuccessAt: source.last_success_at || source.lastSuccessAt || '',
         lastAttemptAt: source.last_attempt_at || source.lastAttemptAt || '',
         updatedAt: source.updated_at || source.updatedAt || '',
@@ -1272,7 +1351,11 @@ function normalizeHistoryAccount(row, sub2Status = null) {
         lastError: String(source.last_error || source.lastError || ''),
         lastErrorCode: String(source.last_error_code || source.lastErrorCode || ''),
         lastHTTPStatus: Number(source.last_http_status || source.lastHTTPStatus || 0),
+        credentialVersion: Number(source.credential_version || 0),
         requiresAction: source.requires_action === true,
+        retryable: typeof source.retryable === 'boolean' ? source.retryable : null,
+        nextRetryAt: source.next_retry_at || source.nextRetryAt || '',
+        manualReason: String(source.manual_reason || source.manualReason || ''),
         manualAction: String(source.manual_action || ''),
         planType: String(source.plan_type || source.planType || ''),
         expiresAt: Number(source.expires_at ?? source.expiresAt ?? 0) || 0,
@@ -1283,12 +1366,89 @@ function normalizeHistoryAccount(row, sub2Status = null) {
     };
 }
 
+function historyAccountName(account) {
+    const name = String(account?.sub2Status?.name || '').trim();
+    const email = String(account?.email || '').trim();
+    return name && name.toLowerCase() !== email.toLowerCase() ? name : email || '未知账号';
+}
+
+function historyPlanLabel(value) {
+    const raw = String(value || '').toLowerCase();
+    return ({ free: 'Free', plus: 'Plus', pro: 'Pro', team: 'Team', business: 'Business' }[raw] || (raw ? raw : '未知（未识别）'));
+}
+
+function renderHistoryPlanFilter() {
+    if (!historyPlanFilter) return;
+    const current = historyPlanFilter.value || 'all';
+    const values = [...new Set(historyAccounts.map(account => String(account.planType || '').toLowerCase() || 'unknown'))].sort((a, b) => a.localeCompare(b));
+    if (current !== 'all' && !values.includes(current)) values.push(current);
+    historyPlanFilter.innerHTML = ['<option value="all">全部类型</option>', ...values.map(value => {
+        const count = historyAccounts.filter(account => (String(account.planType || '').toLowerCase() || 'unknown') === value).length;
+        const suffix = value === current && current !== 'all' && count === 0 ? '（0 个匹配）' : '';
+        return `<option value="${escapeHTML(value)}">${escapeHTML(historyPlanLabel(value === 'unknown' ? '' : value))}${suffix}</option>`;
+    })].join('');
+    historyPlanFilter.value = values.includes(current) ? current : 'all';
+}
+
+function sub2AutomationBlock(account) {
+    const state = account?.sub2Status || {};
+    if (discardedHistoryAccount(account)) return { code: 'discarded', label: '账号已废弃', at: account.updatedAt };
+    if (account?.sub2Policy === 'free_local') return { code: 'free_local', label: 'Free 账号 · 仅保留在 AUTH', at: account.updatedAt };
+    if (state.associationStatus === 'missing' || state.remoteMissing || historyImportState(account) === 'remote_missing') return { code: 'missing', label: 'Sub2 关联账号不存在 · 已停止自动检测和恢复', at: state.checkedAt };
+    if (state.associationStatus === 'unmatched') return { code: 'unmatched', label: '未找到 Sub2 关联 · 不参与自动恢复', at: state.checkedAt };
+    return null;
+}
+
+function deterministicStopReason(account) {
+    if (!account) return '';
+    const known = loginBlockLabel(account.manualReason || account.manual_reason || account.lastErrorCode || account.error_code || account.code);
+    if (known) return known;
+    const stopped = (account.requiresAction || account.requires_action) && account.retryable === false && !(account.nextRetryAt || account.next_retry_at);
+    return stopped ? account.lastError || account.last_error || account.message || '登录阻塞，原因待确认' : '';
+}
+
+function loginTaskSuperseded(account, task) {
+    const code = task?.error_code;
+    if (task?.failure_stage !== 'logging_in' || task.retry_action !== 'manual' || !['failed', 'unknown'].includes(task.state) ||
+        !['email_verification_required', 'phone_verification_required', 'password_rejected', 'totp_rejected', 'verification_code_rejected', 'credentials_rejected', 'auth_page_timeout_exhausted'].includes(code) ||
+        !Object.hasOwn(task, 'source_credential_attempt_id') && !Object.hasOwn(task, 'result_credential_attempt_id')) return false;
+    const current = Number(account?.credentialVersion ?? account?.credential_version ?? 0);
+    const source = Number(task.source_credential_attempt_id || 0), result = Number(task.result_credential_attempt_id || 0);
+    return [current, source, result].every(value => Number.isSafeInteger(value) && value >= 0) && current > Math.max(source, result);
+}
+
+function automationStopped(account) {
+    const sub2Block = sub2AutomationBlock(account);
+    if (sub2Block) return sub2Block;
+    const reason = ['error', 'failed'].includes(account.status) && historyRepairs.get(account.id)?.state !== 'recovery_queued' ? deterministicStopReason(account) : '';
+    if (reason) return { code: 'login', label: `自动处理已暂停 · ${reason}`, at: account.lastAttemptAt || account.updatedAt };
+    const tasks = historyAccountTasks(account);
+    for (const task of Object.values(tasks)) {
+        if (!task || ['completed', 'success', 'canceled'].includes(task.state)) continue;
+        const taskReason = deterministicStopReason(task);
+        if (taskReason) return { code: 'login', label: `自动处理已暂停 · ${taskReason}`, at: task.updated_at };
+    }
+    return null;
+}
+
+function loginBlockLabel(code) {
+    return ({
+        email_verification_required: '需要邮箱验证码 · 已停止自动重试',
+        phone_verification_required: '需要手机/短信验证 · 已停止自动重试',
+        password_rejected: '密码错误 · 已停止自动重试',
+        totp_rejected: 'TOTP 验证码被拒绝 · 已停止自动重试',
+        verification_code_rejected: '验证码被拒绝，验证类型待确认 · 已停止自动重试',
+        credentials_rejected: '登录凭据被拒绝 · 已停止自动重试',
+        auth_page_timeout_exhausted: '认证页面等待超时 · 已停止自动重试'
+    }[String(code || '')] || '');
+}
+
 function lifecycleSourceName(source) {
     return ({ official: '官方检测', sub2: 'Sub2', auth: 'AUTH' }[String(source || '').toLowerCase()] || source || '来源未知');
 }
 
 function lifecycleStatusName(status) {
-    return ({ deleted: '已删除', deactivated: '已停用', deleted_or_deactivated: '已删除或停用' }[String(status || '').toLowerCase()] || status || '状态变化');
+    return ({ deleted: '已删除', deactivated: '已停用', deleted_or_deactivated: '已删除或停用', discarded: '已废弃' }[String(status || '').toLowerCase()] || status || '状态变化');
 }
 
 function renderLifecycleEvents(events, available = true) {
@@ -1296,7 +1456,7 @@ function renderLifecycleEvents(events, available = true) {
     const rows = normalizeLifecycleEvents(events).sort((left, right) => historyTimeValue(right.observedAt) - historyTimeValue(left.observedAt) || Number(right.id) - Number(left.id));
     if (!rows.length) return '';
     const items = rows.map(event => {
-        const reason = [event.reason, event.code ? `代码 ${event.code}` : '', event.httpStatus > 0 ? `HTTP ${event.httpStatus}` : ''].filter(Boolean).join(' · ');
+        const reason = [event.code === 'invalid_username_or_password' ? '账密被拒绝' : event.reason, event.code && event.code !== 'invalid_username_or_password' ? `代码 ${event.code}` : '', event.httpStatus > 0 ? `HTTP ${event.httpStatus}` : ''].filter(Boolean).join(' · ');
         return `<div class="history-attempt"><div class="history-attempt-header"><span>${escapeHTML(event.email || '账号邮箱未知')}</span><span>${escapeHTML(formatHistoryTime(event.observedAt))}</span></div><div class="history-attempt-message">${escapeHTML(`${lifecycleSourceName(event.source)} · ${lifecycleStatusName(event.status)}${reason ? ` · ${reason}` : ''}`)}</div></div>`;
     }).join('');
     return `<div class="history-detail-attempts"><p class="hint">账号状态历史（保留删除或停用的来源证据）</p>${items}</div>`;
@@ -1312,12 +1472,11 @@ function sub2StatusName(status) {
 
 function historyPoolState(account) {
     const state = account.sub2Status;
+    const block = sub2AutomationBlock(account);
+    if (block) return { kind: 'absent', label: block.code === 'free_local' ? 'Free · 仅保留在 AUTH' : block.code === 'missing' ? 'Sub2 关联不存在' : '未找到 Sub2 关联' };
     if (!historySub2Configured || !historyImportsAvailable || !state.present || !state.configured || state.stale ||
         ['ambiguous', 'conflict'].includes(state.associationStatus)) return { kind: 'unknown', label: 'Sub2 待核对' };
-    if (state.associationStatus === 'unmatched' || state.exists === false) {
-        return { kind: 'absent', label: 'Sub2 不在池' };
-    }
-    if (state.unknown || state.error || !(state.imported || state.sub2AccountID)) {
+    if (state.unknown || state.error || state.exists === false || !(state.imported || state.sub2AccountID)) {
         return { kind: 'unknown', label: 'Sub2 待核对' };
     }
     return { kind: 'present', label: 'Sub2 在池' };
@@ -1373,7 +1532,7 @@ function openHistoryRecoveryPopover(id, trigger) {
     historyRecoveryPopoverTrigger = trigger;
     trigger?.setAttribute('aria-expanded', 'true');
     historyRecoveryPopover.hidden = false;
-    historyRecoveryPopoverTitle.textContent = account.email || '复活记录';
+    historyRecoveryPopoverTitle.textContent = historyAccountName(account);
     historyRecoveryPopoverVersion = recoveryPopoverVersion(account);
     loadHistoryRecoveryRecords();
 }
@@ -1510,25 +1669,119 @@ function renderQuotaSummary(account) {
     return `<span class="history-quota-summary" title="${escapeHTML(title)}">${parts.map(part => `<span>${escapeHTML(part)}</span>`).join('')}</span>`;
 }
 
+function historyRecentCostKey(account) {
+    const binding = historyImports.get(account.id);
+    return JSON.stringify([historySub2Configured, binding?.sub2_account_id || account.sub2Status?.sub2AccountID || '',
+        binding?.operation_id || '', account.status === 'deleted', sub2AutomationBlock(account)?.code || '']);
+}
+
+function historyRecentCost(account) {
+    const entry = historyRecentCosts.get(account.id);
+    return entry?.key === historyRecentCostKey(account) ? entry.stats : null;
+}
+
+function recentCostHasAmount(stats) {
+    return !stats?.unknown && typeof stats?.total_cost === 'number' && Number.isFinite(stats.total_cost) && stats.total_cost >= 0;
+}
+
+async function loadHistoryCosts(pageAccounts) {
+    if (!historySub2Configured) return;
+    const requested = [], waiting = new Set();
+    for (const account of pageAccounts.slice(0, 100)) {
+        if (sub2AutomationBlock(account)) continue;
+        const key = historyRecentCostKey(account);
+        const inflight = historyRecentCostInflight.get(account.id);
+        if (inflight?.key === key) { waiting.add(inflight.promise); continue; }
+        const previous = historyRecentCosts.get(account.id);
+        if (previous?.key === key && previous.expiresAt > Date.now()) continue;
+        requested.push({ id: account.id, key, previous: previous?.key === key ? previous.stats : null });
+    }
+    if (requested.length) {
+        const promise = Promise.resolve().then(async () => {
+            let stats;
+            try {
+                const response = await fetch(`/api/history/usage?account_ids=${requested.map(item => encodeURIComponent(item.id)).join(',')}`, {
+                    headers: { 'Accept': 'application/json' }, signal: AbortSignal.timeout(12000)
+                });
+                const payload = await response.json();
+                if (!response.ok || payload.success !== true || !payload.stats || typeof payload.stats !== 'object') throw new Error('usage_unavailable');
+                stats = payload.stats;
+            } catch (_) { /* Keep the last verified amount when a read fails. */ }
+            for (const item of requested) {
+                const current = historyAccounts.find(account => account.id === item.id);
+                if (!current || historyRecentCostKey(current) !== item.key || historyRecentCostInflight.get(item.id)?.promise !== promise) continue;
+                let value = stats?.[item.id];
+                if (!recentCostHasAmount(value)) {
+                    const failed = !value || Boolean(value.error) || value.unknown !== true;
+                    value = recentCostHasAmount(item.previous)
+                        ? { ...item.previous, stale: true, error: 'Sub2 近90天消耗暂不可用' }
+                        : { unknown: true, error: failed ? 'Sub2 近90天消耗暂不可用' : '' };
+                }
+                historyRecentCosts.set(item.id, { key: item.key, stats: value, expiresAt: Date.now() + historyRecentCostTTL });
+            }
+        });
+        for (const item of requested) historyRecentCostInflight.set(item.id, { key: item.key, promise });
+        waiting.add(promise.finally(() => {
+            for (const item of requested) {
+                if (historyRecentCostInflight.get(item.id)?.promise === promise) historyRecentCostInflight.delete(item.id);
+            }
+            renderHistory();
+        }));
+    }
+    await Promise.all(waiting);
+}
+
+function renderHistoryCost(account, detail = false) {
+    const stats = historyRecentCost(account);
+    const known = recentCostHasAmount(stats);
+    const amount = !known ? '—' : stats.total_cost > 0 && stats.total_cost < 0.01 ? '<$0.01'
+        : `$${stats.total_cost.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const state = !historySub2Configured ? 'Sub2 未配置' : sub2AutomationBlock(account) ? '关联不可用' : !stats ? '加载中' : !known ? '待核对' : stats.stale ? '上次数据' : '';
+    const note = 'Sub2 账号统计费用（USD），近 90 天；按 Sub2 保留的用量记录统计，不是官方账单';
+    const time = stats?.checked_at ? `同步 ${formatHistoryTime(stats.checked_at)}` : '';
+    if (detail) {
+        const counts = known && Number.isSafeInteger(stats.total_requests) && Number.isSafeInteger(stats.total_tokens)
+            ? `<br>${stats.total_requests.toLocaleString('en-US')} 次请求 · ${stats.total_tokens.toLocaleString('en-US')} Token` : '';
+        return `<div class="history-detail-stat">近90天账号费用<br><strong>${escapeHTML(amount)}${state ? ` · ${escapeHTML(state)}` : ''}</strong>${time ? `<br>${time}` : ''}${counts}<br><span class="hint">${escapeHTML(note)}</span></div>`;
+    }
+    return `<span class="history-cost-summary${state ? ' is-pending' : ''}" title="${escapeHTML(note)}${time ? ` · ${time}` : ''}">近90天 ${escapeHTML(amount)}${state ? ` <span>${escapeHTML(state)}</span>` : ''}</span>`;
+}
+
+function discardedHistoryAccount(account) {
+    return account?.status === 'discarded' || account?.sub2Policy === 'discarded';
+}
+
+function terminalHistoryAccount(account) {
+    return discardedHistoryAccount(account) || Boolean(account && officialAccountStatus(account));
+}
+
+function discardReason(account) {
+    const event = account.lifecycleEvents?.find(item => item.status === 'discarded');
+    if ([event?.code, account.lastErrorCode].includes('invalid_username_or_password')) return '账密被拒绝';
+    return event?.reason || account.lastError || '未提供废弃原因';
+}
+
 function officialAccountStatus(account) {
+    if (discardedHistoryAccount(account)) return '';
     const result = historyChecks.get(account.id)?.last_result;
     const currentResult = result?.freshness === 'current' ? result : null;
     const values = [account.status, currentResult?.outcome, currentResult?.error_code, currentResult?.stream_error_code]
         .map(value => String(value || '').toLowerCase());
     if (values.some(value => ['deleted', 'account_deleted', 'user_deleted'].includes(value))) return 'deleted';
     if (values.some(value => ['deactivated', 'account_deactivated', 'user_deactivated', 'account_disabled', 'user_disabled'].includes(value))) return 'deactivated';
-    if (values.includes('deleted_or_deactivated')) return 'deleted_or_deactivated';
+    if (values.includes('deleted_or_deactivated') || account.sub2Policy === 'official_unavailable') return 'deleted_or_deactivated';
     return '';
 }
 
 function renderAccountStatusSource(account) {
+    if (discardedHistoryAccount(account)) return '<span class="history-source neutral">本地废弃</span>';
     const labels = [];
     const official = officialAccountStatus(account);
     if (official === 'deleted') labels.push('<span class="history-source official">官方删除</span>');
     else if (official === 'deactivated') labels.push('<span class="history-source official">官方停用</span>');
     else if (official === 'deleted_or_deactivated') labels.push('<span class="history-source official">官方删除或停用</span>');
     const state = account.sub2Status || {};
-    if (state.present && !state.stale && !state.unknown && state.exists === false) labels.push('<span class="history-source sub2">Sub2 已删除</span>');
+    if (sub2AutomationBlock(account)?.code === 'missing') labels.push('<span class="history-source sub2">Sub2 关联不存在</span>');
     if (labels.length) return labels.join('');
     if (state.stale || state.unknown || state.associationStatus === 'ambiguous' || state.associationStatus === 'conflict') return '<span class="history-source unknown">来源待核对</span>';
     if (state.associationStatus === 'unmatched' || (!state.imported && !state.sub2AccountID)) return '<span class="history-source neutral">未交付 Sub2</span>';
@@ -1537,6 +1790,8 @@ function renderAccountStatusSource(account) {
 
 function renderSub2Status(account) {
     const state = account.sub2Status || normalizeSub2Status(null);
+    const block = sub2AutomationBlock(account);
+    if (block) return `<span class="history-status sub2-unknown">${escapeHTML(block.label)}</span>`;
     if (!historySub2Configured) return '<span class="history-status sub2-unknown">Sub2 未配置</span>';
     if (!state.present) return '<span class="history-status sub2-unknown">Sub2 状态待核对</span>';
     if (!state.configured) return '<span class="history-status sub2-unknown">Sub2 未配置</span>';
@@ -1544,7 +1799,7 @@ function renderSub2Status(account) {
     if (association) return `<span class="history-status sub2-unknown" title="${escapeHTML(state.error || '')}">Sub2 ${association}</span>`;
     if (state.stale || state.unknown) return `<span class="history-status sub2-unknown"${state.errorMessage || state.error ? ` title="${escapeHTML(state.errorMessage || state.error)}"` : ''}>Sub2 状态未知${state.checkedAt ? ` · 同步 ${formatHistoryTime(state.checkedAt)}` : ''}</span>`;
     if (!state.imported && !state.sub2AccountID) return '<span class="history-status sub2-unknown">Sub2 状态待核对</span>';
-    if (!state.exists) return '<span class="history-status sub2-error">Sub2 已删除</span>';
+    if (!state.exists) return '<span class="history-status sub2-unknown">Sub2 状态待核对</span>';
     const status = state.status;
     const conflict = localAuthFailure(account) && ['active', 'available', 'enabled'].includes(status);
     const runtimePause = ['active', 'available', 'enabled'].includes(status) ? sub2RuntimePause(state) : null;
@@ -1573,6 +1828,7 @@ function historyStatusName(status) {
         deleted: '账号已删除',
         deactivated: '账号已停用',
         deleted_or_deactivated: '账号已删除或停用',
+        discarded: '账号已废弃',
         unknown: '暂无状态'
     }[status] || status || '暂无状态';
 }
@@ -1702,8 +1958,10 @@ async function resolveGroupConflict(task, action, trigger = null) {
 
 function automaticTaskPolicy(task, kind = '恢复') {
     if (!task || ['completed', 'success', 'canceled'].includes(task.state)) return '';
-    if (task.requires_action === true) return [`需要处理：${task.manual_action || task.last_error || '请查看详情并处理'}`, ...recoveryDiagnosticParts(task)].join(' · ');
-    const action = { resume: `继续${kind}`, relogin: '重新登录', manual: '等待人工处理' }[task.retry_action] || `继续${kind}`;
+    const blocked = deterministicStopReason(task);
+    if (blocked) return `自动处理已暂停 · ${blocked}`;
+    if (task.requires_action === true || task.retry_action === 'manual') return [`自动恢复已停止：${task.manual_action || task.last_error || '请查看详情'}`, ...recoveryDiagnosticParts(task)].join(' · ');
+    const action = { resume: `继续${kind}`, relogin: '重新登录' }[task.retry_action] || `继续${kind}`;
     if (!task.next_retry_at) return '';
     const retryAt = Date.parse(task.next_retry_at);
     return Number.isFinite(retryAt) && retryAt <= Date.now()
@@ -1713,6 +1971,7 @@ function automaticTaskPolicy(task, kind = '恢复') {
 
 function deliveryStatusText(task) {
     if (!task) return '交付状态暂未确认，请在账号历史查看持久记录';
+    if (!['completed', 'canceled'].includes(task.state) && deterministicStopReason(task)) return `自动处理已暂停 · ${deterministicStopReason(task)}`;
     if (task.blocked_reason && !['completed', 'canceled'].includes(task.state)) return `自动交付已暂停 · ${task.blocked_reason}`;
     const stages = { associating: '正在关联账号', importing: '正在导入 Sub2', applying: '正在写回凭据', verifying: '正在验证 Sub2 可用性', enabling: '正在恢复调度' };
     const states = { queued: '等待自动交付', checking: '正在核对 Sub2 账号', importing: '正在导入 Sub2', verifying: '正在验证 Sub2 可用性', working: stages[task.stage] || '正在自动交付', retry_wait: '等待自动重试', completed: 'Sub2 交付完成', requires_action: '交付需要处理', canceled: '交付已取消' };
@@ -1755,11 +2014,13 @@ function reconcileStoppedAccounts() {
 }
 
 function loginManualAction(account) {
-    if (account.requiresAction) return account.manualAction || account.lastError || '请查看账号详情';
-    if (['deleted', 'deactivated', 'deleted_or_deactivated'].includes(account.status)) return '账号已删除或停用，请核对官方账号状态';
+    const blocked = automationStopped(account);
+    if (blocked) return blocked.label;
+    if (historyRepairs.get(account.id)?.state === 'recovery_queued') return '';
+    if (account.requiresAction && ['error', 'failed'].includes(account.status)) return account.manualAction || account.lastError || '请查看账号详情';
     if (!['error', 'failed'].includes(account.status)) return '';
     if (['invalid_password', 'incorrect_password'].includes(account.lastErrorCode)) return '请更新账号密码后重新登录';
-    if (['invalid_mfa', 'invalid_totp'].includes(account.lastErrorCode)) return '请核对二次验证设置后重新登录';
+    if (['invalid_mfa', 'invalid_totp'].includes(account.lastErrorCode)) return '验证码被拒绝，验证类型待确认';
     return '';
 }
 
@@ -1769,36 +2030,37 @@ function supersededByRepair(task, repair) {
 }
 
 function repairStatusText(task) {
+    if (deterministicStopReason(task)) return `自动处理已暂停 · ${deterministicStopReason(task)}`;
     if (task.requires_action) return `更新资料后需要处理：${task.manual_action || task.last_error || '请查看账号详情'}`;
-    const labels = { queued: '资料已保存，等待后台继续', checking: '正在使用更新后的资料重新登录', retry_wait: '资料已保存，等待自动重试', completed: '资料更新任务已完成' };
+    const labels = { queued: '资料已保存，等待后台继续', checking: '正在使用更新后的资料重新登录', recovery_queued: '资料已保存，等待继续恢复', retry_wait: '资料已保存，等待自动重试', completed: '资料更新任务已完成' };
     return `${labels[task.state] || '资料更新任务状态待核对'}${task.next_retry_at ? ` · 下次继续：${formatHistoryTime(task.next_retry_at)}` : ''}`;
 }
 
 function renderHistoryAttention() {
     if (!historyAttention) return;
-    const notices = historyAccounts.map(account => {
-        const recovery = historyRecoveries.get(account.id), delivery = historyDeliveries.get(account.id), recheck = historyRechecks.get(account.id), repair = historyRepairs.get(account.id);
+    const notices = historyAccounts.filter(account => !terminalHistoryAccount(account) && account.sub2Policy !== 'free_local').map(account => {
+        const { recovery, delivery, recheck, repair } = historyAccountTasks(account);
         const tasks = [recovery?.purpose === 'delivery' && delivery ? null : recovery, delivery, recheck]
             .filter(task => !supersededByRepair(task, repair)).concat(repair)
             .filter(task => task?.requires_action === true && !['completed', 'success', 'canceled'].includes(task.state));
         const loginReason = supersededByRepair({ updated_at: account.updatedAt }, repair) ? '' : loginManualAction(account);
         const reasons = [...new Set([...tasks.flatMap(task => [task.manual_action || task.last_error || '请查看任务详情', ...recoveryDiagnosticParts(task)]), loginReason].filter(Boolean))];
         const groupTask = groupConflictTaskForAccount(account);
-        return { account, reasons, groupTask };
+        return { account, reasons, groupTask, stopped: automationStopped(account) };
     }).filter(item => item.reasons.length);
     const focusedID = document.activeElement?.dataset?.attentionAccount;
     const focusedEditID = document.activeElement?.dataset?.attentionEdit;
     historyAttention.hidden = notices.length === 0;
     historyAttentionSummary.textContent = `需要处理 ${notices.length} 个账号${historyLoadError ? '（上次记录，待刷新）' : ''}`;
-    historyAttentionList.innerHTML = notices.map(({ account, reasons, groupTask }) => `<li><div><strong>${escapeHTML(account.email)}</strong><p>${reasons.map(escapeHTML).join('；')}</p></div><div class="history-attention-actions"><button class="btn-secondary" type="button" data-attention-edit="${escapeHTML(account.id)}" ${historyActionsLocked() ? 'disabled' : ''}>更新资料</button><button class="btn-secondary" type="button" data-attention-account="${escapeHTML(account.id)}">查看账号</button></div>${renderGroupConflictActions(account, groupTask)}</li>`).join('');
+    historyAttentionList.innerHTML = notices.map(({ account, reasons, groupTask, stopped }) => `<li><div><strong>${escapeHTML(historyAccountName(account))}</strong><p>${reasons.map(escapeHTML).join('；')}</p></div><div class="history-attention-actions">${stopped ? '' : `<button class="btn-secondary" type="button" data-attention-edit="${escapeHTML(account.id)}" ${historyActionsLocked() ? 'disabled' : ''}>更新资料</button>`}<button class="btn-secondary" type="button" data-attention-account="${escapeHTML(account.id)}">查看账号</button></div>${stopped ? '' : renderGroupConflictActions(account, groupTask)}</li>`).join('');
     if (focusedEditID) historyAttentionList.querySelector(`[data-attention-edit="${CSS.escape(focusedEditID)}"]`)?.focus({ preventScroll: true });
     if (focusedID) historyAttentionList.querySelector(`[data-attention-account="${CSS.escape(focusedID)}"]`)?.focus({ preventScroll: true });
 }
 
 function renderHistoryAutomation(account) {
-    const repair = historyRepairs.get(account.id);
-    const activeTask = task => supersededByRepair(task, repair) ? null : task;
-    const delivery = activeTask(historyDeliveries.get(account.id)), recovery = activeTask(historyRecoveries.get(account.id)), recheck = activeTask(historyRechecks.get(account.id));
+    const stopped = automationStopped(account);
+    if (stopped) return `<div class="history-automation requires-action">${escapeHTML(stopped.label)}${stopped.at ? ` · ${formatHistoryTime(stopped.at)}` : ''}</div>`;
+    const { repair, delivery, recovery, recheck } = historyAccountTasks(account);
     const lines = [];
     if (repair && !['completed', 'canceled'].includes(repair.state)) lines.push(`<div class="history-automation${repair.requires_action ? ' requires-action' : ''}">${escapeHTML(repairStatusText(repair))}</div>`);
     if (delivery) lines.push(`<div class="history-automation${delivery.requires_action ? ' requires-action' : ''}">交付：${escapeHTML(deliveryStatusText(delivery))}</div>`);
@@ -1810,6 +2072,9 @@ function renderHistoryAutomation(account) {
             : recheck.state === 'checking' ? '正在执行延迟复检'
             : `第 ${Number(recheck.round) || 1} 次延迟复检：${recheck.next_check_at ? formatHistoryTime(recheck.next_check_at) : '等待检查'}`;
         lines.push(`<div class="history-automation${recheck.requires_action ? ' requires-action' : ''}">${escapeHTML(label)}</div>`);
+        if (recheck.state === 'requires_action' && recheck.requires_action && Number.isSafeInteger(Number(recheck.task_id)) && Number(recheck.task_id) > 0) {
+            lines.push(`<button class="btn-secondary" type="button" data-history-action="recheck" data-history-id="${escapeHTML(account.id)}" data-recheck-task="${Number(recheck.task_id)}" ${historyActionsLocked() || historyRecoveryRequests.has(account.id) ? 'disabled' : ''}>${historyRecoveryRequests.has(account.id) ? '提交中…' : '重新复检'}</button>`);
+        }
     }
     const pendingImport = historyImports.get(account.id);
     if (['unknown', 'confirming'].includes(pendingImport?.state)) {
@@ -1823,20 +2088,22 @@ function historyRecoveryActive(task) {
 }
 
 function historyRecoveryAction(account) {
+    const blocked = sub2AutomationBlock(account);
+    if (blocked || terminalHistoryAccount(account)) return { visible: false, disabled: true, label: '查看详情', reason: blocked?.label || '官方账号已删除或停用，自动处理已终止', resume: false };
     const state = account.sub2Status;
-    const task = historyRecoveries.get(account.id);
-    const delivery = historyDeliveries.get(account.id);
-    if (delivery && ['queued', 'checking', 'importing', 'verifying', 'working', 'retry_wait'].includes(delivery.state)) {
+    const { recovery: task, delivery } = historyAccountTasks(account);
+    const loginPaused = automationStopped(account)?.code === 'login';
+    if (delivery && ['queued', 'checking', 'importing', 'verifying', 'working', 'retry_wait'].includes(delivery.state) && !(loginPaused && delivery.state === 'retry_wait')) {
         return { visible: true, disabled: true, label: delivery.state === 'retry_wait' ? '等待自动交付' : '交付中…', reason: deliveryStatusText(delivery), resume: false };
     }
-    if (task?.purpose === 'delivery' && delivery?.requires_action) return { visible: false, disabled: true, reason: deliveryStatusText(delivery), resume: false };
+    if (task?.purpose === 'delivery' && delivery?.requires_action && !deterministicStopReason(delivery) && !deterministicStopReason(task)) return { visible: false, disabled: true, reason: deliveryStatusText(delivery), resume: false };
     const resumable = task?.resumable && ['failed', 'unknown'].includes(task.state);
     const checking = ['queued', 'running'].includes(historyChecks.get(account.id)?.latest_task?.state);
     const linked = state.present && (state.imported || Boolean(state.sub2AccountID));
     let reason = '';
     if (!historySub2Configured || !linked) reason = '尚未关联 Sub2 账号';
     else if (state.stale || state.unknown) reason = 'Sub2 状态未知，请刷新后重试';
-    else if (!state.exists) reason = '该账号已从 Sub2 删除';
+    else if (!state.exists) reason = 'Sub2 状态待核对';
     else if (['inactive', 'disabled', 'deleted'].includes(state.status)) reason = 'Sub2 账号已禁用或删除，请先在 Sub2 中确认';
     else if (sub2RuntimePause(state) && !resumable && !localAuthFailure(account)) reason = sub2RuntimePause(state).label;
     else if (!resumable && ['active', 'available', 'enabled'].includes(state.status) && state.schedulable === false) reason = '账号已人工暂停，保持暂停状态';
@@ -1856,10 +2123,12 @@ function historyRecoveryAction(account) {
 }
 
 function renderHistoryRecovery(account) {
+    const stopped = automationStopped(account);
+    if (stopped) return `<div class="history-task-status">${escapeHTML(stopped.label)}${stopped.at ? ` · ${formatHistoryTime(stopped.at)}` : ''}${historyRecoveryNotices.has(account.id) ? ` · ${escapeHTML(historyRecoveryNotices.get(account.id))}` : ''}</div>`;
     const summary = historyChecks.get(account.id);
     const latest = summary?.latest_task;
     const result = summary?.last_result;
-    const latestRecovery = historyRecoveries.get(account.id);
+    const { recovery: latestRecovery, delivery } = historyAccountTasks(account);
     const recovery = latestRecovery?.purpose === 'delivery' ? null : latestRecovery;
     const lines = [];
     if (['queued', 'running'].includes(latest?.state)) lines.push(latest.state === 'queued' ? '检测已排队，等待确认凭据状态' : '正在检测当前凭据');
@@ -1879,7 +2148,6 @@ function renderHistoryRecovery(account) {
         lines.push(`检测：${resultText}${result.http_status ? `（HTTP ${result.http_status}）` : ''}${result.freshness === 'stale' ? ' · 旧凭据结果' : ''}${result.finished_at ? ` · ${formatHistoryTime(result.finished_at)}` : ''}`);
     }
     if (recovery) lines.push(`${historyRecoveryNames[recovery.state] || '恢复状态待确认'}${recovery.last_error ? `：${recovery.last_error}` : ''}${recovery.updated_at ? ` · ${formatHistoryTime(recovery.updated_at)}` : ''}${recovery.requires_action ? ` · ${recoveryDiagnosticParts(recovery).join(' · ')}` : ''}`);
-    const delivery = historyDeliveries.get(account.id);
     if (delivery?.last_error && delivery.state !== 'completed') lines.push(`交付：${delivery.last_error}`);
     if (historyRecoveryNotices.has(account.id)) lines.push(historyRecoveryNotices.get(account.id));
     return lines.map(line => `<div class="history-task-status">${escapeHTML(line)}</div>`).join('');
@@ -1890,13 +2158,15 @@ async function checkAndRecoverHistory(id) {
     if (!account || historyActionsLocked()) return;
     const action = historyRecoveryAction(account);
     if (action.disabled) return;
+    const previousTask = historyRecoveries.get(key);
     historyRecoveryRequests.add(key);
     historyRecoveryNotices.delete(key);
     renderHistory();
     try {
         const response = await fetch(action.resume ? '/api/account-recovery' : '/api/account-recovery/check', {
             method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-            body: JSON.stringify({ account_id: Number(key) }), signal: AbortSignal.timeout(30000)
+            body: JSON.stringify({ account_id: Number(key), manual_attempt: true,
+                expected_task_id: Number(previousTask?.id || 0), expected_retry_count: Number(previousTask?.retry_count || 0) }), signal: AbortSignal.timeout(30000)
         });
         const payload = await response.json().catch(() => ({}));
         if (!response.ok || payload.success === false) throw new Error(payload.message || `提交失败（HTTP ${response.status}）`);
@@ -1908,6 +2178,32 @@ async function checkAndRecoverHistory(id) {
         historyRefreshAt = Date.now() + 5000;
     } finally {
         historyRecoveryRequests.delete(key);
+        renderHistory();
+    }
+}
+
+async function retryHistoryRecheck(id, taskID) {
+    const key = String(id), task = historyRechecks.get(key);
+    const account = historyAccounts.find(item => item.id === key);
+    if (!account || automationStopped(account)) return;
+    if (historyActionsLocked() || historyRecoveryRequests.has(key) || task?.state !== 'requires_action' || !task.requires_action ||
+        !Number.isSafeInteger(Number(taskID)) || Number(taskID) <= 0 || Number(task.task_id) !== Number(taskID)) return;
+    historyRecoveryRequests.add(key);
+    historyRecoveryNotices.delete(key);
+    renderHistory();
+    try {
+        const response = await fetch(`/api/account-recovery/${Number(taskID)}/recheck`, {
+            method: 'POST', headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15000)
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || payload.success === false) throw new Error(payload.message || `复检提交失败（HTTP ${response.status}）`);
+        await loadHistory();
+    } catch (error) {
+        historyRecoveryNotices.set(key, error.name === 'TimeoutError' || error instanceof TypeError
+            ? '提交结果暂未确认，请刷新核对复检进度。' : error.message || '复检提交失败');
+    } finally {
+        historyRecoveryRequests.delete(key);
+        historyRefreshAt = Date.now() + 5000;
         renderHistory();
     }
 }
@@ -1926,9 +2222,13 @@ function formatHistoryTime(value) {
 function getFilteredHistoryAccounts() {
     const query = historySearchInput.value.trim().toLowerCase();
     const filter = historyStatusFilter.value;
+    const planFilter = historyPlanFilter?.value || 'all';
     const filtered = historyAccounts.filter(account => {
-        if (!account.email.toLowerCase().includes(query) && !account.id.includes(query)) return false;
+        const searchable = `${historyAccountName(account)} ${account.email} ${account.id}`.toLowerCase();
+        if (!searchable.includes(query)) return false;
+        if (planFilter !== 'all' && (String(account.planType || '').toLowerCase() || 'unknown') !== planFilter) return false;
         if (filter === 'all') return true;
+        if (discardedHistoryAccount(account)) return filter === 'discarded';
         if (['attention', 'schedulable', 'working', 'unknown'].includes(filter)) return historyAccountMatches(account, filter);
         if (filter === 'available') return ['active', 'success'].includes(account.status);
         if (filter === 'failed') return ['error', 'failed'].includes(account.status);
@@ -1942,7 +2242,7 @@ function getFilteredHistoryAccounts() {
 
 function historyAccountTasks(account) {
     const repair = historyRepairs.get(account.id);
-    const current = task => supersededByRepair(task, repair) ? null : task;
+    const current = task => supersededByRepair(task, repair) || loginTaskSuperseded(account, task) ? null : task;
     return { repair, delivery: current(historyDeliveries.get(account.id)), recovery: current(historyRecoveries.get(account.id)), recheck: current(historyRechecks.get(account.id)) };
 }
 
@@ -1951,16 +2251,18 @@ function historyRecoveryRetrying(task) {
 }
 
 function historyAccountMatches(account, filter) {
+    if (terminalHistoryAccount(account) || account.sub2Policy === 'free_local') return false;
     const { delivery, recovery, recheck, repair } = historyAccountTasks(account);
     const check = historyChecks.get(account.id)?.latest_task;
+    if (filter === 'working' && automationStopped(account)) return false;
     if (filter === 'working') return ['running', 'pending'].includes(account.status) ||
         ['queued', 'running'].includes(check?.state) || historyRecoveryActive(recovery) || historyRecoveryRetrying(recovery) ||
         ['pending', 'checking', 'recovery_queued'].includes(recheck?.state) ||
-        ['queued', 'checking', 'retry_wait'].includes(repair?.state) ||
+        ['queued', 'checking', 'recovery_queued', 'retry_wait'].includes(repair?.state) ||
         ['queued', 'checking', 'importing', 'verifying', 'working', 'retry_wait'].includes(delivery?.state);
-    if (filter === 'attention') return [delivery, recovery, recheck, repair]
+    if (filter === 'attention') return Boolean(sub2AutomationBlock(account)) || [delivery, recovery, recheck, repair]
         .some(task => task?.requires_action && !['completed', 'success', 'canceled'].includes(task.state)) ||
-        (!supersededByRepair({ updated_at: account.updatedAt }, repair) &&
+        (repair?.state !== 'recovery_queued' && !supersededByRepair({ updated_at: account.updatedAt }, repair) &&
             (['error', 'failed', 'deleted', 'deactivated', 'deleted_or_deactivated'].includes(account.status) || localAuthFailure(account))) ||
         (historyPoolState(account).kind === 'present' && account.sub2Status.status === 'error');
     const pool = historyPoolState(account);
@@ -2020,8 +2322,25 @@ function getHistoryPageAccounts(visibleAccounts) {
     return visibleAccounts.slice(start, start + historyPageSize);
 }
 
+function canReloginHistory(account) {
+    return Boolean(account) && !terminalHistoryAccount(account) && account.status !== 'running';
+}
+
+function canReimportRemoteMissing(account) {
+    return Boolean(account) && account.status !== 'running' && !terminalHistoryAccount(account)
+        && account.sub2Policy !== 'free_local' && historyImportState(account) === 'remote_missing' && sub2AutomationBlock(account)?.code === 'missing';
+}
+
+function historyReloginDelivers(account) {
+    return !['missing', 'free_local'].includes(sub2AutomationBlock(account)?.code) && !terminalHistoryAccount(account) && historyDeliveries.get(account.id)?.requires_action === true;
+}
+
 function canBatchRelogin(account) {
-    return ['failed', 'error', 'interrupted', 'deactivated', 'deleted_or_deactivated'].includes(account.status);
+    return canReloginHistory(account) && ['failed', 'error', 'interrupted', 'deactivated', 'deleted_or_deactivated'].includes(account.status);
+}
+
+function canCheckHistoryAccount(account) {
+    return !automationStopped(account) && !terminalHistoryAccount(account) && historyChecks.get(account.id)?.eligible && historyPoolState(account).kind === 'present';
 }
 
 function historyImportState(account) {
@@ -2031,11 +2350,14 @@ function historyImportState(account) {
 
 function canImportToSub2(account) {
     if (!historySub2Configured || !historyImportsAvailable || !account || account.status !== 'active') return false;
+    if (account.sub2Policy === 'free_local' || terminalHistoryAccount(account)) return false;
+    if (sub2AutomationBlock(account)?.code === 'missing' || automationStopped(account)?.code === 'login') return false;
+    if (Object.values(historyAccountTasks(account)).some(task => task && !['completed', 'success', 'canceled'].includes(task.state) && deterministicStopReason(task))) return false;
     return !['queued', 'sending', 'confirming', 'imported', 'unknown'].includes(historyImportState(account));
 }
 
 function historyImportStateName(state) {
-    return ({ queued: '排队中', sending: '导入中', confirming: '核对中', imported: '已关联 Sub2', failed: '导入失败', unknown: '待核对', cleanup_pending: '正在清理' }[state] || '未导入');
+    return ({ queued: '排队中', sending: '导入中', confirming: '核对中', imported: '已关联 Sub2', failed: '导入失败', unknown: '待核对', cleanup_pending: '正在清理', remote_missing: 'Sub2 关联不存在' }[state] || '未导入');
 }
 
 function historyActionsLocked() {
@@ -2051,9 +2373,7 @@ function updateHistoryControls(visibleAccounts, pageAccounts) {
     const hiddenCount = selected.length - selectedOnPage;
     const reloginCount = selected.filter(canBatchRelogin).length;
     const importCount = selected.filter(canImportToSub2).length;
-    const checkCandidates = selected.length
-        ? selected.filter(account => historyChecks.get(account.id)?.eligible && account.sub2Status.present && account.sub2Status.exists).length
-        : visibleAccounts.filter(account => historyChecks.get(account.id)?.eligible && account.sub2Status.present && account.sub2Status.exists).length;
+    const checkCandidates = (selected.length ? selected : visibleAccounts).filter(canCheckHistoryAccount).length;
     const locked = historyActionsLocked();
     historySelectAll.checked = !historyLoadError && pageAccounts.length > 0 && selectedOnPage === pageAccounts.length;
     historySelectAll.indeterminate = !historyLoadError && selectedOnPage > 0 && selectedOnPage < pageAccounts.length;
@@ -2065,15 +2385,17 @@ function updateHistoryControls(visibleAccounts, pageAccounts) {
     historyBatchImportBtn.textContent = `导入 Sub2${importCount ? ` (${importCount})` : ''}`;
     historyBatchImportBtn.title = !historySub2Configured ? 'Sub2 未配置' : !historyImportsAvailable
         ? '导入状态读取失败，请刷新后重试' : '选择 Sub2 分组与交付参数后导入';
-    historyBatchDeleteBtn.disabled = locked || selected.length === 0;
-    historyBatchDeleteBtn.textContent = `批量删除${selected.length ? ` (${selected.length})` : ''}`;
+    const deletable = selected.filter(account => !terminalHistoryAccount(account)).length;
+    historyBatchDeleteBtn.disabled = locked || deletable === 0;
+    historyBatchDeleteBtn.textContent = `批量删除${deletable ? ` (${deletable})` : ''}`;
     if (historyCheckNowBtn) {
         historyCheckNowBtn.disabled = locked || checkCandidates === 0;
         historyCheckNowBtn.textContent = selected.length ? `立即检测 (${checkCandidates})` : `立即检测全部 (${checkCandidates})`;
         historyCheckNowBtn.title = selected.length ? '检测当前选中且已关联 Sub2 的账号' : '按当前筛选条件检测已关联 Sub2 的账号';
     }
     if (historyCheckNowStatus && !checkCandidates) historyCheckNowStatus.textContent = selected.length ? '选中账号没有可检测项' : '当前筛选没有可检测项';
-    historySelectionStatus.textContent = `已选 ${selected.length} 个${hiddenCount ? ` · ${hiddenCount} 个不在当前页` : ''}`;
+    const blockedCount = selected.filter(account => automationStopped(account)).length;
+    historySelectionStatus.textContent = `已选 ${selected.length} 个${hiddenCount ? ` · ${hiddenCount} 个不在当前页` : ''}${blockedCount ? ` · ${blockedCount} 个已暂停自动处理，手动操作按账号状态判断` : ''}`;
     historyPageInfo.textContent = visibleAccounts.length
         ? `第 ${historyPage} / ${pageCount} 页 · ${visibleAccounts.length} 个账号`
         : '暂无账号';
@@ -2082,10 +2404,11 @@ function updateHistoryControls(visibleAccounts, pageAccounts) {
     historyPageSizeSelect.disabled = locked;
     historySearchInput.disabled = historyLoading || historyBatchRunning || processing;
     historyStatusFilter.disabled = locked;
+    historyPlanFilter.disabled = locked;
     historySort.disabled = locked;
     refreshHistoryBtn.disabled = historyLoading || historyBatchRunning || processing;
     startBtn.disabled = processing || historyBatchRunning;
-    retryFailedBtn.disabled = processing || historyBatchRunning || !accounts.some(account => ['error', 'stopped'].includes(account.status));
+    retryFailedBtn.disabled = processing || historyBatchRunning || !accounts.some(canRetryLogin);
     if (historyBatchRunning && historyBatchStats) {
         const stats = historyBatchStats;
         historyBatchStatus.textContent = `${stats.action}：${stats.done} / ${stats.total}，成功 ${stats.success}，失败 ${stats.failed}${stats.skipped ? `，跳过 ${stats.skipped}` : ''}`;
@@ -2101,12 +2424,13 @@ function updateHistoryControls(visibleAccounts, pageAccounts) {
 }
 
 function renderHistory() {
+    renderHistoryPlanFilter();
     renderHistoryAttention();
     const focused = document.activeElement;
     const focusID = focused?.dataset?.historyId;
     const focusAction = focused?.dataset?.historyAction;
     const focusWasInGrid = historyGrid.contains(focused);
-    const openDetails = [...(historyGrid.querySelectorAll?.('details[open][data-history-details]') || [])].map(node => node.dataset.historyDetails);
+    const openDetails = Array.from(historyGrid.querySelectorAll?.('details[open][data-history-details]') || [], node => node.dataset.historyDetails);
     const visibleAccounts = getFilteredHistoryAccounts();
     if (accountTableSummary) {
         const counts = { schedulable: 0, attention: 0, working: 0 };
@@ -2116,7 +2440,7 @@ function renderHistory() {
     }
     const pageAccounts = getHistoryPageAccounts(visibleAccounts);
     const query = historySearchInput.value.trim().toLowerCase();
-    const filtered = query || historyStatusFilter.value !== 'all';
+    const filtered = query || historyStatusFilter.value !== 'all' || historyPlanFilter.value !== 'all';
     historyRefreshStatus.textContent = historyLoadError
         ? historyLoadError
         : historyLoading ? '正在加载…' : (filtered
@@ -2142,13 +2466,16 @@ function renderHistory() {
         const deleted = account.status === 'deleted';
         const deactivated = ['deactivated', 'deleted_or_deactivated'].includes(account.status);
         const busy = historyBusyID === account.id;
+        const stopped = automationStopped(account);
+        const displayName = historyAccountName(account);
         const selected = historySelectedIDs.has(account.id);
         const importState = historyImportState(account);
         const externallyLinked = account.sub2Status.associationStatus === 'linked' || String(historyImports.get(account.id)?.operation_id || '').startsWith('linked-');
         const importStateText = externallyLinked && importState === 'imported' ? '已关联 Sub2' : historyImportStateName(importState);
         const importError = historyImports.get(String(account.id))?.last_error || '';
         const statusClass = escapeHTML(account.status.replace(/[^a-z_]/g, ''));
-        const errorSummary = account.reloginMessage || account.lastError;
+        const discarded = discardedHistoryAccount(account);
+        const errorSummary = discarded ? discardReason(account) : account.lastErrorCode === 'invalid_username_or_password' ? '账密被拒绝' : account.reloginMessage || account.lastError;
         const errorCode = account.lastErrorCode ? ` · ${escapeHTML(account.lastErrorCode)}` : '';
         const errorHTTPStatus = account.lastHTTPStatus > 0 ? ` · HTTP ${account.lastHTTPStatus}` : '';
         const expiry = historyExpiryState(account);
@@ -2169,14 +2496,12 @@ function renderHistory() {
         const recoveryHTML = renderHistoryRecovery(account);
         const { delivery, recovery, repair, recheck } = historyAccountTasks(account);
         const official = officialAccountStatus(account);
-        const primaryProblem = official === 'deleted' ? '官方检测为账号已删除，可清理本地记录'
-            : official === 'deactivated' ? '官方检测为账号已停用，可重新登录确认'
-            : official === 'deleted_or_deactivated' ? '官方检测为账号已删除或停用，请核对官方状态'
-            : deleted || deactivated ? 'AUTH 记录标记为删除或停用，来源待核对'
-            : errorSummary || importError || account.sub2Status.errorMessage;
+        const recentLoginFailure = stopped && !busy && ['error', 'failed'].includes(account.status) && account.lastError ? `最近登录失败：${account.lastError}` : '';
+        const primaryProblem = discarded ? `废弃原因：${errorSummary}` : official ? `官方账号${lifecycleStatusName(official)}，已停止登录` : stopped
+            ? [stopped.label, recentLoginFailure].filter(Boolean).join('；') : errorSummary || importError || account.sub2Status.errorMessage;
         const checkState = historyChecks.get(account.id)?.latest_task?.state;
-        const workflow = [delivery, recovery, repair, recheck].some(task => task?.requires_action && !['completed', 'success', 'canceled'].includes(task.state)) ? '需处理'
-            : ['queued', 'checking', 'retry_wait'].includes(repair?.state) ? '资料更新处理中'
+        const workflow = official ? (importState === 'cleanup_pending' ? '后台清理 Sub2 中' : '已终止') : stopped?.code === 'free_local' ? 'Free · 仅本地' : stopped ? '自动处理已暂停' : [delivery, recovery, repair, recheck].some(task => task?.requires_action && !['completed', 'success', 'canceled'].includes(task.state)) ? '需处理'
+            : ['queued', 'checking', 'recovery_queued', 'retry_wait'].includes(repair?.state) ? '资料更新处理中'
             : ['queued', 'running'].includes(checkState) ? (checkState === 'queued' ? '检测排队中' : '检测中')
             : ['running', 'pending'].includes(account.status) ? historyStatusName(account.status)
             : delivery?.state === 'retry_wait' ? '等待交付重试'
@@ -2186,38 +2511,42 @@ function renderHistory() {
             : recheck?.state === 'checking' ? '正在延迟复检'
             : ['pending', 'recovery_queued'].includes(recheck?.state) ? '等待延迟复检'
             : delivery?.state === 'completed' ? 'Sub2 交付完成' : importStateText;
-        const automationHTML = renderHistoryAutomation(account);
+        const automationHTML = official || discarded ? '' : renderHistoryAutomation(account);
         return `
             <article class="history-item history-account-card ${selected ? 'history-selected' : ''} ${deleted ? 'history-deleted' : ''}" data-history-card="${escapeHTML(account.id)}">
                 <div class="history-select">
-                    <input type="checkbox" data-history-select data-history-id="${escapeHTML(account.id)}" aria-label="选择 ${escapeHTML(account.email || '未知账号')}" ${selected ? 'checked' : ''} ${historyActionsLocked() ? 'disabled' : ''}>
+                    <input type="checkbox" data-history-select data-history-id="${escapeHTML(account.id)}" aria-label="选择 ${escapeHTML(historyAccountName(account))}" ${selected ? 'checked' : ''} ${historyActionsLocked() ? 'disabled' : ''}>
                 </div>
                 <div class="history-row-identity">
-                    <div class="history-email">${escapeHTML(account.email || '未知账号')}</div>
-                    <span class="history-account-number">#${escapeHTML(account.id)}${account.planType ? ` · ${escapeHTML(account.planType)}` : ''}</span>
+                    <div class="history-email">${escapeHTML(displayName)}</div>
+                    ${displayName !== account.email && account.email ? `<div class="history-account-email">${escapeHTML(account.email)}</div>` : ''}
+                    ${account.sub2Status.nameStale ? `<div class="history-name-source">${escapeHTML(({ cached_remote: '缓存名称', historical_import: '历史导入名称', local_delivery: '本地交付名称' }[account.sub2Status.nameSource] || '名称'))} · 待同步</div>` : ''}
+                    <span class="history-account-number">AUTH #${escapeHTML(account.id)}${account.sub2Status.sub2AccountID ? ` · Sub2 #${escapeHTML(account.sub2Status.sub2AccountID)}` : ''} · ${escapeHTML(historyPlanLabel(account.planType))}</span>
                 </div>
                 <div class="history-row-auth"><span class="history-row-label">AUTH 登录</span><span class="history-status ${statusClass}">${escapeHTML(historyStatusName(account.status))}</span>${expiryBadge}</div>
                 <div class="history-row-sub2"><span class="history-row-label">Sub2 调度</span>${renderSub2Status(account)}${pool.kind !== 'present' ? `<span class="history-account-number">${escapeHTML(pool.label)}</span>` : ''}</div>
                 <div class="history-row-source"><span class="history-row-label">状态来源</span>${renderAccountStatusSource(account)}</div>
-                <div class="history-row-quota"><span class="history-row-label">使用额度</span>${renderQuotaSummary(account)}</div>
+                <div class="history-row-quota"><span class="history-row-label">使用额度</span>${renderQuotaSummary(account)}${renderHistoryCost(account)}</div>
                 <div class="history-row-workflow"><span class="history-row-label">交付 / 恢复</span><span class="history-workflow-state">${escapeHTML(workflow)}</span>
                     ${primaryProblem || recoveryHTML || automationHTML ? `<details class="history-diagnostics ${primaryProblem ? 'is-alert' : ''}" data-history-details="diagnostics-${escapeHTML(account.id)}"><summary><span>${escapeHTML(primaryProblem || '查看进度与记录')}</span></summary><div class="history-diagnostics-body">${diagnostics.map(line => `<p class="history-error">${line}</p>`).join('')}${automationHTML}${recoveryHTML}<p class="history-task-status">登录尝试 ${Number.isFinite(account.attemptCount) ? account.attemptCount : 0} 次 · 最近尝试 ${formatHistoryTime(account.lastAttemptAt || account.updatedAt)}</p></div></details>` : ''}
-                    ${account.recoveryCount || account.recoveryAttemptCount ? `<button class="history-recovery-count" type="button" data-history-action="recovery-history" data-history-id="${escapeHTML(account.id)}" aria-expanded="false" aria-controls="historyRecoveryPopover" aria-haspopup="dialog" aria-label="${escapeHTML(account.email)}，${escapeHTML(recoverySummary)}，查看复活记录" title="${account.recoveryAttemptCount} 次恢复尝试；悬停、聚焦或点击查看记录">↻ ${escapeHTML(recoverySummary)}</button>` : ''}
+                    ${account.recoveryCount || account.recoveryAttemptCount ? `<button class="history-recovery-count" type="button" data-history-action="recovery-history" data-history-id="${escapeHTML(account.id)}" aria-expanded="false" aria-controls="historyRecoveryPopover" aria-haspopup="dialog" aria-label="${escapeHTML(historyAccountName(account))}，${escapeHTML(recoverySummary)}，查看复活记录" title="${account.recoveryAttemptCount} 次恢复尝试；悬停、聚焦或点击查看记录">↻ ${escapeHTML(recoverySummary)}</button>` : ''}
                 </div>
                 <div class="history-row-time"><span class="history-row-label">最近成功</span>${formatHistoryTime(account.lastSuccessAt)}</div>
                 <div class="history-row-actions history-actions">
                     ${recoveryButton}
-                    <button class="btn-secondary" type="button" data-history-action="details" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy ? 'disabled' : ''}>详情</button>
-                    <details class="history-more" data-history-details="actions-${escapeHTML(account.id)}">
+                    <button class="btn-secondary" type="button" data-history-action="details" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy ? 'disabled' : ''}>查看详情</button>
+                    ${official || discarded ? '' : `<details class="history-more" data-history-details="actions-${escapeHTML(account.id)}">
                         <summary>更多</summary>
                         <div class="history-more-menu">
                             ${copyRefreshButton}
-                            <button class="btn-secondary" type="button" data-history-action="credentials" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy || account.status === 'running' ? 'disabled' : ''}>更新资料并继续</button>
-                            <button class="btn-secondary" type="button" data-history-action="relogin" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy || deleted ? 'disabled' : ''}>${busy ? '<span class="spinner"></span> 登录中' : historyDeliveries.get(account.id)?.requires_action ? '重新登录并交付' : '重新登录'}</button>
-                            <button class="btn-secondary" type="button" data-history-action="${importState === 'unknown' || importState === 'confirming' ? 'reconcile' : 'import'}" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy || !canImportToSub2(account) && !['unknown', 'confirming'].includes(importState) ? 'disabled' : ''}>${escapeHTML(importStateText)}</button>
+                            ${stopped ? `<div class="history-more-status" role="status">${escapeHTML(stopped.label)}。${recentLoginFailure ? `${escapeHTML(recentLoginFailure)}${errorCode}${errorHTTPStatus}。` : ''}${official ? '官方终态账号不再提供登录或人工核对。' : stopped.code === 'free_local' ? '保留本地登录和凭据，不进入 Sub2。' : stopped.code === 'missing' ? '可仅重新登录 AUTH；也可明确选择“重新登录并导入 Sub2”重建。' : stopped.code === 'unmatched' ? '可更新资料、重新登录或手动首次导入。' : '可更新资料后手动重试；每次点击仅尝试一次，失败仍暂停。'}</div>` : ''}
+                            ${stopped?.code === 'missing' ? '' : `<button class="btn-secondary" type="button" data-history-action="credentials" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy || account.status === 'running' ? 'disabled' : ''}>更新资料</button>`}
+                            ${canReloginHistory(account) || busy ? `<button class="btn-secondary" type="button" data-history-action="relogin" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy || !canReloginHistory(account) ? 'disabled' : ''}>${busy ? '<span class="spinner"></span> 登录中' : stopped?.code === 'missing' ? '仅重新登录 AUTH' : historyReloginDelivers(account) ? '重新登录并交付' : '重新登录'}</button>` : ''}
+                            ${canReimportRemoteMissing(account) ? `<button class="btn-secondary" type="button" data-history-action="reimport" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy ? 'disabled' : ''}>重新登录并导入 Sub2</button>` : ''}
+                            ${stopped && !canImportToSub2(account) ? '' : `<button class="btn-secondary" type="button" data-history-action="${importState === 'unknown' || importState === 'confirming' ? 'reconcile' : 'import'}" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy || !canImportToSub2(account) && !['unknown', 'confirming'].includes(importState) ? 'disabled' : ''}>${escapeHTML(importStateText)}</button>`}
                             <button class="btn-secondary" type="button" data-history-action="delete" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy ? 'disabled' : ''}>${deleted ? '清理记录' : '删除记录'}</button>
                         </div>
-                    </details>
+                    </details>`}
                 </div>
             </article>`;
     }).join('');
@@ -2230,6 +2559,7 @@ function renderHistory() {
         const replacement = historyGrid.querySelector(`[data-history-action="${CSS.escape(focusAction)}"][data-history-id="${CSS.escape(focusID)}"]`);
         if (replacement && !replacement.disabled) replacement.focus({ preventScroll: true });
     }
+    void loadHistoryCosts(pageAccounts);
 }
 
 async function checkHistoryNow() {
@@ -2238,7 +2568,7 @@ async function checkHistoryNow() {
     const source = historySelectedIDs.size
         ? historyAccounts.filter(account => historySelectedIDs.has(account.id))
         : visible;
-    const ids = source.filter(account => historyChecks.get(account.id)?.eligible && account.sub2Status.present && account.sub2Status.exists).map(account => account.id);
+    const ids = source.filter(canCheckHistoryAccount).map(account => account.id);
     if (!ids.length) return;
     if (historyCheckNowStatus) historyCheckNowStatus.textContent = `正在提交 ${ids.length} 个账号的检测…`;
     historyCheckNowBtn.disabled = true;
@@ -2261,11 +2591,11 @@ async function deleteHistory(id) {
 async function deleteHistoryAccounts(ids) {
     if (historyActionsLocked()) return;
     // Snapshot immutable record IDs before confirmation; never resolve by email.
-    const selected = historyAccounts.filter(account => ids.includes(account.id));
+    const selected = historyAccounts.filter(account => ids.includes(account.id) && !terminalHistoryAccount(account));
     if (!selected.length) return;
     const pageIDs = new Set(getHistoryPageAccounts(getFilteredHistoryAccounts()).map(account => account.id));
     const hiddenCount = selected.filter(account => !pageIDs.has(account.id)).length;
-    const subject = selected.length === 1 ? `账号 ${selected[0].email}` : `选中的 ${selected.length} 个账号`;
+    const subject = selected.length === 1 ? `账号 ${historyAccountName(selected[0])}` : `选中的 ${selected.length} 个账号`;
     const prompt = `确认删除${subject}的 AUTH 本地凭据和登录历史吗？${hiddenCount ? `\n其中 ${hiddenCount} 个不在当前页（包含其他页或筛选外账号）。` : ''}\n\n此操作不可撤销；不会删除 Sub2 中已导入的账号。正在登录、导入中或导入待核对的账号会保留并提示原因。`;
     if (!await confirmAction({ title: '删除账号记录', message: prompt, confirmLabel: '确认删除', danger: true }) || historyActionsLocked()) return;
     historyBatchRunning = true;
@@ -2328,6 +2658,8 @@ function closeHistoryDetails() {
     const wasOpen = !historyDetail.hidden;
     if (historyDetailAbort) historyDetailAbort.abort();
     historyDetailAbort = null;
+    clearHistoryCredentials();
+    historyDetailBody.innerHTML = '';
     historyDetailID = '';
     historyDetail.hidden = true;
     const trigger = historyDetailTrigger;
@@ -2341,16 +2673,18 @@ async function openHistoryDetails(id, trigger = null) {
     const account = historyAccounts.find(item => item.id === id);
     if (!account) return;
     if (historyDetailAbort) historyDetailAbort.abort();
+    clearHistoryCredentials();
     historyDetailTrigger = trigger && typeof trigger.focus === 'function' ? trigger : null;
     historyDetailID = String(id);
     historyDetail.hidden = false;
     historyDetailPanel.focus?.({ preventScroll: true });
-    historyDetailTitle.textContent = account.email || '账号详情';
+    historyDetailTitle.textContent = historyAccountName(account);
     historyDetailBody.innerHTML = '<div class="empty-state"><p>正在加载详情…</p></div>';
     const controller = new AbortController();
     let timedOut = false;
     const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15000);
     historyDetailAbort = controller;
+    const costPromise = loadHistoryCosts([account]);
     try {
         const response = await fetch(`/api/history/${encodeURIComponent(id)}`, {
             headers: { 'Accept': 'application/json' },
@@ -2358,12 +2692,13 @@ async function openHistoryDetails(id, trigger = null) {
         });
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(payload.message || `详情加载失败（HTTP ${response.status}）`);
-        if (historyDetailID !== String(id)) return;
+        await costPromise;
+        if (historyDetailID !== String(id) || historyDetailAbort !== controller || controller.signal.aborted) return;
         renderHistoryDetail(payload.account || account, Array.isArray(payload.attempts) ? payload.attempts : [],
             Array.isArray(payload.recovery_failures) ? payload.recovery_failures : [],
             payload.recovery_failures_available !== false, payload.recovery_failures_truncated === true,
             Array.isArray(payload.lifecycle_events) ? payload.lifecycle_events : account.lifecycleEvents,
-            payload.lifecycle_events_available !== false);
+            payload.lifecycle_events_available !== false, payload.credentials_meta);
     } catch (error) {
         if (historyDetailID !== String(id)) return;
         if (error.name === 'AbortError' && !timedOut) return;
@@ -2389,7 +2724,93 @@ function renderRecoveryFailureEvents(events, available, truncated) {
     return `<div class="history-detail-attempts"><p class="hint">Sub2 检测失败证据（仅保存固定分类、阶段和 HTTP 状态，不保存上游响应或凭据）${truncated ? ' · 仅显示最近 100 条' : ''}</p>${items}</div>`;
 }
 
-function renderHistoryDetail(account, attempts, recoveryFailures = [], recoveryFailuresAvailable = true, recoveryFailuresTruncated = false, lifecycleEvents = [], lifecycleEventsAvailable = true) {
+function clearHistoryCredentials() {
+    historyDetailGeneration += 1;
+    const fields = new Set([...historyCredentialValues.keys(), ...historyCredentialRequests.keys()]);
+    historyCredentialRequests.forEach(controller => controller.abort());
+    historyCredentialRequests.clear();
+    historyCredentialValues.clear();
+    for (const field of fields) {
+        const value = historyDetailBody.querySelector(`[data-history-credential-value="${field}"]`);
+        if (value) value.textContent = '••••••••';
+        const button = historyDetailBody.querySelector(`[data-history-credential-field="${field}"][data-history-credential-action="show"]`);
+        if (button) { button.textContent = '显示'; button.disabled = false; }
+        const copy = historyDetailBody.querySelector(`[data-history-credential-field="${field}"][data-history-credential-action="copy"]`);
+        if (copy) copy.disabled = false;
+        const status = historyDetailBody.querySelector(`[data-history-credential-status="${field}"]`);
+        if (status) status.textContent = '';
+    }
+}
+
+function renderHistoryCredentials(account, meta) {
+    if (terminalHistoryAccount(account)) return '';
+    const fieldRow = (field, label) => {
+        const state = meta?.[field]?.state;
+        const available = state === 'saved';
+        return `<div class="history-credential-row"><span>${label}</span><span class="history-credential-value" data-history-credential-value="${field}">${available ? '••••••••' : state === 'missing' ? '未保存/已清除' : '资料状态未提供'}</span><div class="history-credential-actions"><button class="btn-secondary" type="button" data-history-credential-field="${field}" data-history-credential-action="show" ${available ? '' : 'disabled'}>显示</button><button class="btn-secondary" type="button" data-history-credential-field="${field}" data-history-credential-action="copy" ${available ? '' : 'disabled'}>复制</button></div><span class="history-credential-status" data-history-credential-status="${field}" role="status" aria-live="polite"></span></div>`;
+    };
+    return `<section class="history-credentials" aria-label="登录资料"><h4>登录资料</h4><div class="history-credential-row"><span>邮箱</span><span class="history-credential-value">${escapeHTML(account.email)}</span><div class="history-credential-actions"><button class="btn-secondary" type="button" data-history-credential-field="email" data-history-credential-action="copy">复制</button></div></div>${fieldRow('password', '密码')}${fieldRow('totp_secret', '2FA（TOTP）密钥')}<p class="hint">2FA 显示已保存的密钥，不是当前六位验证码。</p><details class="history-credential-edit"><summary>修改登录资料</summary><p class="hint">保存资料不代表登录成功；Sub2 关联缺失时不会重新导入。</p><button class="btn-secondary" type="button" data-history-detail-edit ${sub2AutomationBlock(account)?.code === 'missing' || account.status === 'running' ? 'disabled' : ''}>修改资料</button></details></section>`;
+}
+
+async function handleHistoryCredentialAction(field, action, button) {
+    const id = historyDetailID;
+    if (!id || historyDetail.hidden || document.hidden || !['show', 'copy'].includes(action)) return;
+    const account = historyAccounts.find(item => item.id === id);
+    if (field === 'email' && action === 'copy') { if (account) await copySecret(account.email, '邮箱'); return; }
+    if (!account || terminalHistoryAccount(account)) return;
+    if (!['password', 'totp_secret'].includes(field)) return;
+    const node = historyDetailBody.querySelector(`[data-history-credential-value="${field}"]`);
+    const status = historyDetailBody.querySelector(`[data-history-credential-status="${field}"]`);
+    if (action === 'show' && historyCredentialValues.has(field)) {
+        historyCredentialRequests.get(field)?.abort();
+        historyCredentialRequests.delete(field);
+        historyCredentialValues.delete(field);
+        if (node) node.textContent = '••••••••';
+        button.textContent = '显示';
+        if (status) status.textContent = '';
+        return;
+    }
+    if (historyCredentialRequests.has(field)) return;
+    const generation = historyDetailGeneration, controller = new AbortController();
+    historyCredentialRequests.set(field, controller);
+    const current = () => historyDetailID === id && historyDetailGeneration === generation && !historyDetail.hidden && !document.hidden && historyCredentialRequests.get(field) === controller && !controller.signal.aborted;
+    button.disabled = true;
+    if (status) status.textContent = '正在读取…';
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+        const response = await fetch(`/api/history/${encodeURIComponent(id)}/credentials/reveal`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+            body: JSON.stringify({ field }), signal: controller.signal, cache: 'no-store'
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!current()) return;
+        if (!response.ok || payload.success !== true) {
+            const messages = { credential_missing: '未保存/已清除', account_not_found: '账号不存在', credential_read_failed: '资料读取失败' };
+            if (status) status.textContent = messages[payload.code] || '资料读取失败，请稍后重试';
+            return;
+        }
+        if (String(payload.account_id) !== id || payload.field !== field || typeof payload.value !== 'string' || !payload.value) {
+            if (status) status.textContent = '资料响应无效，请刷新详情';
+            return;
+        }
+        if (action === 'copy') {
+            const copied = await copySecret(payload.value, field === 'password' ? '密码' : 'TOTP 密钥');
+            if (current() && status) status.textContent = copied ? '已复制' : '复制失败，请点击显示后手动复制';
+        } else {
+            historyCredentialValues.set(field, payload.value);
+            if (node) node.textContent = payload.value;
+            button.textContent = '隐藏';
+            if (status) status.textContent = '';
+        }
+    } catch (_) {
+        if (historyDetailID === id && historyDetailGeneration === generation && !historyDetail.hidden && !document.hidden && status) status.textContent = '资料读取失败，请稍后重试';
+    } finally {
+        clearTimeout(timeout);
+        if (historyCredentialRequests.get(field) === controller) { historyCredentialRequests.delete(field); button.disabled = false; }
+    }
+}
+
+function renderHistoryDetail(account, attempts, recoveryFailures = [], recoveryFailuresAvailable = true, recoveryFailuresTruncated = false, lifecycleEvents = [], lifecycleEventsAvailable = true, credentialsMeta = null) {
     const current = historyAccounts.find(item => item.id === String(account.id)) || normalizeHistoryAccount(account);
     const sub2 = current.sub2Status;
     const pool = historyPoolState(current);
@@ -2406,27 +2827,32 @@ function renderHistoryDetail(account, attempts, recoveryFailures = [], recoveryF
     const delivery = historyDeliveries.get(current.id);
     const expiry = historyExpiryState({ expiresAt: Number(account.expires_at ?? account.expiresAt ?? 0) });
     const expiryText = expiry.label || '有效期未知';
-    const plan = account.plan_type || account.planType || '未知';
-    const status = String(account.status || 'unknown').toLowerCase();
+    const plan = historyPlanLabel(account.plan_type || account.planType);
+    const status = discardedHistoryAccount(current) ? 'discarded' : String(account.status || 'unknown').toLowerCase();
     const attemptHTML = attempts.length ? attempts.map(attempt => {
         const stage = stageNames[attempt.stage] || attempt.stage || '登录';
         const state = historyStatusName(String(attempt.status || 'unknown').toLowerCase());
-        const code = attempt.code ? ` · ${escapeHTML(attempt.code)}` : '';
+        const rejected = attempt.code === 'invalid_username_or_password';
+        const code = attempt.code && !rejected ? ` · ${escapeHTML(attempt.code)}` : '';
+        const message = rejected ? '账密被拒绝' : loginBlockLabel(attempt.manual_reason || attempt.code) || attempt.message;
         const http = Number(attempt.http_status || 0) > 0 ? ` · HTTP ${Number(attempt.http_status)}` : '';
         const duration = Number(attempt.duration_ms || 0) > 0 ? `${(Number(attempt.duration_ms) / 1000).toFixed(1)}s` : '—';
         return `<div class="history-attempt">
             <div class="history-attempt-header"><span>${escapeHTML(formatHistoryTime(attempt.started_at))} · ${escapeHTML(state)}</span><span>${escapeHTML(stage)} · ${duration}</span></div>
-            <div class="history-attempt-message">${attempt.retryable ? '可重试' : '不可重试'}${code}${http}${attempt.message ? ` · ${escapeHTML(attempt.message)}` : ''}</div>
+            <div class="history-attempt-message">${attempt.retryable ? '可重试' : '不可重试'}${code}${http}${message ? ` · ${escapeHTML(message)}` : ''}</div>
         </div>`;
     }).join('') : '<div class="empty-state"><p>暂无登录尝试记录</p></div>';
     const failureHTML = renderRecoveryFailureEvents(recoveryFailures, recoveryFailuresAvailable, recoveryFailuresTruncated);
     const lifecycleHTML = renderLifecycleEvents(lifecycleEvents.length ? lifecycleEvents : current.lifecycleEvents, lifecycleEventsAvailable);
-    historyDetailBody.innerHTML = `
+    clearHistoryCredentials();
+    historyDetailBody.innerHTML = `${renderHistoryCredentials(current, credentialsMeta)}
+        ${discardedHistoryAccount(current) ? `<p class="hint">废弃原因：${escapeHTML(discardReason(current))}</p>` : ''}
         <div class="history-detail-summary">
             <div class="history-detail-stat">AUTH 最近登录<br><strong>${escapeHTML(historyStatusName(status))}</strong></div>
             <div class="history-detail-stat">状态来源<br><strong>${renderAccountStatusSource(current)}</strong></div>
             <div class="history-detail-stat">Sub2 状态 / 调度<br><strong>${renderSub2Status(current)}</strong><br>${escapeHTML(pool.label)}</div>
             <div class="history-detail-stat">Sub2 最近同步<br><strong>${formatHistoryTime(sub2.checkedAt)}</strong></div>
+            ${renderHistoryCost(current, true)}
             <div class="history-detail-stat">5 小时使用额度<br><strong>${escapeHTML(quotaFiveHour)}</strong></div>
             <div class="history-detail-stat">7 天使用额度<br><strong>${escapeHTML(quotaSevenDay)}</strong></div>
             <div class="history-detail-stat">7 天 Sonnet<br><strong>${escapeHTML(quotaSevenDaySonnet)}</strong></div>
@@ -2444,9 +2870,10 @@ function renderHistoryDetail(account, attempts, recoveryFailures = [], recoveryF
         <div class="history-detail-attempts"><p class="hint">列表中的有效期来自 OAuth 访问令牌；访问令牌过期后，Refresh Token 是否可用不由此字段判断，通常仍可用于重新登录。最近 ${attempts.length} 次尝试</p>${attemptHTML}</div>${failureHTML}`;
 }
 
-async function performHistoryRelogin(id) {
+async function performHistoryRelogin(id, { autoDeliver, deliveryOptions } = {}) {
     const account = historyAccounts.find(item => item.id === id);
     if (!account) return { success: false, error: '账号不存在' };
+    if (!canReloginHistory(account)) return { success: false, error: '账号正在登录或官方已删除，请查看详情' };
     historyRefreshTokens.delete(String(id));
     account.refreshToken = '';
     historyBusyID = id;
@@ -2458,7 +2885,8 @@ async function performHistoryRelogin(id) {
         const response = await fetch('/api/history/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
-            body: JSON.stringify({ account_id: Number(id), proxy: proxyInput.value.trim(), auto_deliver: historyDeliveries.get(String(id))?.requires_action === true }),
+            body: JSON.stringify({ account_id: Number(id), auto_deliver: autoDeliver ?? historyReloginDelivers(account), manual_attempt: true,
+                ...(deliveryOptions ? { delivery_options: deliveryOptions } : {}) }),
             signal: controller.signal
         });
         const contentType = response.headers.get('content-type') || '';
@@ -2472,13 +2900,17 @@ async function performHistoryRelogin(id) {
             message: account.reloginMessage,
             timings: {}
         });
+        const latest = historyAccounts.find(item => item.id === id);
+        if (!latest || terminalHistoryAccount(latest)) return { success: false, error: '账号已移除或已停止使用' };
         if (!finalData.success) {
             throw new Error(formatLoginError(finalData, { stage: '' }));
         }
         const result = finalData.Data || finalData.data || {};
         const refreshToken = getRefreshToken(result);
         if (refreshToken) historyRefreshTokens.set(id, refreshToken);
-        account.reloginMessage = '登录成功，历史已更新';
+        const delivery = result.delivery || result.Delivery;
+        account.reloginMessage = delivery?.state === 'queued' ? '登录成功，等待同步至 Sub2'
+            : delivery?.state === 'canceled' ? `登录成功 · ${delivery.last_error || '已取消交付'}` : '登录成功，历史已更新';
         return { success: true };
     } catch (error) {
         account.reloginMessage = error.name === 'AbortError' ? '重新登录超时，请刷新后核对结果' : (error.message || '重新登录失败');
@@ -2497,7 +2929,6 @@ async function reloginHistory(id) {
     historyBatchSummary = '';
     startBtn.disabled = true;
     startBtn.innerHTML = '<span class="spinner"></span><span>处理中</span>';
-    proxyCheckBtn.disabled = true;
     exportBtn.disabled = true;
     refreshHistoryBtn.disabled = true;
     historySearchInput.disabled = true;
@@ -2512,7 +2943,78 @@ async function reloginHistory(id) {
         startBtn.disabled = false;
         startBtn.innerHTML = '<span>▶️</span><span>开始处理</span>';
         document.body.classList.remove('processing');
-        proxyCheckBtn.disabled = proxyChecking;
+        exportBtn.disabled = results.length === 0;
+        refreshHistoryBtn.disabled = false;
+        historySearchInput.disabled = false;
+        renderHistory();
+    }
+}
+
+async function reimportRemoteMissingHistory(id) {
+    const key = String(id), account = historyAccounts.find(item => item.id === key);
+    if (!account || historyActionsLocked() || historyBusyID || pendingDeliveryOptions || !canReimportRemoteMissing(account)) return;
+    const importOperation = String(historyImports.get(key)?.operation_id || '');
+    const initialCredentialVersion = Number(account.credentialVersion || 0);
+    if (!importOperation) {
+        historyBatchSummary = '缺少旧关联标识，请刷新核对后重新导入。';
+        renderHistory();
+        return;
+    }
+    const optionsRequest = chooseDeliveryOptions('将重新登录并创建新的 Sub2 账号。旧关联已标记不存在；只有确认后才提交。', true,
+        historyDeliveries.get(key)?.delivery_options || null, false);
+    deliveryOptionsApply.textContent = '重新登录并导入';
+    const deliveryOptions = await optionsRequest;
+    if (!deliveryOptions || historyActionsLocked() || !canReimportRemoteMissing(historyAccounts.find(item => item.id === key))
+        || historyImports.get(key)?.operation_id !== importOperation) return;
+    const frozenOptions = copyDeliveryOptions(deliveryOptions);
+    processing = true;
+    historyBatchRunning = true;
+    historyBatchSummary = '正在重新登录并准备 Sub2 重建…';
+    startBtn.disabled = true;
+    startBtn.innerHTML = '<span class="spinner"></span><span>处理中</span>';
+    exportBtn.disabled = true;
+    refreshHistoryBtn.disabled = true;
+    historySearchInput.disabled = true;
+    document.body.classList.add('processing');
+    renderHistory();
+    try {
+        const loginResult = await performHistoryRelogin(key, { autoDeliver: false, deliveryOptions: frozenOptions });
+        if (!loginResult.success) {
+            historyBatchSummary = loginResult.error || '重新登录失败，未提交 Sub2 重建';
+            return;
+        }
+        await loadHistory();
+        const freshAccount = historyAccounts.find(item => item.id === key);
+        const credentialVersion = Number(freshAccount?.credentialVersion || 0);
+        if (historyLoadError || !freshAccount || freshAccount.status !== 'active' || !Number.isSafeInteger(initialCredentialVersion) || initialCredentialVersion < 0
+            || !Number.isSafeInteger(credentialVersion) || credentialVersion <= initialCredentialVersion
+            || !canReimportRemoteMissing(freshAccount) || historyImports.get(key)?.operation_id !== importOperation) {
+            historyBatchSummary = '账号状态已变化，未提交 Sub2 重建，请刷新历史核对。';
+            return;
+        }
+        const response = await fetch('/api/sub2/import', {
+            method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ account_ids: [Number(key)], delivery_options: frozenOptions, reimport: true,
+                expected_credential_version: credentialVersion, expected_import_operation_id: importOperation }),
+            signal: AbortSignal.timeout(30000)
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || payload.success === false) throw new Error(payload.message || `Sub2 重建提交失败（HTTP ${response.status}）`);
+        const accepted = Array.isArray(payload.imports) && payload.imports.some(item => String(item.account_id) === key);
+        if (!accepted) throw new Error('Sub2 未受理重建请求，请刷新核对关联状态');
+        historyBatchSummary = '已提交 Sub2 重建，正在等待结果…';
+        const outcome = await waitForImportCompletion([key], 90000, { total: 1 });
+        historyBatchSummary = outcome.pending ? `Sub2 重建仍在处理中，${outcome.message || '请稍后刷新核对'}`
+            : outcome.success ? '重新登录并导入 Sub2 已完成。' : '登录已成功，Sub2 重建未完成，请查看账号状态与错误原因。';
+    } catch (error) {
+        historyBatchSummary = error.name === 'TimeoutError' || error instanceof TypeError ? 'Sub2 重建提交结果暂未确认，请刷新核对。' : (error.message || 'Sub2 重建提交失败，请刷新后核对');
+    } finally {
+        await loadHistory();
+        processing = false;
+        historyBatchRunning = false;
+        startBtn.disabled = false;
+        startBtn.innerHTML = '<span>▶️</span><span>开始处理</span>';
+        document.body.classList.remove('processing');
         exportBtn.disabled = results.length === 0;
         refreshHistoryBtn.disabled = false;
         historySearchInput.disabled = false;
@@ -2528,7 +3030,7 @@ async function batchReloginHistory() {
     });
     if (!ids.length) return;
     const skipped = historySelectedIDs.size - ids.length;
-    const proxyLabel = proxyInput.value.trim().toLowerCase() === 'direct' ? '使用服务器 IPv4 直连' : proxyInput.value.trim() ? '使用当前已配置代理' : '使用服务器默认网络配置';
+    const proxyLabel = '优先使用各账号在 Sub2 的当前代理，不可达时尝试其备用节点；未交付账号沿用已有线路';
     const estimate = `默认最长约 ${ids.length * 3} 分钟`;
     const summary = `将按顺序复活 ${ids.length} 个账号，${proxyLabel}，${estimate}（按单账号 3 分钟上限）。${skipped > 0 ? `另有 ${skipped} 个选中账号当前不可复活，将跳过。` : ''}\n\n是否继续？`;
     if (!await confirmAction({ title: '批量复活账号', message: summary, confirmLabel: '开始复活' }) || historyActionsLocked()) return;
@@ -2539,7 +3041,6 @@ async function batchReloginHistory() {
     processing = true;
     startBtn.disabled = true;
     startBtn.innerHTML = '<span class="spinner"></span><span>批量复活中</span>';
-    proxyCheckBtn.disabled = true;
     exportBtn.disabled = true;
     refreshHistoryBtn.disabled = true;
     historySearchInput.disabled = true;
@@ -2572,7 +3073,6 @@ async function batchReloginHistory() {
         startBtn.disabled = false;
         startBtn.innerHTML = '<span>▶️</span><span>开始处理</span>';
         document.body.classList.remove('processing');
-        proxyCheckBtn.disabled = proxyChecking;
         exportBtn.disabled = results.length === 0;
         refreshHistoryBtn.disabled = false;
         historySearchInput.disabled = false;
@@ -2750,6 +3250,7 @@ async function importLoginResultsToSub2() {
 
 async function reconcileHistoryImport(id) {
     if (historyActionsLocked()) return;
+    if (terminalHistoryAccount(historyAccounts.find(account => account.id === String(id)))) return;
     const item = historyImports.get(String(id));
     if (!item || !item.id) return;
     historyBatchRunning = true;
@@ -2774,6 +3275,9 @@ async function reconcileHistoryImport(id) {
 async function runAccounts(targetAccounts) {
     if (processing || historyBatchRunning || targetAccounts.length === 0) return;
     const autoDeliver = autoDeliveryConfigured === true && Boolean(autoDeliverToggle?.checked);
+    // The initial settings read may still be resolving after a fast page load.
+    // Use it when available so a selected Sub2 login route is not lost.
+    if (!deliveryBatchOptions && deliverySettingsRequest) await deliverySettingsRequest;
     if (targetAccounts.some(account => (account.autoDeliver ?? autoDeliver) && !account.deliveryOptions) && !await prepareDeliveryBatch()) return;
     if (processing || historyBatchRunning) return;
     processing = true;
@@ -2787,18 +3291,14 @@ async function runAccounts(targetAccounts) {
     stopBtn.disabled = false;
     stopBtn.textContent = '停止';
     document.body.classList.add('processing');
-    proxyCheckBtn.disabled = true;
     importSub2Btn.disabled = true;
     exportBtn.disabled = true;
     refreshHistoryBtn.disabled = true;
-    const proxy = proxyInput.value.trim();
-    // A previous batch may have hit the IP limit. Do not carry its local
-    // countdown into a new batch; the server remains the source of truth.
-    platformPauseUntil = 0;
+    const proxy = '';
     for (const account of targetAccounts) {
         // Retrying a login preserves the delivery choice frozen for that account's batch.
         if (typeof account.autoDeliver !== 'boolean') account.autoDeliver = autoDeliver;
-        if (account.autoDeliver && !account.deliveryOptions) account.deliveryOptions = copyDeliveryOptions(frozenOptions);
+        if (!account.deliveryOptions && frozenOptions) account.deliveryOptions = copyDeliveryOptions(frozenOptions);
         account.status = 'pending';
         account.message = '等待处理';
         account.duration = '';
@@ -2827,7 +3327,6 @@ async function runAccounts(targetAccounts) {
         startBtn.disabled = false;
         startBtn.innerHTML = '<span>▶️</span><span>开始处理</span>';
         document.body.classList.remove('processing');
-        proxyCheckBtn.disabled = proxyChecking;
         exportBtn.disabled = results.length === 0;
         refreshHistoryBtn.disabled = false;
         await loadHistory();
@@ -2877,6 +3376,9 @@ async function processAccount(account, proxy, signal) {
         account.timings = data.timings || {};
 
         if (data.success) {
+            account.manualReason = '';
+            account.requiresAction = false;
+            account.retryable = null;
             account.status = 'success';
             account.message = '登录成功 ✨';
             account.result = data.data;
@@ -2888,6 +3390,10 @@ async function processAccount(account, proxy, signal) {
                 ...data.data
             });
         } else {
+            account.manualReason = data.error?.manual_reason || '';
+            account.lastErrorCode = data.error?.code || '';
+            account.requiresAction = Boolean(account.manualReason);
+            account.retryable = data.error?.retryable ?? null;
             throw new Error(formatLoginError(data, account));
         }
     } catch (error) {
@@ -2916,12 +3422,6 @@ async function loginAccount(account, proxy, signal) {
     let response;
     for (let attempt = 0; attempt < 4; attempt++) {
         if (signal.aborted) throw signal.reason;
-        while (Date.now() < platformPauseUntil) {
-            account.stage = 'queued';
-            account.message = '平台限流，' + Math.ceil((platformPauseUntil - Date.now()) / 1000) + ' 秒后继续';
-            renderStatus();
-            await waitForLoginRetry(Math.min(1000, platformPauseUntil - Date.now()), signal);
-        }
         // Bound connection setup only: the server may use a custom login
         // deadline longer than the default while the SSE stream is active.
         const controller = new AbortController();
@@ -2938,7 +3438,7 @@ async function loginAccount(account, proxy, signal) {
                     totp_secret: account.totp_secret,
                     proxy,
                     auto_deliver: account.autoDeliver === true,
-                    ...(account.autoDeliver && account.deliveryOptions ? { delivery_options: account.deliveryOptions } : {})
+                    ...(account.deliveryOptions ? { delivery_options: account.deliveryOptions } : {})
                 }),
                 signal: requestSignal
             });
@@ -2953,20 +3453,13 @@ async function loginAccount(account, proxy, signal) {
         if (response.ok && contentType.includes('text/event-stream')) break;
         account.requestMayHaveStarted = false;
         const data = contentType.includes('json') ? await response.json() : {};
-        if (response.status === 429 && ['platform_rate_limit', 'platform_busy'].includes(data.code) && attempt < 3) {
+        if (response.status === 429 && data.code === 'platform_busy' && attempt < 3) {
             const delay = Number(data.retry_after || response.headers.get('retry-after'));
             if (Number.isFinite(delay) && delay > 0 && delay <= 600) {
-                if (data.code === 'platform_rate_limit') {
-                    // This limit is shared by the client IP, so pause all
-                    // workers together. A full login slot is request-local;
-                    // pausing every worker for it creates a retry storm.
-                    platformPauseUntil = Math.max(platformPauseUntil, Date.now() + delay * 1000);
-                } else {
-                    account.stage = 'queued';
-                    account.message = '服务并发已满，' + delay + ' 秒后继续';
-                    renderStatus();
-                    await waitForLoginRetry(delay * 1000, signal);
-                }
+                account.stage = 'queued';
+                account.message = '服务并发已满，' + delay + ' 秒后继续';
+                renderStatus();
+                await waitForLoginRetry(delay * 1000, signal);
                 continue;
             }
         }
@@ -3077,7 +3570,9 @@ function formatLoginError(data, account) {
     if (accountStatusNames[detail.account_status]) parts.unshift(accountStatusNames[detail.account_status]);
     if (detail.http_status) parts.push('HTTP ' + detail.http_status);
     if (detail.code) parts.push(detail.code);
-    return parts.join(' · ') + '\n' + (detail.message || data.message || '登录失败');
+    if (detail.upstream_code !== detail.code && /^[a-z][a-z0-9_-]{1,63}$/.test(detail.upstream_code || '')) parts.push('上游 ' + detail.upstream_code);
+    const blocked = loginBlockLabel(detail.manual_reason || detail.code);
+    return parts.join(' · ') + '\n' + (blocked || detail.message || data.message || '登录失败');
 }
 
 function renderStatus() {
@@ -3231,11 +3726,11 @@ function updateStatusRow(account, state) {
         ? `${((Date.now() - (account.startTime || Date.now())) / 1000).toFixed(1)}s`
         : account.duration || '-';
 
-    const actionsKey = `${account.status}|${account.result ? 'result' : ''}|${processing ? 'processing' : 'idle'}`;
+    const actionsKey = `${account.status}|${account.result ? 'result' : ''}|${processing ? 'processing' : 'idle'}|${canRetryLogin(account)}`;
     if (state.actionsKey !== actionsKey) {
         state.actions.innerHTML = `${account.status === 'checking' ? `
             <button class="btn-secondary" onclick="recheckStoppedAccount(${account.id})" ${processing ? 'disabled' : ''}>核对结果</button>
-        ` : ''}${['error', 'stopped'].includes(account.status) ? `
+        ` : ''}${canRetryLogin(account) ? `
             <button class="btn-secondary" onclick="retryAccount(${account.id})" ${processing ? 'disabled' : ''}>重试</button>
         ` : ''}${account.result ? `
             <button class="btn-icon" onclick="copyToken(${account.id})" title="复制 Refresh Token">📋</button>
@@ -3269,7 +3764,7 @@ function updateStats() {
     stoppedCount.textContent = accounts.filter(a => a.status === 'stopped').length;
     checkingCount.textContent = accounts.filter(a => a.status === 'checking').length;
     retryFailedBtn.textContent = accounts.some(account => account.status === 'stopped') ? '重试失败和已停止' : '重试全部失败';
-    retryFailedBtn.disabled = processing || historyBatchRunning || !accounts.some(account => ['error', 'stopped'].includes(account.status));
+    retryFailedBtn.disabled = processing || historyBatchRunning || !accounts.some(canRetryLogin);
 }
 
 function getRefreshToken(result) {
@@ -3280,7 +3775,7 @@ function getRefreshToken(result) {
 async function copySecret(value, label) {
     if (!value) {
         window.alert(`没有可复制的 ${label}`);
-        return;
+        return false;
     }
     try {
         if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
@@ -3292,14 +3787,19 @@ async function copySecret(value, label) {
             textarea.style.position = 'fixed';
             textarea.style.opacity = '0';
             document.body.appendChild(textarea);
-            textarea.select();
-            const copied = document.execCommand('copy');
-            textarea.remove();
-            if (!copied) throw new Error('clipboard unavailable');
+            try {
+                textarea.select();
+                if (!document.execCommand('copy')) throw new Error('clipboard unavailable');
+            } finally {
+                textarea.value = '';
+                textarea.remove();
+            }
         }
         window.alert(`✅ ${label} 已复制到剪贴板`);
+        return true;
     } catch (_) {
         window.alert(`复制 ${label} 失败，请检查浏览器剪贴板权限`);
+        return false;
     }
 }
 
@@ -3311,6 +3811,7 @@ window.copyToken = function(id) {
 };
 
 function copyHistoryRefreshToken(id) {
+    if (terminalHistoryAccount(historyAccounts.find(account => account.id === String(id)))) return;
     copySecret(historyRefreshTokens.get(String(id)) || '', 'Refresh Token');
 }
 
@@ -3340,6 +3841,7 @@ exportBtn.addEventListener('click', () => {
             },
             extra: {
                 email: r.Email,
+                codex_fingerprint_mode: 'full',
                 recovery: {
                     email: r.Email
                 }

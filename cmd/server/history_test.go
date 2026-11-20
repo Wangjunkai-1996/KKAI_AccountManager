@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -257,5 +258,51 @@ func TestRunWithHistoryAccountRejectsDeletedIdentity(t *testing.T) {
 	}
 	if _, err = history.GetAccount(ctx, account.Email); !errors.Is(err, store.ErrAccountNotFound) {
 		t.Fatalf("stale history login recreated account: %v", err)
+	}
+}
+
+func TestHistoryLoginRejectsRetainedDeletedAccount(t *testing.T) {
+	history := newTestHistory(t)
+	ctx := context.Background()
+	account, attempt, err := history.BeginAttempt(ctx, store.Credentials{Email: "deleted-history@example.test", Password: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.FinishAttempt(ctx, attempt.ID, false, nil, &store.Failure{Code: "account_deleted", AccountStatus: "deleted"}); err != nil {
+		t.Fatal(err)
+	}
+	attempt.Release()
+	request := httptest.NewRequest(http.MethodPost, "/api/history/login", strings.NewReader(`{"account_id":`+itoa(account.ID)+`}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handleHistoryLogin(nil)(response, request)
+	if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), `"code":"account_not_found"`) {
+		t.Fatalf("deleted history login = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestHistoryReloginRejectsChangedIssuerSubject(t *testing.T) {
+	history := newTestHistory(t)
+	ctx := context.Background()
+	req := LoginRequest{Email: "issuer@example.test", Password: "pw"}
+	// These fixture tokens come from the mocked login runner.
+	token := func(subject string) string {
+		return "e30." + base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"https://issuer.example","sub":"`+subject+`"}`)) + ".sig"
+	}
+	first, err := runWithHistory(ctx, req, func(context.Context) (*login.LoginResult, error) {
+		return &login.LoginResult{Email: req.Email, AccessToken: token("one"), RefreshToken: "old", PlanType: "plus"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = runWithHistoryAccount(ctx, first.AccountID, req, func(context.Context) (*login.LoginResult, error) {
+		return &login.LoginResult{Email: req.Email, AccessToken: token("two"), RefreshToken: "other", PlanType: "free"}, nil
+	})
+	if err == nil {
+		t.Fatal("different issuer subject was accepted")
+	}
+	_, saved, err := history.GetOAuthResultByID(ctx, first.AccountID)
+	if err != nil || saved.PlanType != "plus" || saved.RefreshToken != "old" {
+		t.Fatalf("original account credentials changed: err=%v", err)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +38,10 @@ type sub2ImportService struct {
 	wg             sync.WaitGroup
 	statusMu       sync.Mutex
 	statusCache    map[int64]sub2DetailCacheEntry
+	nameCache      map[string]sub2DisplayName
+	costMu         sync.Mutex
+	costCache      map[int64]sub2CostCacheEntry
+	costSlots      chan struct{}
 }
 
 // The history page polls frequently. Cache successful read-only detail
@@ -178,15 +183,23 @@ type sub2DataImportData struct {
 }
 
 type sub2DataAccount struct {
-	Name               string         `json:"name"`
-	Platform           string         `json:"platform"`
-	Type               string         `json:"type"`
-	Credentials        map[string]any `json:"credentials"`
-	Extra              map[string]any `json:"extra,omitempty"`
-	Concurrency        int            `json:"concurrency"`
-	Priority           int            `json:"priority"`
-	RateMultiplier     int            `json:"rate_multiplier"`
-	AutoPauseOnExpired bool           `json:"auto_pause_on_expired"`
+	Name               string              `json:"name"`
+	Platform           string              `json:"platform"`
+	Type               string              `json:"type"`
+	Credentials        map[string]any      `json:"credentials"`
+	Extra              map[string]any      `json:"extra,omitempty"`
+	Concurrency        int                 `json:"concurrency"`
+	Priority           int                 `json:"priority"`
+	RateMultiplier     int                 `json:"rate_multiplier"`
+	AutoPauseOnExpired bool                `json:"auto_pause_on_expired"`
+	EgressMode         string              `json:"egress_mode,omitempty"`
+	EgressPool         *sub2DataEgressPool `json:"egress_pool,omitempty"`
+}
+
+type sub2DataEgressPool struct {
+	RouteKeys            []string `json:"route_keys"`
+	PrimaryRouteKey      string   `json:"primary_route_key"`
+	ConcurrencyPerEgress int      `json:"concurrency_per_egress"`
 }
 
 type sub2ImportEnvelope struct {
@@ -203,6 +216,9 @@ type sub2CreateDataResult struct {
 		Name    string `json:"name"`
 		Message string `json:"message"`
 	} `json:"errors"`
+	Warnings []struct {
+		Code string `json:"code"`
+	} `json:"warnings"`
 }
 
 func newOperationID() (string, error) {
@@ -229,6 +245,16 @@ func (s *sub2ImportService) buildPayloadWithOperation(accountID int64, operation
 	if err := opt.ValidateForImport(); err != nil {
 		return nil, "", "", err
 	}
+	var routes []resolvedEgressRoute
+	if len(opt.EgressRouteIDs) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var err error
+		routes, err = s.resolveEgressRoutes(ctx, opt.EgressRouteIDs)
+		if err != nil {
+			return nil, "", "", err
+		}
+	}
 	email, result, err := s.store.GetOAuthResultByID(context.Background(), accountID)
 	if err != nil {
 		return nil, "", "", err
@@ -250,7 +276,8 @@ func (s *sub2ImportService) buildPayloadWithOperation(accountID int64, operation
 		"expires_at":         result.ExpiresAt,
 	}
 	extra := map[string]any{
-		"email": email,
+		"email":                  email,
+		"codex_fingerprint_mode": "full",
 		"kkai_auth_import": map[string]any{
 			"source_instance_id": strings.TrimSpace(os.Getenv("AUTH_INSTANCE_ID")),
 			"source_account_id":  accountID,
@@ -258,14 +285,28 @@ func (s *sub2ImportService) buildPayloadWithOperation(accountID int64, operation
 			"target_group_ids":   opt.GroupIDs,
 		},
 	}
+	account := sub2DataAccount{
+		Name: name, Platform: "openai", Type: "oauth", Credentials: credentials, Extra: extra,
+		Concurrency: opt.Concurrency, Priority: opt.Priority, RateMultiplier: 1, AutoPauseOnExpired: true,
+	}
+	version := 1
+	if len(routes) > 0 {
+		keys := make([]string, len(routes))
+		for i, route := range routes {
+			keys[i] = route.RouteKey
+		}
+		version = 2
+		account.EgressMode = "pool"
+		account.EgressPool = &sub2DataEgressPool{
+			RouteKeys: keys, PrimaryRouteKey: keys[0], ConcurrencyPerEgress: opt.Concurrency,
+		}
+		extra["kkai_auth_import"].(map[string]any)["target_route_ids"] = append([]int64(nil), opt.EgressRouteIDs...)
+	}
 	request := sub2DataImportRequest{
 		SkipDefaultGroupBind: true,
 		Data: sub2DataImportData{
-			Type: "sub2api-data", Version: 1, Proxies: []any{},
-			Accounts: []sub2DataAccount{{
-				Name: name, Platform: "openai", Type: "oauth", Credentials: credentials, Extra: extra,
-				Concurrency: opt.Concurrency, Priority: opt.Priority, RateMultiplier: 1, AutoPauseOnExpired: true,
-			}},
+			Type: "sub2api-data", Version: version, Proxies: []any{},
+			Accounts: []sub2DataAccount{account},
 		},
 	}
 	payload, err := json.Marshal(request)
@@ -288,7 +329,10 @@ func (s *sub2ImportService) runOnce(ctx context.Context) {
 	if len(cleanupTasks) > 0 {
 		lease, leaseErr := s.store.AcquireAccountRecovery(ctx, cleanupTasks[0].AccountID)
 		if leaseErr == nil {
-			_ = s.deleteDeletedAccountWithLease(ctx, lease, cleanupTasks[0].AccountID, cleanupTasks[0].CredentialVersion)
+			task := cleanupTasks[0]
+			if err := s.deleteDeletedAccountWithLease(ctx, lease, task.AccountID, task.CredentialVersion, task); err != nil {
+				s.markSub2CleanupPending(ctx, task, err)
+			}
 			lease.Release()
 			return
 		}
@@ -306,6 +350,29 @@ func (s *sub2ImportService) runOnce(ctx context.Context) {
 }
 
 func (s *sub2ImportService) processQueued(ctx context.Context, task store.Sub2Import) error {
+	current, err := s.store.GetSub2ImportByID(ctx, task.ID)
+	if err != nil {
+		return err
+	}
+	if current.State == store.Sub2RemoteMissing {
+		return store.ErrSub2AccountMissing
+	}
+	if current.OperationID != task.OperationID {
+		return store.ErrAccountRecoveryStale
+	}
+	account, err := s.store.GetAccountByID(ctx, task.AccountID)
+	if err != nil {
+		return err
+	}
+	if err := account.Sub2EligibilityError(); err != nil {
+		return err
+	}
+	if !store.IsSub2PaidPlan(account.PlanType) {
+		return store.ErrSub2PlanIneligible
+	}
+	if err := s.importMissing(ctx, task.AccountID); err != nil {
+		return err
+	}
 	if task.DestinationKey != s.destinationKey {
 		return &recoveryOperationError{Code: "configuration", RequiresAction: true}
 	}
@@ -322,16 +389,16 @@ func (s *sub2ImportService) processQueued(ctx context.Context, task store.Sub2Im
 			return err
 		}
 	}
-	if err := s.store.MarkSub2ImportSendingForVersion(ctx, task.ID, task.CredentialVersion); err != nil {
+	if err := s.store.MarkSub2ImportSendingForOperation(ctx, task); err != nil {
 		return err
 	}
 	if currentVersion, err = s.store.GetAccountCredentialVersion(ctx, task.AccountID); err != nil || currentVersion != task.CredentialVersion {
-		_ = s.store.UpdateSub2Import(ctx, task.ID, "queued", false, 0, "登录凭据版本已变化，已等待刷新导入任务")
+		_ = s.store.UpdateSub2ImportForOperation(ctx, task, "queued", false, 0, "登录凭据版本已变化，已等待刷新导入任务")
 		return errors.New("登录凭据版本已变化，阻止旧导入任务发送")
 	}
 	payload, err := s.store.GetSub2ImportPayload(ctx, task.ID)
 	if err != nil {
-		_ = s.store.UpdateSub2Import(ctx, task.ID, "failed", false, 0, "读取导入任务失败")
+		_ = s.store.UpdateSub2ImportForOperation(ctx, task, "failed", false, 0, "读取导入任务失败")
 		return err
 	}
 	status, response, err := s.postImport(ctx, task, payload)
@@ -340,12 +407,12 @@ func (s *sub2ImportService) processQueued(ctx context.Context, task store.Sub2Im
 		if status >= 400 && status < 500 {
 			state = "failed"
 		}
-		_ = s.store.UpdateSub2Import(ctx, task.ID, state, false, 0, err.Error())
+		_ = s.store.UpdateSub2ImportForOperation(ctx, task, state, false, 0, err.Error())
 		return err
 	}
 	if response.Code != 0 {
 		failure := &recoveryOperationError{Code: "request_rejected", RequiresAction: true}
-		_ = s.store.UpdateSub2Import(ctx, task.ID, "failed", false, 0, failure.Error())
+		_ = s.store.UpdateSub2ImportForOperation(ctx, task, "failed", false, 0, failure.Error())
 		return failure
 	}
 	var result sub2CreateDataResult
@@ -354,16 +421,35 @@ func (s *sub2ImportService) processQueued(ctx context.Context, task store.Sub2Im
 	}
 	if result.AccountFailed > 0 || result.AccountCreated < 1 {
 		failure := &recoveryOperationError{Code: "request_rejected", RequiresAction: true}
-		_ = s.store.UpdateSub2Import(ctx, task.ID, "failed", false, 0, failure.Error())
+		_ = s.store.UpdateSub2ImportForOperation(ctx, task, "failed", false, 0, failure.Error())
 		return failure
 	}
-	_ = s.store.UpdateSub2Import(ctx, task.ID, "confirming", true, 0, "")
+	if len(result.Warnings) > 0 {
+		var request sub2DataImportRequest
+		if json.Unmarshal(payload, &request) == nil && len(request.Data.Accounts) == 1 && request.Data.Accounts[0].EgressPool != nil {
+			for _, warning := range result.Warnings {
+				if warning.Code == "EGRESS_POOL_NOT_RESTORED" {
+					failure := &recoveryOperationError{Code: "egress_mismatch", RequiresAction: true}
+					_ = s.store.UpdateSub2ImportForOperation(ctx, task, "unknown", true, 0, failure.Error())
+					return failure
+				}
+			}
+		}
+	}
+	_ = s.store.UpdateSub2ImportForOperation(ctx, task, "confirming", true, 0, "")
 	return s.reconcile(ctx, task.ID)
 }
 
 // refreshSub2ImportCredentials keeps the original operation marker and
 // display/options payload while replacing only the OAuth snapshot.
 func (s *sub2ImportService) refreshSub2ImportCredentials(ctx context.Context, task store.Sub2Import) error {
+	account, err := s.store.GetAccountByID(ctx, task.AccountID)
+	if err != nil {
+		return err
+	}
+	if err := account.Sub2EligibilityError(); err != nil {
+		return err
+	}
 	payload, err := s.store.GetSub2ImportPayload(ctx, task.ID)
 	if err != nil {
 		return err
@@ -375,6 +461,9 @@ func (s *sub2ImportService) refreshSub2ImportCredentials(ctx context.Context, ta
 	email, result, err := s.store.GetOAuthResultByID(ctx, task.AccountID)
 	if err != nil {
 		return err
+	}
+	if !store.IsSub2PaidPlan(result.PlanType) {
+		return store.ErrSub2PlanIneligible
 	}
 	request.Data.Accounts[0].Credentials = map[string]any{
 		"access_token": result.AccessToken, "refresh_token": result.RefreshToken,
@@ -439,6 +528,9 @@ type sub2ListResponse struct {
 // current remote account state. A failed lookup is marked stale/unknown so a
 // transient management API failure cannot be mistaken for a deleted account.
 type sub2AccountStatus struct {
+	Name                    string     `json:"name,omitempty"`
+	NameSource              string     `json:"name_source,omitempty"`
+	NameStale               bool       `json:"name_stale"`
 	Exists                  bool       `json:"exists"`
 	Imported                bool       `json:"imported"`
 	Sub2AccountID           int64      `json:"sub2_account_id,omitempty"`
@@ -523,6 +615,28 @@ func (s *sub2ImportService) syncAccountStatuses(ctx context.Context) ([]store.Su
 	needsDiscovery := false
 	for _, account := range accounts {
 		task, bound := bindings[account.ID]
+		if account.IsTerminalUnavailable() && !bound {
+			status := "deleted"
+			if !account.IsOfficialUnavailable() {
+				status = "discarded"
+			}
+			statuses[account.ID] = sub2AccountStatus{CheckedAt: checkedAt, Status: status, AssociationStatus: "unmatched"}
+			continue
+		}
+		if bound && task.State == store.Sub2RemoteMissing {
+			statuses[account.ID] = missingSub2Status(task, checkedAt)
+			continue
+		}
+		if !bound {
+			missing, readErr := s.store.Sub2AccountMissing(ctx, s.destinationKey, account.ID)
+			if readErr != nil {
+				return nil, nil, readErr
+			}
+			if missing {
+				statuses[account.ID] = missingSub2Status(task, checkedAt)
+				continue
+			}
+		}
 		needsDiscovery = needsDiscovery || !bound
 		statuses[account.ID] = sub2AccountStatus{Imported: task.State == "imported", Sub2AccountID: task.Sub2AccountID,
 			CheckedAt: checkedAt, Unknown: true, Stale: true, Error: "Sub2 状态查询未完成"}
@@ -546,7 +660,21 @@ func (s *sub2ImportService) syncAccountStatuses(ctx context.Context) ([]store.Su
 				task, bound := bindings[account.ID]
 				mu.Unlock()
 				var snapshot sub2AccountStatus
+				mu.Lock()
+				stopped := statuses[account.ID].AssociationStatus == "missing"
+				mu.Unlock()
+				if stopped {
+					snapshot = missingSub2Status(task, checkedAt)
+					s.attachDisplayName(ctx, account, task, &snapshot)
+					mu.Lock()
+					statuses[account.ID] = snapshot
+					mu.Unlock()
+					continue
+				}
 				if !bound {
+					if account.IsTerminalUnavailable() {
+						continue
+					}
 					linkErr := discoveryErr
 					if linkErr == nil {
 						task, linkErr = s.linkExistingAccount(ctx, account, candidates)
@@ -573,14 +701,21 @@ func (s *sub2ImportService) syncAccountStatuses(ctx context.Context) ([]store.Su
 					} else {
 						snapshot = sub2AccountStatus{CheckedAt: checkedAt, Unknown: true, Stale: true, Error: "Sub2 账号尚未完成核对"}
 					}
+					if snapshot.AssociationStatus == "missing" {
+						task.State = store.Sub2RemoteMissing
+						mu.Lock()
+						bindings[account.ID] = task
+						mu.Unlock()
+					}
 					snapshot.Imported = task.State == "imported"
-					if snapshot.Imported {
+					if snapshot.Imported && snapshot.AssociationStatus != "missing" {
 						snapshot.AssociationStatus = "imported"
 						if strings.HasPrefix(task.OperationID, "linked-") {
 							snapshot.AssociationStatus = "linked"
 						}
 					}
 				}
+				s.attachDisplayName(ctx, account, task, &snapshot)
 				mu.Lock()
 				statuses[account.ID] = snapshot
 				mu.Unlock()
@@ -597,6 +732,7 @@ send:
 	}
 	close(jobs)
 	wg.Wait()
+	s.attachSub2Usage(ctx, statuses)
 	imports := make([]store.Sub2Import, 0, len(bindings))
 	for _, account := range accounts {
 		if task, ok := bindings[account.ID]; ok {
@@ -638,6 +774,12 @@ func (s *sub2ImportService) listOAuthAccounts(ctx context.Context) ([]map[string
 }
 
 func (s *sub2ImportService) linkExistingAccount(ctx context.Context, account store.Account, candidates []map[string]any) (store.Sub2Import, error) {
+	if err := account.Sub2EligibilityError(); err != nil {
+		return store.Sub2Import{}, err
+	}
+	if !store.IsSub2PaidPlan(account.PlanType) {
+		return store.Sub2Import{}, store.ErrSub2PlanIneligible
+	}
 	var match map[string]any
 	var conflictingIdentity bool
 	for _, candidate := range candidates {
@@ -700,6 +842,10 @@ func (s *sub2ImportService) listSub2AccountStatuses(ctx context.Context, imports
 		}
 		// Include acknowledged tasks as well, so an import that is waiting for
 		// reconciliation remains visible in the history response.
+		if current, err := s.store.GetSub2Import(ctx, s.destinationKey, task.AccountID); err == nil && current.State == store.Sub2RemoteMissing {
+			statuses[task.AccountID] = missingSub2Status(current, checkedAt)
+			continue
+		}
 		status := sub2AccountStatus{Imported: task.State == "imported", Sub2AccountID: task.Sub2AccountID, CheckedAt: checkedAt}
 		status.Unknown, status.Stale, status.Error = true, true, "Sub2 状态查询未完成"
 		statuses[task.AccountID] = status
@@ -758,16 +904,30 @@ send:
 func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, checkedAt time.Time, accounts ...store.Account) sub2AccountStatus {
 	status := sub2AccountStatus{Sub2AccountID: id, CheckedAt: checkedAt}
 	var detail map[string]any
-	var code int
-	var err error
+	bindings, err := s.bindingsForRemoteID(ctx, id)
+	if err != nil {
+		status.Unknown, status.Stale, status.Error = true, true, "Sub2 绑定读取失败"
+		return status
+	}
+	for _, binding := range bindings {
+		if binding.State == store.Sub2RemoteMissing {
+			return missingSub2Status(binding, checkedAt)
+		}
+	}
 	if sub2StatusCacheEnabled(ctx) {
-		detail, code, err = s.cachedSub2AccountDetail(ctx, id)
+		detail, _, err = s.cachedSub2AccountDetail(ctx, id)
 	} else {
-		code, err = s.apiJSONStatus(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(id, 10), nil, &detail)
+		_, err = s.apiJSONStatus(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(id, 10), nil, &detail)
 	}
 	if err != nil {
-		if code == http.StatusNotFound {
-			s.recordSub2NotFoundLifecycle(ctx, id, accounts...)
+		if isSub2NotFound(err) {
+			for _, binding := range bindings {
+				if missingErr := s.markBindingRemoteMissing(ctx, binding); missingErr != nil {
+					status.Unknown, status.Stale, status.Error = true, true, "Sub2 缺失状态保存失败"
+					return status
+				}
+			}
+			status.AssociationStatus = "missing"
 			status.Exists = false
 			status.Error = "Sub2 账号不存在"
 			return status
@@ -785,13 +945,26 @@ func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, che
 	}
 	for _, account := range accounts {
 		binding, bindingErr := s.store.GetSub2Import(ctx, s.destinationKey, account.ID)
-		if bindingErr != nil || binding.Sub2AccountID != id || verifySub2RecoveryIdentity(detail, id, account.ID, account, binding) != nil {
+		if bindingErr == nil && binding.State == store.Sub2RemoteMissing {
+			return missingSub2Status(binding, checkedAt)
+		}
+		sameOperation := false
+		for _, before := range bindings {
+			if before.ID == binding.ID && before.OperationID == binding.OperationID {
+				sameOperation = true
+				break
+			}
+		}
+		if bindingErr != nil || !sameOperation || binding.Sub2AccountID != id || verifySub2RecoveryIdentity(detail, id, account.ID, account, binding) != nil {
 			status.Unknown, status.Stale = true, true
 			status.Error = "Sub2 账号身份与 AUTH 绑定不一致"
 			return status
 		}
 	}
 	status.Exists = true
+	if len(accounts) > 0 {
+		status.Name, _ = detail["name"].(string)
+	}
 	status.Status, _ = detail["status"].(string)
 	status.ErrorMessage, _ = detail["error_message"].(string)
 	status.RateLimitedAt = detail["rate_limited_at"]
@@ -820,51 +993,6 @@ func (s *sub2ImportService) sub2AccountStatus(ctx context.Context, id int64, che
 		status.EffectiveSchedulable = &effective
 	}
 	return status
-}
-
-// recordSub2NotFoundLifecycle persists a deletion observation only when the
-// remote ID belongs to an explicit AUTH/Sub2 binding. A missing or ambiguous
-// association is deliberately left as unknown and must not become deletion
-// evidence.
-func (s *sub2ImportService) recordSub2NotFoundLifecycle(ctx context.Context, sub2ID int64, accounts ...store.Account) {
-	if s == nil || s.store == nil || sub2ID <= 0 {
-		return
-	}
-	if len(accounts) == 0 {
-		imports, err := s.store.ListSub2ImportStatuses(ctx)
-		if err != nil {
-			return
-		}
-		for _, task := range imports {
-			if task.DestinationKey != s.destinationKey || task.Sub2AccountID != sub2ID || task.AccountID <= 0 {
-				continue
-			}
-			account, accountErr := s.store.GetAccountByID(ctx, task.AccountID)
-			if accountErr == nil {
-				s.recordSub2NotFoundLifecycle(ctx, sub2ID, account)
-			}
-		}
-		return
-	}
-	for _, account := range accounts {
-		if account.ID <= 0 || strings.TrimSpace(account.Email) == "" {
-			continue
-		}
-		task, err := s.store.GetSub2Import(ctx, s.destinationKey, account.ID)
-		if err != nil || task.Sub2AccountID != sub2ID || task.Sub2AccountID <= 0 {
-			continue
-		}
-		_, _ = s.store.RecordLifecycleEvent(ctx, store.LifecycleEvent{
-			AccountID:  account.ID,
-			Email:      account.Email,
-			Source:     "sub2",
-			Status:     "deleted",
-			Reason:     "Sub2 账号不存在",
-			Code:       "not_found",
-			HTTPStatus: http.StatusNotFound,
-			DedupeKey:  fmt.Sprintf("sub2:%s:%d:not_found", s.destinationKey, sub2ID),
-		})
-	}
 }
 
 func (s *sub2ImportService) cachedSub2AccountDetail(ctx context.Context, id int64) (map[string]any, int, error) {
@@ -1305,6 +1433,12 @@ func (s *sub2ImportService) apiJSONStatus(ctx context.Context, method, path stri
 	if err != nil {
 		return response.StatusCode, err
 	}
+	if method == http.MethodGet && response.StatusCode == http.StatusNotFound && isSub2AccountDetailPath(path) {
+		if trustedSub2NotFound(path, response.Header.Get("Content-Type"), body) {
+			return response.StatusCode, &sub2NotFoundError{}
+		}
+		return response.StatusCode, &recoveryOperationError{Code: "protocol_error", HTTPStatus: response.StatusCode}
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return response.StatusCode, recoveryHTTPError(response.StatusCode, recoveryRetryAfter(response.Header.Get("Retry-After")))
 	}
@@ -1352,18 +1486,13 @@ func (s *sub2ImportService) deleteDeletedAccount(ctx context.Context, accountID,
 		if err != nil {
 			return err
 		}
-		if account.Status == "deleted" {
+		if expectedCredentialAttemptID > 0 && account.IsOfficialUnavailable() {
 			return s.store.FinalizeDeletedAccount(ctx, accountID)
 		}
 		return nil
 	}
 	lease, err := s.store.AcquireAccountRecovery(ctx, accountID)
 	if err != nil {
-		if errors.Is(err, store.ErrAccountBusy) {
-			if task, taskErr := s.store.GetSub2Import(ctx, s.destinationKey, accountID); taskErr == nil && task.State == "imported" {
-				s.markSub2CleanupPending(ctx, task, err)
-			}
-		}
 		return err
 	}
 	defer lease.Release()
@@ -1382,114 +1511,181 @@ func accountDeactivationConfirmed(code string) bool {
 // deleteDeletedAccountWithLease is used by recovery flows that already hold
 // the account recovery lease. The caller must keep that lease until this
 // method returns.
-func (s *sub2ImportService) deleteDeletedAccountWithLease(ctx context.Context, lease *store.AccountRecoveryLease, accountID, expectedCredentialAttemptID int64) error {
+func (s *sub2ImportService) deleteDeletedAccountWithLease(ctx context.Context, lease *store.AccountRecoveryLease, accountID, expectedCredentialAttemptID int64, frozen ...store.Sub2Import) error {
 	if s == nil || !s.configured() || lease == nil || accountID <= 0 {
 		return nil
 	}
+	if expectedCredentialAttemptID <= 0 {
+		return store.ErrAccountRecoveryVersionChanged
+	}
 	task, err := s.store.GetSub2Import(ctx, s.destinationKey, accountID)
-	if errors.Is(err, store.ErrSub2ImportNotFound) {
-		account, accountErr := s.store.GetAccountByID(ctx, accountID)
-		if errors.Is(accountErr, store.ErrAccountNotFound) {
-			return nil
-		}
-		if accountErr != nil {
-			return accountErr
-		}
-		if account.Status == "deleted" {
-			return s.store.FinalizeDeletedAccount(ctx, accountID)
-		}
+	if errors.Is(err, store.ErrSub2ImportNotFound) && len(frozen) == 0 {
 		return nil
 	}
-	if err != nil || (task.State != "imported" && task.State != "cleanup_pending") || task.Sub2AccountID <= 0 {
-		return err
-	}
-	currentVersion, err := s.store.GetAccountCredentialVersion(ctx, accountID)
 	if err != nil {
 		return err
+	}
+	if len(frozen) > 0 && !sameCleanupBinding(task, frozen[0]) {
+		return store.ErrAccountRecoveryStale
+	}
+	if task.State == store.Sub2RemoteMissing {
+		return nil
+	}
+	if task.State != "cleanup_pending" && task.State != "imported" || task.Sub2AccountID <= 0 || task.OperationID == "" {
+		return store.ErrAccountRecoveryStale
+	}
+	if task.CredentialVersion != expectedCredentialAttemptID {
+		return store.ErrAccountRecoveryVersionChanged
 	}
 	account, err := s.store.GetAccountByID(ctx, accountID)
-	if errors.Is(err, store.ErrAccountNotFound) {
-		return nil
-	}
 	if err != nil {
 		return err
 	}
-	// A later successful login supersedes a pending deletion intent. Restore
-	// the verified binding and let the normal delivery/recovery path update it;
-	// never delete a remote account using an obsolete credential observation.
-	if task.State == "cleanup_pending" && currentVersion != task.CredentialVersion {
-		if account.Status == "active" {
-			_ = s.store.UpdateSub2Import(ctx, task.ID, "imported", true, task.Sub2AccountID, "新的登录结果已取代待清理任务")
+	var checkEvidence func(context.Context, store.Sub2Import) (bool, error)
+	free := account.IsFreeLocal() && !account.IsTerminalUnavailable()
+	switch {
+	case free:
+		checkEvidence = s.store.HasFreeSub2CleanupEvidence
+	case account.IsOfficialUnavailable():
+		checkEvidence = s.store.HasOfficialSub2CleanupEvidence
+	case account.IsTerminalUnavailable():
+		checkEvidence = s.store.HasDiscardedSub2CleanupEvidence
+	default:
+		return store.ErrAccountRecoveryStale
+	}
+	if authorized, err := checkEvidence(ctx, task); err != nil {
+		return err
+	} else if !authorized {
+		return store.ErrAccountRecoveryStale
+	}
+	workspace, err := s.store.Sub2CleanupWorkspace(ctx, task, free)
+	if err != nil {
+		return err
+	}
+	path := "/admin/accounts/" + strconv.FormatInt(task.Sub2AccountID, 10)
+	var writeErr error
+	var pausedRevision time.Time
+	lastPhase := ""
+	for {
+		var detail map[string]any
+		status, err := s.apiJSONStatus(ctx, http.MethodGet, path, nil, &detail)
+		if isSub2NotFound(err) {
+			if authorized, err := checkEvidence(ctx, task); err != nil {
+				return err
+			} else if !authorized {
+				return store.ErrAccountRecoveryStale
+			}
+			return s.finishDeletedSub2Binding(ctx, account, task, status)
 		}
-		return errors.New("登录凭据版本已变化，跳过待清理任务")
-	}
-	if task.State != "cleanup_pending" && currentVersion != expectedCredentialAttemptID {
-		return errors.New("检测使用的凭据版本已变化，跳过删除")
-	}
-	var detail map[string]any
-	status, err := s.apiJSONStatus(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(task.Sub2AccountID, 10), nil, &detail)
-	if status == http.StatusNotFound {
-		return s.finishDeletedSub2Binding(ctx, account, task)
-	}
-	if err != nil {
-		if status == 0 || status >= 500 {
-			s.markSub2CleanupPending(ctx, task, err)
+		if writeErr != nil {
+			return writeErr
 		}
-		return err
-	}
-	if err := verifySub2RecoveryIdentity(detail, task.Sub2AccountID, accountID, account, task); err != nil {
-		_ = s.store.UpdateSub2Import(ctx, task.ID, "cleanup_manual", true, task.Sub2AccountID, "Sub2 账号身份核对失败，需要人工确认")
-		return err
-	}
-	// The remote GET and DELETE are separate calls. Re-read the local
-	// association before the destructive call so a concurrent relink/requeue
-	// cannot make this stale deletion target a newly assigned account.
-	latest, err := s.store.GetSub2Import(ctx, s.destinationKey, accountID)
-	if err != nil {
-		return err
-	}
-	if latest.ID != task.ID || (latest.State != "imported" && latest.State != "cleanup_pending") || latest.Sub2AccountID != task.Sub2AccountID || latest.OperationID != task.OperationID {
-		_ = s.store.UpdateSub2Import(ctx, task.ID, "cleanup_manual", true, task.Sub2AccountID, "Sub2 绑定在删除前发生变化，需要人工确认")
-		return errors.New("Sub2 绑定在删除前发生变化")
-	}
-	status, err = s.apiJSONStatus(ctx, http.MethodDelete, "/admin/accounts/"+strconv.FormatInt(task.Sub2AccountID, 10), nil, nil)
-	if status == http.StatusNotFound {
-		return s.finishDeletedSub2Binding(ctx, account, task)
-	}
-	if err != nil {
-		if status == 0 || status >= 500 {
-			s.markSub2CleanupPending(ctx, task, err)
+		if err != nil {
+			return err
 		}
-		return err
+		if lastPhase == "delete" {
+			return &recoveryOperationError{Code: "checkpoint_unconfirmed"}
+		}
+		account.ChatGPTAccountID = workspace
+		extra, _ := detail["extra"].(map[string]any)
+		_, hasMarker := extra["kkai_auth_import"]
+		owned := matchesImportMarker(detail, task) || !hasMarker && strings.HasPrefix(task.OperationID, "linked-")
+		if detail["parent_account_id"] != nil || fmt.Sprint(extra["synthetic_ui_test"]) == "true" || workspace == "" || verifySub2AccountIdentity(detail, task.Sub2AccountID, accountID, account) != nil || !owned {
+			return store.ErrAccountRecoveryStale
+		}
+		stamp, _ := detail["updated_at"].(string)
+		parsed, err := time.Parse(time.RFC3339Nano, stamp)
+		scheduled, known := boolField(detail, "schedulable")
+		if err != nil || parsed.IsZero() || !known || lastPhase == "pause" && scheduled {
+			return &recoveryOperationError{Code: "protocol_error"}
+		}
+		if lastPhase == "pause" && !parsed.Equal(pausedRevision) {
+			return store.ErrAccountRecoveryStale
+		}
+		bindings, err := s.store.ListSub2ImportsForRemoteID(ctx, task.DestinationKey, task.Sub2AccountID)
+		if err != nil {
+			return err
+		}
+		if len(bindings) != 1 || !sameCleanupBinding(bindings[0], task) {
+			return store.ErrAccountRecoveryStale
+		}
+		if authorized, err := checkEvidence(ctx, task); err != nil {
+			return err
+		} else if !authorized {
+			return store.ErrAccountRecoveryStale
+		}
+		if scheduled {
+			lastPhase = "pause"
+			var paused struct {
+				ID          int64     `json:"id"`
+				Schedulable *bool     `json:"schedulable"`
+				UpdatedAt   time.Time `json:"updated_at"`
+			}
+			recovery := sub2RecoveryService{store: s.store, sub2: s}
+			writeErr = recovery.sub2JSONBody(ctx, http.MethodPost, path+"/schedulable", map[string]bool{"schedulable": false}, &paused)
+			if writeErr == nil && (paused.ID != task.Sub2AccountID || paused.Schedulable == nil || *paused.Schedulable || !paused.UpdatedAt.After(parsed)) {
+				writeErr = &recoveryOperationError{Code: "protocol_error"}
+			}
+			pausedRevision = paused.UpdatedAt
+			continue
+		}
+
+		// The standard DELETE cascades to Spark shadows. Check the paged
+		// account list before deleting so retirement only targets the bound ID.
+		accounts, err := s.listOAuthAccounts(ctx)
+		if err != nil {
+			return err
+		}
+		found := false
+		for _, item := range accounts {
+			if int64(toFloat(item["parent_account_id"])) == task.Sub2AccountID {
+				return store.ErrAccountRecoveryStale
+			}
+			if int64(toFloat(item["id"])) == task.Sub2AccountID {
+				found = true
+			}
+		}
+		if !found {
+			return store.ErrAccountRecoveryStale
+		}
+		if authorized, err := checkEvidence(ctx, task); err != nil {
+			return err
+		} else if !authorized {
+			return store.ErrAccountRecoveryStale
+		}
+		lastPhase = "delete"
+		writeErr = s.apiJSON(ctx, http.MethodDelete, path, nil, nil)
 	}
-	return s.finishDeletedSub2Binding(ctx, account, task)
+}
+
+func sameCleanupBinding(current, frozen store.Sub2Import) bool {
+	return current.ID == frozen.ID && current.AccountID == frozen.AccountID &&
+		current.DestinationKey == frozen.DestinationKey && current.Sub2AccountID == frozen.Sub2AccountID &&
+		current.OperationID == frozen.OperationID && current.CredentialVersion == frozen.CredentialVersion &&
+		current.State == frozen.State
 }
 
 func (s *sub2ImportService) markSub2CleanupPending(ctx context.Context, task store.Sub2Import, err error) {
 	if task.ID == 0 {
 		return
 	}
-	message := "Sub2 删除失败"
-	if err != nil {
-		message = err.Error()
+	message := "Sub2 退役尚未确认，后台将自动复查"
+	if errors.Is(err, store.ErrAccountRecoveryStale) || errors.Is(err, store.ErrAccountRecoveryVersionChanged) {
+		message = "账号退役证据与当前 Sub2 绑定或版本不一致，后台将自动复查"
 	}
-	version, versionErr := s.store.GetAccountCredentialVersion(ctx, task.AccountID)
-	if versionErr != nil {
-		return
-	}
-	_ = s.store.MarkSub2ImportCleanupPending(ctx, task.ID, version, task.Sub2AccountID, message)
+	_ = s.store.DeferFrozenSub2Cleanup(ctx, task, message)
 }
 
-func (s *sub2ImportService) finishDeletedSub2Binding(ctx context.Context, account store.Account, task store.Sub2Import) error {
-	if err := s.store.DeleteSub2ImportBinding(ctx, s.destinationKey, task.AccountID, task.Sub2AccountID, task.OperationID); err != nil {
-		s.markSub2CleanupPending(ctx, task, err)
+func (s *sub2ImportService) finishDeletedSub2Binding(ctx context.Context, _ store.Account, task store.Sub2Import, status int) error {
+	if status != http.StatusNotFound {
+		return &recoveryOperationError{Code: "checkpoint_unconfirmed"}
+	}
+	if err := s.store.MarkRetiredSub2AccountMissing(ctx, task); err != nil {
 		return err
 	}
-	if account.Status == "deleted" {
-		if err := s.store.FinalizeDeletedAccount(ctx, account.ID); err != nil && !errors.Is(err, store.ErrAccountNotFound) {
-			return err
-		}
-	}
+	s.statusMu.Lock()
+	delete(s.statusCache, task.Sub2AccountID)
+	s.statusMu.Unlock()
 	return nil
 }
 
@@ -1501,12 +1697,25 @@ func (s *sub2ImportService) reconcile(ctx context.Context, id int64) error {
 	if task.DestinationKey != s.destinationKey {
 		return &recoveryOperationError{Code: "configuration", RequiresAction: true}
 	}
+	if task.State == store.Sub2RemoteMissing {
+		return store.ErrSub2AccountMissing
+	}
+	account, err := s.store.GetAccountByID(ctx, task.AccountID)
+	if err != nil {
+		return err
+	}
+	if err := account.Sub2EligibilityError(); err != nil {
+		return err
+	}
+	if !store.IsSub2PaidPlan(account.PlanType) {
+		return store.ErrSub2PlanIneligible
+	}
 	if task.State == "imported" && task.Sub2AccountID > 0 {
 		return nil
 	}
 	items, err := s.listOAuthAccounts(ctx)
 	if err != nil {
-		_ = s.store.UpdateSub2Import(ctx, id, "unknown", task.CreateAcknowledged, 0, classifyRecoveryError(err).Error())
+		_ = s.store.UpdateSub2ImportForOperation(ctx, task, "unknown", task.CreateAcknowledged, 0, classifyRecoveryError(err).Error())
 		return err
 	}
 	candidates := make([]map[string]any, 0, len(items))
@@ -1520,7 +1729,7 @@ func (s *sub2ImportService) reconcile(ctx context.Context, id int64) error {
 		if len(candidates) > 1 {
 			message = "Sub2 找到多个同来源账号，已暂停自动确认"
 		}
-		_ = s.store.UpdateSub2Import(ctx, id, "unknown", task.CreateAcknowledged, 0, message)
+		_ = s.store.UpdateSub2ImportForOperation(ctx, task, "unknown", task.CreateAcknowledged, 0, message)
 		if len(candidates) > 1 {
 			return errSub2AmbiguousMatch
 		}
@@ -1533,15 +1742,58 @@ func (s *sub2ImportService) reconcile(ctx context.Context, id int64) error {
 	}
 	var detail map[string]any
 	if err := s.apiJSON(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(sub2ID, 10), nil, &detail); err != nil {
-		_ = s.store.UpdateSub2Import(ctx, id, "unknown", task.CreateAcknowledged, 0, err.Error())
+		_ = s.store.UpdateSub2ImportForOperation(ctx, task, "unknown", task.CreateAcknowledged, 0, err.Error())
 		return err
 	}
 	if int64(toFloat(detail["id"])) != sub2ID || !matchesImportMarker(detail, task) {
 		message := "Sub2 账号身份核对不一致，已暂停自动确认"
-		_ = s.store.UpdateSub2Import(ctx, id, "unknown", task.CreateAcknowledged, 0, message)
+		_ = s.store.UpdateSub2ImportForOperation(ctx, task, "unknown", task.CreateAcknowledged, 0, message)
 		return errSub2IdentityConflict
 	}
-	return s.store.UpdateSub2Import(ctx, id, "imported", true, sub2ID, "")
+	if err := s.verifyImportedEgress(ctx, task, detail); err != nil {
+		_ = s.store.UpdateSub2ImportForOperation(ctx, task, "unknown", true, sub2ID, classifyRecoveryError(err).Error())
+		return err
+	}
+	return s.store.UpdateSub2ImportForOperation(ctx, task, "imported", true, sub2ID, "")
+}
+
+// Only newly imported accounts carry the target route marker. Existing linked
+// accounts retain their administrator-managed egress configuration.
+func (s *sub2ImportService) verifyImportedEgress(ctx context.Context, task store.Sub2Import, detail map[string]any) error {
+	payload, err := s.store.GetSub2ImportPayload(ctx, task.ID)
+	if err != nil {
+		return err
+	}
+	var request sub2DataImportRequest
+	if err := json.Unmarshal(payload, &request); err != nil || len(request.Data.Accounts) != 1 {
+		return &recoveryOperationError{Code: "configuration", RequiresAction: true}
+	}
+	account := request.Data.Accounts[0]
+	marker, _ := account.Extra["kkai_auth_import"].(map[string]any)
+	rawIDs, selected := marker["target_route_ids"]
+	if !selected {
+		return nil
+	}
+	encodedIDs, err := json.Marshal(rawIDs)
+	if err != nil {
+		return &recoveryOperationError{Code: "configuration", RequiresAction: true}
+	}
+	var expectedIDs []int64
+	if json.Unmarshal(encodedIDs, &expectedIDs) != nil || len(expectedIDs) == 0 || account.EgressPool == nil {
+		return &recoveryOperationError{Code: "configuration", RequiresAction: true}
+	}
+	var actual struct {
+		RouteIDs             []int64 `json:"route_ids"`
+		PrimaryRouteID       int64   `json:"primary_route_id"`
+		ConcurrencyPerEgress int     `json:"concurrency_per_egress"`
+	}
+	encodedPool, err := json.Marshal(detail["egress_pool"])
+	if err != nil || json.Unmarshal(encodedPool, &actual) != nil ||
+		detail["egress_mode"] != "pool" || !slices.Equal(actual.RouteIDs, expectedIDs) ||
+		actual.PrimaryRouteID != expectedIDs[0] || actual.ConcurrencyPerEgress != account.EgressPool.ConcurrencyPerEgress {
+		return &recoveryOperationError{Code: "egress_mismatch", RequiresAction: true}
+	}
+	return nil
 }
 
 func matchesImportMarker(item map[string]any, task store.Sub2Import) bool {
@@ -1577,7 +1829,14 @@ func toFloat(value any) float64 {
 
 type sub2ImportRequest struct {
 	DeliveryOptions *store.DeliveryOptions `json:"delivery_options,omitempty"`
-	AccountIDs      []int64                `json:"account_ids"`
+	Reimport        bool                   `json:"reimport"`
+	// ExpectedCredentialVersion binds an explicit remote-missing reimport to
+	// the successful login that immediately preceded it.
+	ExpectedCredentialVersion int64 `json:"expected_credential_version,omitempty"`
+	// ExpectedImportOperationID binds it to the exact missing binding observed
+	// before the login, preventing delayed requests from reviving a later one.
+	ExpectedImportOperationID string  `json:"expected_import_operation_id,omitempty"`
+	AccountIDs                []int64 `json:"account_ids"`
 }
 
 func (s *sub2ImportService) handleImport(w http.ResponseWriter, r *http.Request) {
@@ -1609,12 +1868,22 @@ func (s *sub2ImportService) handleImport(w http.ResponseWriter, r *http.Request)
 		respondJSONStatus(w, 400, LoginResponse{Message: err.Error(), Code: "invalid_import_options"})
 		return
 	}
+	if request.Reimport && request.ExpectedCredentialVersion <= 0 {
+		respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: "重新导入必须绑定本次成功登录，请刷新后重试", Code: "reimport_credential_version_required"})
+		return
+	}
+	if request.Reimport && strings.TrimSpace(request.ExpectedImportOperationID) == "" {
+		respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: "重新导入必须绑定当前缺失关联，请刷新后重试", Code: "reimport_binding_required"})
+		return
+	}
 	if !s.workerMu.TryLock() {
 		respondJSONStatus(w, 409, LoginResponse{Message: "正在处理导入，请稍后重试"})
 		return
 	}
 	defer s.workerMu.Unlock()
 	created := make([]store.Sub2Import, 0, len(request.AccountIDs))
+	var reimportErr error
+	discarded := false
 	seen := make(map[int64]struct{}, len(request.AccountIDs))
 	for _, accountID := range request.AccountIDs {
 		if accountID <= 0 {
@@ -1628,7 +1897,11 @@ func (s *sub2ImportService) handleImport(w http.ResponseWriter, r *http.Request)
 		if err != nil {
 			continue
 		}
-		if account.Status != "active" {
+		if errors.Is(account.Sub2EligibilityError(), store.ErrAccountDiscarded) {
+			discarded = true
+			continue
+		}
+		if account.IsTerminalUnavailable() || account.Status != "active" {
 			continue
 		}
 		lease, err := s.store.AcquireAccountRecovery(r.Context(), accountID)
@@ -1636,6 +1909,18 @@ func (s *sub2ImportService) handleImport(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 		if _, active, checkErr := s.store.GetActiveAccountRecoveryTaskForDestination(r.Context(), accountID, s.destinationKey); checkErr != nil || active {
+			lease.Release()
+			continue
+		}
+		if request.Reimport {
+			if err := s.authorizeReimport(r.Context(), accountID, options, request.ExpectedCredentialVersion, request.ExpectedImportOperationID); err != nil {
+				reimportErr = err
+				lease.Release()
+				continue
+			}
+			if task, err := s.store.GetSub2Import(r.Context(), s.destinationKey, accountID); err == nil {
+				created = append(created, task)
+			}
 			lease.Release()
 			continue
 		}
@@ -1653,6 +1938,14 @@ func (s *sub2ImportService) handleImport(w http.ResponseWriter, r *http.Request)
 		lease.Release()
 	}
 	if len(created) == 0 {
+		if discarded {
+			respondJSONStatus(w, http.StatusGone, LoginResponse{Message: "账号已在本地退役", Code: "account_discarded"})
+			return
+		}
+		if request.Reimport && errors.Is(reimportErr, store.ErrAccountRecoveryStale) {
+			respondJSONStatus(w, http.StatusConflict, LoginResponse{Message: "登录资料已变化或重导入请求已失效，请重新登录后重试", Code: "reimport_credential_version_stale"})
+			return
+		}
 		respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: "没有可导入的认证成功账号", Code: "no_importable_accounts"})
 		return
 	}
@@ -1660,8 +1953,25 @@ func (s *sub2ImportService) handleImport(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *sub2ImportService) ensureTask(ctx context.Context, accountID int64, options ...store.DeliveryOptions) (store.Sub2Import, error) {
+	return s.ensureDeliveryTask(ctx, accountID, true, options...)
+}
+
+func (s *sub2ImportService) ensureDeliveryTask(ctx context.Context, accountID int64, allowCreate bool, options ...store.DeliveryOptions) (store.Sub2Import, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	account, err := s.store.GetAccountByID(ctx, accountID)
+	if err != nil {
+		return store.Sub2Import{}, err
+	}
+	if err := account.Sub2EligibilityError(); err != nil {
+		return store.Sub2Import{}, err
+	}
+	if !store.IsSub2PaidPlan(account.PlanType) {
+		return store.Sub2Import{}, store.ErrSub2PlanIneligible
+	}
+	if err := s.importMissing(ctx, accountID); err != nil {
+		return store.Sub2Import{}, err
+	}
 	if existing, err := s.store.GetSub2Import(ctx, s.destinationKey, accountID); err == nil {
 		version, versionErr := s.store.GetAccountCredentialVersion(ctx, accountID)
 		if versionErr != nil {
@@ -1689,9 +1999,8 @@ func (s *sub2ImportService) ensureTask(ctx context.Context, accountID int64, opt
 	} else if !errors.Is(err, store.ErrSub2ImportNotFound) {
 		return store.Sub2Import{}, err
 	}
-	account, err := s.store.GetAccountByID(ctx, accountID)
-	if err != nil {
-		return store.Sub2Import{}, err
+	if !allowCreate {
+		return store.Sub2Import{}, store.ErrSub2AccountMissing
 	}
 	candidates, err := s.listOAuthAccounts(ctx)
 	if err != nil {

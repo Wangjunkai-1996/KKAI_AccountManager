@@ -262,15 +262,31 @@ func (s *accountCheckService) finish(id, accountID int64, result store.AccountCh
 		}
 		cleanupCancel()
 	}
-	if !result.Canceled && batch.State != "stopping" && batch.State != "stopped" && accountID > 0 && accountRecoveryService != nil && recoveryCheckCandidate(result) {
+	// Missing bindings can cancel an individual in-flight check while its
+	// batch completes normally. Never enqueue from that superseded result.
+	committed := false
+	if _, checks, readErr := s.store.GetAccountCheckBatch(ctx, batch.ID); readErr == nil {
+		for _, check := range checks {
+			if check.ID == id && check.State == "finished" && check.Freshness == "current" {
+				committed = true
+				break
+			}
+		}
+	}
+	if committed && !result.Canceled && batch.State != "stopping" && batch.State != "stopped" && accountID > 0 && accountRecoveryService != nil && recoveryCheckCandidate(result) {
 		explicit, err := s.store.ExplicitRecoveryCheck(ctx, batch.ID)
 		if err == nil && explicit {
+			manual, claimed, claimErr := s.store.ClaimExplicitRecoveryCheck(ctx, batch.ID)
+			if claimErr != nil || !claimed {
+				s.notify()
+				return
+			}
 			// This single-account intent survives a page close or an unrelated
 			// change to the automatic switch. The shared enqueue path revalidates
 			// identity, state and credentials before any recovery mutation.
 			recoveryCtx, recoveryCancel := context.WithTimeout(accountRecoveryService.ctx, 10*time.Second)
 			if accountRecoveryService.remoteRecoverySuspect(recoveryCtx, accountID) {
-				if _, _, err := accountRecoveryService.enqueue(recoveryCtx, accountID); err != nil {
+				if _, _, err := accountRecoveryService.enqueueWithIntent(recoveryCtx, accountID, manual, false); err != nil {
 					accountRecoveryService.recordRecoveryEnqueueFailure(accountID)
 				}
 			} else {
@@ -510,6 +526,10 @@ func checkAPIError(w http.ResponseWriter, status int, code, message string) {
 }
 
 func (s *accountCheckService) respondError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, store.ErrAccountDiscarded) {
+		checkAPIError(w, http.StatusGone, "account_discarded", "账号已在本地退役")
+		return
+	}
 	if r.Context().Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		// A browser disconnect/timeout is not a storage failure and must not
 		// disable the independent background workers.

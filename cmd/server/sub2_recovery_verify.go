@@ -33,30 +33,55 @@ type recoveryOperationError struct {
 }
 
 func (e *recoveryOperationError) Error() string {
+	if e.Code == "account_discarded" {
+		return "账号已在本地退役，操作已停止"
+	}
 	messages := map[string]string{
 		"group_unavailable":  "所选 Sub2 分组已删除、停用或不支持 OpenAI，请重新选择",
 		"group_conflict":     "Sub2 当前分组与本批目标不一致，请选择保留当前分组或按目标分组修正",
+		"egress_mismatch":    "Sub2 出口配置与本批所选 IP 不一致，请人工核对",
+		"egress_unavailable": "账号在 Sub2 当前绑定的代理均不可用于登录，请检查代理后重试",
 		"import_unconfirmed": "尚未核对到 Sub2 创建结果；可重新核对，避免重复创建",
 		"network_error":      "网络暂不可用，稍后自动重试", "timeout": "请求超时，稍后自动重试",
 		"interrupted": "任务被中断，稍后自动核对", "rate_limited": "请求受到限流，等待后自动重试",
 		"upstream_error": "上游服务暂不可用，稍后自动重试", "probe_failed": "Sub2 检测未通过，稍后自动复查",
 		"protocol_error": "Sub2 响应未能确认，稍后自动核对", "credential_invalid": "新凭据已被上游明确拒绝，将重新登录",
 		"sub2_auth_rejected": "Sub2 管理认证失败，请检查管理密钥或权限", "account_missing": "原 Sub2 账号不存在，请核对绑定",
+		"sub2_account_missing": "Sub2 关联账号不存在，自动恢复已停止", "reimport_required": "Sub2 关联已移除，请明确重新导入",
 		"request_rejected": "Sub2 拒绝恢复请求，请核对接口配置", "configuration": "恢复服务配置不完整，请检查配置",
-		"account_unavailable": "上游明确报告账号停用或删除，请人工处理", "login_required": "登录需要人工处理，请检查账号信息或验证要求",
+		"account_unavailable": "账号当前不可用", "login_required": "登录需要人工处理，请检查账号信息或验证要求",
 		"login_failed": "登录暂未完成，稍后自动重试", "identity_changed": "账号身份或绑定发生变化，请人工核对",
+		"email_verification_required": "需要邮箱验证码，自动恢复已停止", "phone_verification_required": "需要手机/短信验证，自动恢复已停止",
+		"password_rejected": "密码错误，自动恢复已停止", "totp_rejected": "TOTP 验证码被拒绝，自动恢复已停止",
+		"verification_code_rejected": "验证码被拒绝，自动恢复已停止", "credentials_rejected": "登录凭据被拒绝，自动恢复已停止",
+		"auth_page_timeout": "认证页面暂未加载完成，稍后自动重试", "auth_page_timeout_exhausted": "本任务多次恢复失败且认证页面仍未完成，请人工核对",
 		"challenge":                  "认证站暂时要求浏览器验证，稍后自动重试",
 		"browser_runtime_permission": "浏览器运行环境权限不足，请联系管理员检查 Node 与驱动权限",
 		"manual_pause":               "账号已被人工暂停或禁用，保持原状态", "version_changed": "本地凭据版本已变化，请核对后继续",
 		"checkpoint_unconfirmed": "无法确认恢复检查点归属，请人工核对", "account_busy": "账号正在处理其他任务，稍后自动重试",
 	}
 	if message := messages[e.Code]; message != "" {
+		if e.RequiresAction {
+			switch e.Code {
+			case "network_error", "timeout", "interrupted", "rate_limited", "upstream_error", "probe_failed", "protocol_error", "credential_invalid", "login_failed", "auth_page_timeout", "challenge", "account_busy":
+				return strings.SplitN(message, "，", 2)[0] + "，自动重试已停止，可再次手动尝试"
+			}
+		}
 		return message
+	}
+	if accountDeactivationConfirmed(e.Code) {
+		return "上游确认账号已停用或删除"
 	}
 	return "恢复结果暂未确认，稍后自动核对"
 }
 
 func classifyRecoveryError(err error) *recoveryOperationError {
+	if errors.Is(err, store.ErrAccountDiscarded) {
+		return &recoveryOperationError{Code: "account_discarded"}
+	}
+	if errors.Is(err, store.ErrSub2AccountMissing) {
+		return &recoveryOperationError{Code: "sub2_account_missing", RequiresAction: true}
+	}
 	var failure *recoveryOperationError
 	if errors.As(err, &failure) {
 		return failure
@@ -218,7 +243,7 @@ func recoveryProbeEventError(payload []byte) *recoveryOperationError {
 	}
 	switch strings.ToLower(strings.TrimSpace(event.Code)) {
 	case "account_deactivated", "account_deleted", "user_deactivated", "user_deleted", "account_disabled", "user_disabled":
-		failure.Code, failure.RequiresAction = "account_unavailable", true
+		failure.Code = strings.ToLower(strings.TrimSpace(event.Code))
 	case "token_revoked", "token_invalidated", "token_expired", "access_token_expired", "invalid_token", "unauthorized", "authentication_error":
 		failure.Code, failure.CredentialInvalid = "credential_invalid", true
 	case "rate_limit_exceeded", "rate_limited", "too_many_requests":
@@ -359,7 +384,7 @@ func verifySub2RecoveryIdentity(detail map[string]any, expectedSub2ID, accountID
 		return nil // A present marker was checked by verifySub2AccountIdentity.
 	}
 	for _, binding := range bindings {
-		if binding.AccountID == accountID && binding.Sub2AccountID == expectedSub2ID && binding.State == "imported" && strings.HasPrefix(binding.OperationID, "linked-") {
+		if binding.AccountID == accountID && binding.Sub2AccountID == expectedSub2ID && (binding.State == "imported" || binding.State == "cleanup_pending") && strings.HasPrefix(binding.OperationID, "linked-") {
 			return nil
 		}
 	}

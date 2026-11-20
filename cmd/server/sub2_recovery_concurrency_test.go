@@ -98,7 +98,7 @@ func TestSub2RecoveryStaleRetryDoesNotOverwriteNewLogin(t *testing.T) {
 	f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
 		close(loginBlocked)
 		<-releaseLogin
-		return &login.LoginResult{Email: f.account.Email, AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "workspace"}, nil
+		return &login.LoginResult{Email: f.account.Email, AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "workspace", PlanType: "plus"}, nil
 	}
 	go func() { f.service.retryDueRecoveries(); close(monitorDone) }()
 	<-monitorBlocked
@@ -122,7 +122,7 @@ func TestSub2RecoveryRestartClaimPreservesOperatorPause(t *testing.T) {
 	f := newRecoveryFixture(t, true)
 	f.service.autoRecovery.Store(true)
 	f.service.process(f.task)
-	f.probeBody = "data: {\"type\":\"error\",\"status\":401,\"code\":\"token_revoked\"}\n\n"
+	f.probeBody = "data: {\"type\":\"error\",\"error\":\"Token revoked (401): Encountered invalidated oauth token for user, failing request\"}\n\n"
 	forceDueRecheck(t, f)
 	if !f.service.processNextRecheck() {
 		t.Fatal("recheck not processed")

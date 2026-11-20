@@ -2,13 +2,77 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/login"
 	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/store"
 )
+
+func TestSub2RecheckRetryAPI(t *testing.T) {
+	for _, change := range []string{"resume", "canceled", "pause", "binding", "destination", "version", "method", "worker_paused"} {
+		t.Run(change, func(t *testing.T) {
+			f := newRecoveryFixture(t, true)
+			f.service.process(f.task)
+			f.probeStatus = http.StatusUnauthorized
+			forceDueRecheck(t, f)
+			f.service.processNextRecheck()
+			if currentRecheck(t, f).State != "requires_action" {
+				t.Fatal("missing manual follow-up")
+			}
+			f.probeStatus = 0
+			method, want := http.MethodPost, http.StatusConflict
+			switch change {
+			case "resume":
+				want = http.StatusAccepted
+			case "canceled":
+				if _, err := f.db.Exec(`UPDATE account_recovery_rechecks SET state='canceled' WHERE task_id=?`, f.task.ID); err != nil {
+					t.Fatal(err)
+				}
+			case "pause":
+				f.schedule = false
+			case "binding":
+				want = http.StatusNotFound // Legacy tasks lose destination proof with the binding.
+				binding, _ := f.store.GetSub2Import(context.Background(), "fixture", f.account.ID)
+				if err := f.store.UpdateSub2Import(context.Background(), binding.ID, "imported", true, 902, ""); err != nil {
+					t.Fatal(err)
+				}
+			case "destination":
+				f.service.sub2.destinationKey = "other"
+				want = http.StatusNotFound
+			case "version":
+				if err := f.store.UpdateOAuthResultByID(context.Background(), f.account.ID, store.Result{AccessToken: "newer-at", RefreshToken: "newer-rt"}); err != nil {
+					t.Fatal(err)
+				}
+			case "method":
+				method, want = http.MethodGet, http.StatusMethodNotAllowed
+			case "worker_paused":
+				f.service.paused.Store(true)
+				want = http.StatusServiceUnavailable
+			}
+			r := httptest.NewRequest(method, fmt.Sprintf("/api/account-recovery/%d/recheck", f.task.ID), nil)
+			w := httptest.NewRecorder()
+			f.service.handleAction(w, r)
+			if w.Code != want {
+				t.Fatalf("status=%d want=%d body=%s", w.Code, want, w.Body.String())
+			}
+			check := currentRecheck(t, f)
+			if change == "resume" {
+				if check.State != "pending" || !f.service.processNextRecheck() || currentRecheck(t, f).Round != 2 {
+					t.Fatalf("retry did not continue: %+v", check)
+				}
+			} else if check.State == "pending" {
+				t.Fatalf("invalid retry queued: %+v", check)
+			}
+			if f.loginCalls != 1 || f.applyCalls != 1 {
+				t.Fatal("retry performed another login or writeback")
+			}
+		})
+	}
+}
 
 func forceDueRecheck(t *testing.T, f *recoveryFixture) {
 	t.Helper()
@@ -111,7 +175,7 @@ func TestSub2RecheckTransientFailureBacksOffAndManualFailureSurfaces(t *testing.
 			}
 			if tc.state == "requires_action" {
 				f.probeStatus = 0
-				resumed, err := f.store.RetryAccountRecoveryRecheck(context.Background(), f.account.ID)
+				resumed, err := f.store.RetryAccountRecoveryRecheck(context.Background(), f.task.ID, "fixture")
 				if err != nil || !resumed || !f.service.processNextRecheck() || currentRecheck(t, f).Round != 2 {
 					t.Fatalf("corrected configuration did not resume follow-up: resumed=%v err=%v", resumed, err)
 				}
@@ -154,7 +218,7 @@ func TestSub2RecheckRejectsChangedOwnershipAndManualPause(t *testing.T) {
 				t.Fatal("manual pause not preserved")
 			}
 			if change == "pause" {
-				if resumed, err := f.store.RetryAccountRecoveryRecheck(context.Background(), f.account.ID); err != nil || resumed {
+				if resumed, err := f.store.RetryAccountRecoveryRecheck(context.Background(), f.task.ID, "fixture"); err != nil || resumed {
 					t.Fatalf("editing credentials resumed an operator pause: %v, %v", resumed, err)
 				}
 			}

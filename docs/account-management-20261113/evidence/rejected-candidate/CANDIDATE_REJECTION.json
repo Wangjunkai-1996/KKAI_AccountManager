@@ -1,0 +1,11 @@
+{
+  "path": "/mfa-challenge/[id]",
+  "visible_input": {
+    "name": "code",
+    "type": "text",
+    "autocomplete": "one-time-code"
+  },
+  "challenge_heading": "Check your authenticator app",
+  "challenge_instruction": "Enter the one-time authentication code shown in your app to verify your identity.",
+  "reason": "current TOTP text is not recognized; candidate rejected"
+}

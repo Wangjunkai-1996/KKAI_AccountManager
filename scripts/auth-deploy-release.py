@@ -96,6 +96,8 @@ def counts(path: Path):
 
 
 def assert_idle(value):
+    if any(v is None for v in value.values()):
+        raise RuntimeError("in-flight task counters are incomplete")
     active = {k: v for k, v in value.items() if isinstance(v, int) and v}
     if active:
         raise RuntimeError(f"in-flight work is not empty: {active}")
@@ -239,6 +241,7 @@ def main():
     switched = False
     stopped = False
     try:
+        assert_idle(counts(DB))
         call(["systemctl", "stop", SERVICE], timeout=45); wait_service(False, 45)
         stopped = True
         after_stop = counts(DB); assert_idle(after_stop)
@@ -270,6 +273,7 @@ def main():
         if immediate["nrestarts"] != "0": raise RuntimeError(f"service restarted during deployment: {immediate['nrestarts']}")
         (release / "ACCEPTANCE.json").write_text(json.dumps(immediate, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+        print("Immediate acceptance passed; waiting for delayed checks.", flush=True)
         if args.delay_seconds > 0:
             time.sleep(args.delay_seconds)
         delayed_ready, delayed_health = wait_http(45)
@@ -285,14 +289,7 @@ def main():
         print(json.dumps(delayed, ensure_ascii=False, sort_keys=True))
     except BaseException:
         if switched:
-            try:
-                call(["systemctl", "stop", SERVICE], timeout=45, check=False)
-                wait_service(False, 45)
-                atomic_switch(link, old, args.release_id + "-rollback")
-                call(["systemctl", "start", SERVICE], timeout=45)
-                wait_service(True, 60); wait_http(90)
-            except BaseException as rollback_error:
-                print(f"automatic rollback failed: {rollback_error}", flush=True)
+            print("Automatic rollback disabled by user instruction; keep the new release for diagnosis.", flush=True)
         elif stopped:
             try:
                 call(["systemctl", "start", SERVICE], timeout=45)

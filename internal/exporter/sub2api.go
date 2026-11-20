@@ -32,17 +32,17 @@ type Sub2APIData struct {
 
 // Sub2APIAccount represents a single account in sub2api format
 type Sub2APIAccount struct {
-	Name               string                    `json:"name"`
-	Platform           string                    `json:"platform"`
-	Type               string                    `json:"type"`
-	Credentials        Sub2APICredentials        `json:"credentials"`
-	Extra              Sub2APIExtra              `json:"extra"`
-	Concurrency        int                       `json:"concurrency"`
-	Priority           int                       `json:"priority"`
-	RateMultiplier     float64                   `json:"rate_multiplier"`
-	AutoPauseOnExpired bool                      `json:"auto_pause_on_expired"`
-	PlanType           string                    `json:"plan_type"`
-	ExpiresAt          int64                     `json:"expires_at,omitempty"`
+	Name               string             `json:"name"`
+	Platform           string             `json:"platform"`
+	Type               string             `json:"type"`
+	Credentials        Sub2APICredentials `json:"credentials"`
+	Extra              Sub2APIExtra       `json:"extra"`
+	Concurrency        int                `json:"concurrency"`
+	Priority           int                `json:"priority"`
+	RateMultiplier     float64            `json:"rate_multiplier"`
+	AutoPauseOnExpired bool               `json:"auto_pause_on_expired"`
+	PlanType           string             `json:"plan_type"`
+	ExpiresAt          int64              `json:"expires_at,omitempty"`
 }
 
 // Sub2APICredentials represents the credentials section
@@ -58,10 +58,11 @@ type Sub2APICredentials struct {
 
 // Sub2APIExtra represents the extra section
 type Sub2APIExtra struct {
-	Email             string              `json:"email"`
-	DisplayName       string              `json:"display_name"`
-	OpenAIPassthrough bool                `json:"openai_passthrough"`
-	Recovery          Sub2APIRecovery     `json:"recovery"`
+	Email                string          `json:"email"`
+	DisplayName          string          `json:"display_name"`
+	OpenAIPassthrough    bool            `json:"openai_passthrough"`
+	CodexFingerprintMode string          `json:"codex_fingerprint_mode"`
+	Recovery             Sub2APIRecovery `json:"recovery"`
 }
 
 // Sub2APIRecovery represents the recovery credentials
@@ -105,9 +106,10 @@ func GenerateSub2APIJson(results []*AccountResult) *Sub2APIData {
 				PlanType:         result.PlanType,
 			},
 			Extra: Sub2APIExtra{
-				Email:             result.Email,
-				DisplayName:       displayName,
-				OpenAIPassthrough: false,
+				Email:                result.Email,
+				DisplayName:          displayName,
+				OpenAIPassthrough:    false,
+				CodexFingerprintMode: "full",
 				Recovery: Sub2APIRecovery{
 					Email:         result.Email,
 					LoginPassword: result.Password,

@@ -15,6 +15,9 @@ import (
 func TestAccountDeliveryDeletedGroupRetry(t *testing.T) {
 	history, accountID := testOAuthStore(t)
 	ctx := context.Background()
+	if err := history.UpdateOAuthResultByID(ctx, accountID, store.Result{AccessToken: "fixture-at", RefreshToken: "fixture-rt", PlanType: "plus"}); err != nil {
+		t.Fatal(err)
+	}
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -70,7 +73,7 @@ func TestAccountDeliveryPauseStopsBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = f.store.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &store.Result{AccessToken: "second-at", RefreshToken: "second-rt", ChatGPTAccountID: "second-workspace"}, "fixture", store.DeliveryOptions{Priority: 1, Concurrency: 3, Merchant: "测试号商", Deadline: "2026-12-31"})
+	_, err = f.store.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &store.Result{PlanType: "plus", AccessToken: "second-at", RefreshToken: "second-rt", ChatGPTAccountID: "second-workspace"}, "fixture", store.DeliveryOptions{Priority: 1, Concurrency: 3, Merchant: "测试号商", Deadline: "2026-12-31"})
 	attempt.Release()
 	if err != nil {
 		t.Fatal(err)

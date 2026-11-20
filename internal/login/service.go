@@ -28,12 +28,17 @@ import (
 var ErrCloudflareChallenge = errors.New("auth.openai.com 被 Cloudflare challenge 拦截")
 var ErrUnsupportedRegion = errors.New("OpenAI 拒绝当前网络出口：Country, region, or territory not supported")
 var ErrUnexpectedAuthPage = errors.New("OpenAI 登录流程未进入预期页面")
+
+// ErrAuthPageTimeout is a transient subtype of ErrUnexpectedAuthPage. Keep
+// the broad sentinel for backward-compatible error codes, while allowing the
+// durable recovery layer to retry waits that simply outlasted the page load.
+var ErrAuthPageTimeout = errors.New("OpenAI 认证页面等待超时")
 var ErrAuthConnectionReset = errors.New("访问 auth.openai.com 时连接被重置")
 var ErrAuthTransientNetwork = errors.New("访问 auth.openai.com 时出现临时网络错误")
 
 // authRejectionError keeps callback/page errors without inventing an HTTP status.
 type authRejectionError struct {
-	Code, Message, Stage string
+	Code, Message, Stage, UpstreamCode string
 }
 
 func (e *authRejectionError) Error() string {
@@ -81,6 +86,9 @@ func (e *authHTTPStatusError) Error() string {
 
 func (e *authHTTPStatusError) retryable() bool {
 	if accountStatusForAuthError(e.UpstreamCode, e.Message) != "" {
+		return false
+	}
+	if IsDeterministicFailure(LoginErrorInfo{Code: e.UpstreamCode}) {
 		return false
 	}
 	if errors.Is(e, ErrCloudflareChallenge) {
@@ -251,7 +259,23 @@ func (s *Service) loginWithRetries(ctx context.Context, email, password, totpSec
 	})
 }
 
+type singleAttemptKey struct{}
+
+// WithSingleAttempt limits an explicit operator request to one browser attempt,
+// including proxy fallback. The normal automatic policy remains unchanged.
+func WithSingleAttempt(ctx context.Context) context.Context {
+	return context.WithValue(ctx, singleAttemptKey{}, true)
+}
+
+func IsSingleAttempt(ctx context.Context) bool {
+	once, _ := ctx.Value(singleAttemptKey{}).(bool)
+	return once
+}
+
 func loginWithRetries(ctx context.Context, retryCount int, attemptFunc func(context.Context) (*LoginResult, error)) (*LoginResult, error) {
+	if IsSingleAttempt(ctx) {
+		retryCount = 0
+	}
 	if retryCount < 0 {
 		retryCount = 0
 	}
@@ -272,7 +296,7 @@ func loginWithRetries(ctx context.Context, retryCount int, attemptFunc func(cont
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, errors.Join(err, lastErr)
 		}
 		if attempt > 0 {
 			log.Printf("   🔄 重试 %d/%d", attempt, effectiveRetryCount)
@@ -339,12 +363,22 @@ func retryableLoginError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false
 	}
+	var rejection *authRejectionError
+	if errors.As(err, &rejection) {
+		return false
+	}
 	var statusErr *authHTTPStatusError
 	if errors.As(err, &statusErr) {
 		return statusErr.retryable()
 	}
 	if errors.Is(err, ErrCloudflareChallenge) {
 		return true
+	}
+	if errors.Is(err, ErrAuthPageTimeout) {
+		return true
+	}
+	if errors.Is(err, ErrUnexpectedAuthPage) {
+		return false
 	}
 	if errors.Is(err, playwright.ErrTimeout) || errors.Is(err, playwright.ErrTargetClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) {
 		return true
@@ -380,6 +414,7 @@ func isTransientBrowserError(err error) bool {
 		"net::err_network_changed",
 		"net::err_proxy_connection_failed",
 		"net::err_proxy_connection_refused",
+		"net::err_tunnel_connection_failed",
 		"net::err_internet_disconnected",
 		"net::err_name_not_resolved",
 		"net::err_address_unreachable",
@@ -738,6 +773,9 @@ func (s *Service) loginAttempt(ctx context.Context, email, password, totpSecret 
 	if err != nil {
 		return nil, fmt.Errorf("解析 OAuth 身份信息失败: %w", err)
 	}
+	if !strings.EqualFold(strings.TrimSpace(email), identity.Email) {
+		return nil, errors.New("OAuth 返回的账号与本次登录账号不一致")
+	}
 	if identity.ExpiresAt <= 0 && tokens.ExpiresIn > 0 {
 		identity.ExpiresAt = time.Now().Unix() + tokens.ExpiresIn
 	}
@@ -763,6 +801,15 @@ func waitOAuthCallback(page playwright.Page, callbacks <-chan string, challenges
 	return waitOAuthCallbackContext(context.Background(), page, callbacks, challenges, timeout, email, totpSecret, authStatuses...)
 }
 
+// Retain the page-wait reason when the overall request expires first. A user
+// cancellation is terminal and must never acquire a retryable page marker.
+func authPageWaitContextError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		return errors.Join(err, ErrUnexpectedAuthPage, ErrAuthPageTimeout)
+	}
+	return err
+}
+
 func waitOAuthCallbackContext(ctx context.Context, page playwright.Page, callbacks <-chan string, challenges <-chan struct{}, timeout time.Duration, email, totpSecret string, authStatuses ...<-chan error) (string, error) {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -776,7 +823,7 @@ func waitOAuthCallbackContext(ctx context.Context, page playwright.Page, callbac
 	consentSubmitted := false
 	for {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return "", authPageWaitFailure(page, err)
 		}
 		if err := takeAuthFailure(nil, authStatusCh); err != nil {
 			if !errors.Is(err, ErrCloudflareChallenge) {
@@ -791,9 +838,12 @@ func waitOAuthCallbackContext(ctx context.Context, page playwright.Page, callbac
 				return "", recoveryErr
 			}
 		}
+		if rejection := accountRejectionOnPage(page); rejection != nil {
+			return "", rejection
+		}
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", authPageWaitFailure(page, ctx.Err())
 		case callback := <-callbacks:
 			return callback, nil
 		case <-challenges:
@@ -811,7 +861,7 @@ func waitOAuthCallbackContext(ctx context.Context, page playwright.Page, callbac
 				return "", authFailureWithPage(page, err)
 			}
 		case <-deadline.C:
-			return "", fmt.Errorf("%w：未收到 OAuth 回调（%s）", ErrUnexpectedAuthPage, authPageSummary(page, email))
+			return "", authPageWaitFailure(page, fmt.Errorf("%w: %w：未收到 OAuth 回调（%s）", ErrUnexpectedAuthPage, ErrAuthPageTimeout, authPageSummary(page, email)))
 		case <-tick.C:
 			u, err := url.Parse(page.URL())
 			if err != nil || u.Scheme != "https" || u.Host != "auth.openai.com" {
@@ -820,8 +870,8 @@ func waitOAuthCallbackContext(ctx context.Context, page playwright.Page, callbac
 			if rejection := accountRejectionOnPage(page); rejection != nil {
 				return "", rejection
 			}
-			if strings.HasPrefix(u.Path, "/mfa-challenge/") && !mfaSubmitted {
-				codeInput := page.Locator("input[name='code'], input[autocomplete='one-time-code']").First()
+			if strings.HasPrefix(u.Path, "/mfa-challenge/") && !mfaSubmitted && isTOTPChallenge(page) {
+				codeInput := page.Locator(authCodeInputSelector).First()
 				if count, countErr := codeInput.Count(); countErr != nil || count == 0 {
 					continue
 				}
@@ -1006,11 +1056,11 @@ func clickCodexConsent(ctx context.Context, page playwright.Page, email string, 
 // Preserve the response classification when a click also reports a browser
 // error. A submitted auth request may be challenged without replacing the form.
 func authActionError(page playwright.Page, challenges <-chan struct{}, statuses <-chan error, fallback error) error {
-	if rejection := accountRejectionOnPage(page); rejection != nil {
-		return rejection
-	}
 	if err := takeAuthFailure(challenges, statuses); err != nil {
 		return authFailureWithPage(page, err)
+	}
+	if rejection := accountRejectionOnPage(page); rejection != nil {
+		return rejection
 	}
 	if page != nil && isCloudflareChallenge(page) {
 		return cloudflareError()
@@ -1044,6 +1094,9 @@ func (s *Service) LoginWithProxiesContext(ctx context.Context, email, password, 
 		attemptBudget++
 	}
 	if attemptBudget < 1 {
+		attemptBudget = 1
+	}
+	if IsSingleAttempt(ctx) {
 		attemptBudget = 1
 	}
 	ctx = context.WithValue(ctx, loginRetryBudgetKey{}, &loginRetryBudget{remaining: attemptBudget})
@@ -1223,9 +1276,9 @@ func navigateAuthorize(ctx context.Context, page playwright.Page, authorizeURL s
 			if strings.Contains(strings.ToLower(gotoErr.Error()), "net::err_connection_reset") {
 				return ErrAuthConnectionReset
 			}
-			return ErrAuthTransientNetwork
+			return errors.Join(ErrAuthTransientNetwork, gotoErr)
 		}
-		return fmt.Errorf("访问登录页失败（请检查 HTTP 代理连通性）: %w", gotoErr)
+		return fmt.Errorf("访问登录页失败: %w", gotoErr)
 	}
 	if response != nil && response.Status() >= 400 {
 		retryAfter, _ := response.HeaderValue("retry-after")
@@ -1422,6 +1475,10 @@ func parseOAuthIdentity(accessToken, idToken string) (*oauthIdentity, error) {
 		}
 	}
 	if access, err := ParseJWT(accessToken); err == nil {
+		if access.Email != "" && identity.Email != "" && !strings.EqualFold(access.Email, identity.Email) ||
+			access.ChatGPTAccountID != "" && identity.ChatGPTAccountID != "" && access.ChatGPTAccountID != identity.ChatGPTAccountID {
+			return nil, errors.New("同次 OAuth 凭据账号不一致")
+		}
 		if identity.ChatGPTAccountID == "" {
 			identity.ChatGPTAccountID = access.ChatGPTAccountID
 		}
@@ -1430,6 +1487,8 @@ func parseOAuthIdentity(accessToken, idToken string) (*oauthIdentity, error) {
 		}
 		if identity.PlanType == "" {
 			identity.PlanType = access.ChatGPTPlanType
+		} else if access.ChatGPTPlanType != "" && !strings.EqualFold(strings.TrimSpace(identity.PlanType), strings.TrimSpace(access.ChatGPTPlanType)) {
+			identity.PlanType = ""
 		}
 		if identity.Email == "" {
 			identity.Email = access.Email
@@ -1605,6 +1664,9 @@ func takeAuthFailure(challenges <-chan struct{}, statuses <-chan error) error {
 }
 
 func waitForAuthSelector(ctx context.Context, page playwright.Page, selector string, timeout time.Duration, challenges <-chan struct{}, statuses <-chan error) error {
+	if err := ctx.Err(); err != nil {
+		return authPageWaitFailure(page, err)
+	}
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	tick := time.NewTicker(100 * time.Millisecond)
@@ -1612,7 +1674,7 @@ func waitForAuthSelector(ctx context.Context, page playwright.Page, selector str
 	locator := page.Locator(selector).First()
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return authPageWaitFailure(page, err)
 		}
 		if err := takeAuthFailure(nil, statuses); err != nil {
 			if !errors.Is(err, ErrCloudflareChallenge) {
@@ -1641,7 +1703,7 @@ func waitForAuthSelector(ctx context.Context, page playwright.Page, selector str
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return authPageWaitFailure(page, ctx.Err())
 		case err := <-statuses:
 			if err != nil {
 				if errors.Is(err, ErrCloudflareChallenge) {
@@ -1661,7 +1723,7 @@ func waitForAuthSelector(ctx context.Context, page playwright.Page, selector str
 			if err := detectAccessBlock(page, challenges, statuses); err != nil {
 				return err
 			}
-			return fmt.Errorf("%w：等待登录输入框超时", ErrUnexpectedAuthPage)
+			return fmt.Errorf("%w: %w：等待登录输入框超时", ErrUnexpectedAuthPage, ErrAuthPageTimeout)
 		case <-tick.C:
 		}
 	}
@@ -1711,13 +1773,22 @@ func oauthCallbackCode(rawURL, expectedState string) (string, error) {
 
 func authFailureWithPage(page playwright.Page, failure error) error {
 	var statusErr *authHTTPStatusError
-	if !errors.As(failure, &statusErr) || statusErr.Message != "" || statusErr.UpstreamCode != "" || errors.Is(failure, ErrCloudflareChallenge) {
+	if errors.Is(failure, context.Canceled) || errors.Is(failure, ErrCloudflareChallenge) {
 		return failure
 	}
+	if errors.As(failure, &statusErr) {
+		info := NormalizeErrorInfo(LoginErrorInfo{Code: statusErr.UpstreamCode, Stage: statusErr.Stage})
+		if info.Code == LoginErrorVerificationCodeRejected && isTOTPChallenge(page) {
+			rejection := verificationRejection(LoginErrorTOTPRejected, LoginStageMFA)
+			rejection.UpstreamCode = statusErr.UpstreamCode
+			return errors.Join(failure, rejection)
+		}
+		if IsDeterministicFailure(info) || accountStatusForAuthError(statusErr.UpstreamCode, statusErr.Message) != "" {
+			return failure
+		}
+	}
 	if rejection := accountRejectionOnPage(page); rejection != nil {
-		withMessage := *statusErr
-		withMessage.Message = rejection.(*authRejectionError).Message
-		return &withMessage
+		return errors.Join(failure, rejection)
 	}
 	return failure
 }
@@ -1740,7 +1811,7 @@ func accountRejectionOnPage(page playwright.Page) error {
 	if strings.Contains(strings.ToLower(strings.Join(strings.Fields(body), " ")), strings.ToLower(message)) {
 		return &authRejectionError{Code: "account_unavailable", Message: message}
 	}
-	return nil
+	return verificationPageRejection(page, u.Path)
 }
 
 func openAIRequestPath(rawURL string) string {

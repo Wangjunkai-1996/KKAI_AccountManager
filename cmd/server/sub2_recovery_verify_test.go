@@ -109,7 +109,7 @@ func TestRecoveryVerifyErrorClassification(t *testing.T) {
 		{"string_revoked", `{"type":"error","error":"token_revoked"}`, "credential_invalid", true, false},
 		{"string_invalid", `{"type":"error","error":"invalid_token"}`, "credential_invalid", true, false},
 		{"upstream_401", `{"type":"error","status":401}`, "credential_invalid", true, false},
-		{"disabled", `{"type":"error","error":{"code":"account_deactivated","status":401}}`, "account_unavailable", false, true},
+		{"disabled", `{"type":"error","error":{"code":"account_deactivated","status":401}}`, "account_deactivated", false, false},
 		{"wrapped_upstream_401", `{"type":"error","error":"API returned 401: {\"error\":{\"code\":\"token_revoked\"}}"}`, "credential_invalid", true, false},
 		{"limited", `{"type":"error","status":429}`, "rate_limited", false, false},
 		{"server_error", `{"type":"error","status":503}`, "upstream_error", false, false},
@@ -153,7 +153,7 @@ func TestRecoveryVerifyWrappedError(t *testing.T) {
 		{"revoked_malformed_status", "Token revoked (0401): at-secret", "probe_failed", 0, false, false},
 		{"empty_body", "API returned 401:", "credential_invalid", 401, true, false},
 		{"no_space_body", "API returned 401:unauthorized", "credential_invalid", 401, true, false},
-		{"disabled", `API returned 401: {"error":{"code":"account_disabled","status":503}}`, "account_unavailable", 401, false, true},
+		{"disabled", `API returned 401: {"error":{"code":"account_disabled","status":503}}`, "account_disabled", 401, false, false},
 		{"body_status_ignored", `API returned 401: {"status":503,"status_code":502,"error":{"status":429,"status_code":403}}`, "credential_invalid", 401, true, false},
 		{"body_cannot_create_401", `API returned 503: {"status":401,"error":{"status_code":401}}`, "upstream_error", 503, false, false},
 		{"wrong_prefix", "HTTP 401: at-secret", "probe_failed", 0, false, false},
@@ -234,6 +234,18 @@ func TestRecoveryLoginHTTP4xxRequiresAction(t *testing.T) {
 		if failure.Code != "login_required" || !failure.RequiresAction {
 			t.Fatalf("deterministic login code %q classified as %+v, want manual handling", code, failure)
 		}
+	}
+	pageTimeout := classifyRecoveryLoginInfo(login.LoginErrorInfo{Code: login.LoginErrorUnexpectedPage, Retryable: true}, 0)
+	if pageTimeout.Code != "auth_page_timeout" || pageTimeout.RequiresAction || recoveryRetryDelay(pageTimeout, 0) != 5*time.Minute || recoveryRetryDelay(pageTimeout, 1) != 10*time.Minute {
+		t.Fatalf("transient page timeout was not scheduled with login backoff: %+v", pageTimeout)
+	}
+	pageHTTP4xx := classifyRecoveryLoginInfo(login.LoginErrorInfo{Code: login.LoginErrorUnexpectedPage, Retryable: true, HTTPStatus: http.StatusForbidden}, 0)
+	if pageHTTP4xx.Code != "login_required" || !pageHTTP4xx.RequiresAction {
+		t.Fatalf("explicit auth rejection was retried: %+v", pageHTTP4xx)
+	}
+	deletedPage := classifyRecoveryLoginInfo(login.LoginErrorInfo{Code: "account_deleted", AccountStatus: "deleted"}, 0)
+	if deletedPage.Code != "account_unavailable" || !deletedPage.RequiresAction {
+		t.Fatalf("deleted account was retried: %+v", deletedPage)
 	}
 	challenge := classifyRecoveryLoginInfo(login.LoginErrorInfo{Code: login.LoginErrorCloudflareChallenge, HTTPStatus: http.StatusForbidden}, 37)
 	if challenge.Code != "challenge" || challenge.RetryAfterSeconds != 37 || challenge.RequiresAction {

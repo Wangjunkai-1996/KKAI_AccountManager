@@ -109,11 +109,8 @@ func TestServeLoginStreamCancellationWaitsForRunnerCleanup(t *testing.T) {
 }
 
 func TestHandleLoginStreamValidationStaysJSON(t *testing.T) {
-	oldLimiter, oldSlots := limiter, loginSlots
-	t.Cleanup(func() {
-		limiter, loginSlots = oldLimiter, oldSlots
-	})
-	limiter = newRateLimiter(100, 10*time.Minute)
+	oldSlots := loginSlots
+	t.Cleanup(func() { loginSlots = oldSlots })
 	loginSlots = make(chan struct{}, 1)
 
 	badType := httptest.NewRequest(http.MethodPost, "/api/login/stream", strings.NewReader(`{}`))
@@ -161,47 +158,34 @@ func TestReserveReturnsRemainingWaitWithoutConsumingRejection(t *testing.T) {
 	}
 }
 
-func TestLoginRejectionsCarryJSONRetryAfter(t *testing.T) {
-	oldLimiter, oldSlots := limiter, loginSlots
-	t.Cleanup(func() { limiter, loginSlots = oldLimiter, oldSlots })
+func TestLoginBusyCarriesJSONRetryAfter(t *testing.T) {
+	oldSlots := loginSlots
+	t.Cleanup(func() { loginSlots = oldSlots })
+	loginSlots = make(chan struct{}, 1)
+	loginSlots <- struct{}{}
 	valid := `{"email":"test@example.com","password":"test-password","totp_secret":"JBSWY3DPEHPK3PXP"}`
-	for _, code := range []string{"platform_rate_limit", "platform_busy"} {
-		t.Run(code, func(t *testing.T) {
-			limiter = newRateLimiter(1, time.Minute)
-			loginSlots = make(chan struct{}, 1)
-			req := httptest.NewRequest(http.MethodPost, "/api/login/stream", strings.NewReader(valid))
-			req.Header.Set("Content-Type", "application/json")
-			if code == "platform_rate_limit" {
-				limiter.reserve(getClientIP(req))
-			} else {
-				loginSlots <- struct{}{}
-			}
-			rec := httptest.NewRecorder()
-			handleLoginStream(nil)(rec, req)
-			var result LoginResponse
-			if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
-				t.Fatalf("rejection is not JSON: %v", err)
-			}
-			if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Content-Type") != "application/json" {
-				t.Fatalf("response = %d %q", rec.Code, rec.Header().Get("Content-Type"))
-			}
-			if result.Code != code || result.Success || result.RetryAfter <= 0 {
-				t.Fatalf("rejection metadata = %#v", result)
-			}
-			if rec.Header().Get("Retry-After") != strconv.Itoa(result.RetryAfter) {
-				t.Fatalf("Retry-After header and body disagree: %q vs %d", rec.Header().Get("Retry-After"), result.RetryAfter)
-			}
-			if code == "platform_busy" && (result.RetryAfter != 5 || len(loginSlots) != 1) {
-				t.Fatalf("busy retry delay or slot changed: delay=%d slots=%d", result.RetryAfter, len(loginSlots))
-			}
-		})
+	req := httptest.NewRequest(http.MethodPost, "/api/login/stream", strings.NewReader(valid))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handleLoginStream(nil)(rec, req)
+	var result LoginResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("rejection is not JSON: %v", err)
+	}
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("response = %d %q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	if result.Code != "platform_busy" || result.Success || result.RetryAfter != 5 || len(loginSlots) != 1 {
+		t.Fatalf("busy metadata = %#v, slots=%d", result, len(loginSlots))
+	}
+	if rec.Header().Get("Retry-After") != strconv.Itoa(result.RetryAfter) {
+		t.Fatalf("Retry-After header and body disagree: %q vs %d", rec.Header().Get("Retry-After"), result.RetryAfter)
 	}
 }
 
-func TestProxyCheckJSONGuardsPreserveLoginBudget(t *testing.T) {
-	oldLimiter, oldProxyLimiter := limiter, proxyCheckLimiter
-	t.Cleanup(func() { limiter, proxyCheckLimiter = oldLimiter, oldProxyLimiter })
-	limiter = newRateLimiter(1, time.Minute)
+func TestProxyCheckJSONGuardsAndRateLimit(t *testing.T) {
+	oldProxyLimiter := proxyCheckLimiter
+	t.Cleanup(func() { proxyCheckLimiter = oldProxyLimiter })
 	proxyCheckLimiter = newRateLimiter(20, time.Minute)
 	service := login.NewService(login.Config{})
 	invalidProxy := `{"proxy":"socks5://proxy.invalid:1234"}`
@@ -232,16 +216,16 @@ func TestProxyCheckJSONGuardsPreserveLoginBudget(t *testing.T) {
 			if rec.Code != tt.status || !strings.Contains(result.Message, tt.message) {
 				t.Fatalf("response = %d %q, want %d containing %q", rec.Code, result.Message, tt.status, tt.message)
 			}
-			if len(limiter.requests) != 0 {
-				t.Fatal("proxy check consumed the login rate limit")
-			}
 		})
 	}
-	const ip = "192.0.2.1"
-	if wait := limiter.reserve(ip); wait != 0 {
-		t.Fatalf("proxy checks consumed the login budget: remaining wait %s", wait)
-	}
-	if len(proxyCheckLimiter.requests) == 0 {
-		t.Fatal("proxy checks did not use their own limiter")
+	proxyCheckLimiter = newRateLimiter(1, time.Minute)
+	for i, want := range []int{http.StatusBadRequest, http.StatusTooManyRequests} {
+		req := httptest.NewRequest(http.MethodPost, "/api/proxy-check", strings.NewReader(invalidProxy))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handleProxyCheck(service)(rec, req)
+		if rec.Code != want {
+			t.Fatalf("proxy check %d = %d, want %d", i+1, rec.Code, want)
+		}
 	}
 }

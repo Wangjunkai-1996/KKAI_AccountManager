@@ -10,6 +10,8 @@ import (
 
 // JWTPayload contains the decoded JWT payload
 type JWTPayload struct {
+	Issuer           string `json:"iss"`
+	Subject          string `json:"sub"`
 	ChatGPTAccountID string `json:"https://api.openai.com/auth.chatgpt_account_id"`
 	ChatGPTUserID    string `json:"https://api.openai.com/auth.chatgpt_user_id"`
 	ChatGPTPlanType  string `json:"https://api.openai.com/auth.chatgpt_plan_type"`

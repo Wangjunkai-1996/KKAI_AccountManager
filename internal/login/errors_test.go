@@ -9,6 +9,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/mxschmitt/playwright-go"
 )
 
 func TestDescribeErrorAuthStatus(t *testing.T) {
@@ -44,6 +46,24 @@ func TestDescribeErrorClassifiesSentinels(t *testing.T) {
 			info := DescribeError(tt.err)
 			if info.Stage != tt.stage || info.Code != tt.code {
 				t.Fatalf("DescribeError() = %#v, want stage=%q code=%q", info, tt.stage, tt.code)
+			}
+		})
+	}
+}
+
+func TestDescribeErrorClassifiesChromiumProxyFailuresPrecisely(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw, code, stage, message string
+		retryable                       bool
+	}{
+		{name: "tunnel transport", raw: "访问登录页失败: net::ERR_TUNNEL_CONNECTION_FAILED", code: LoginErrorConnectionReset, stage: LoginStageProxy, message: "代理隧道连接失败，请检查网络出口", retryable: true},
+		{name: "proxy certificate", raw: "访问登录页失败: net::ERR_PROXY_CERTIFICATE_INVALID", code: LoginErrorConfiguration, stage: LoginStageProxy, message: "代理证书无效，请检查代理配置"},
+		{name: "proxy credentials", raw: "访问登录页失败: net::ERR_INVALID_AUTH_CREDENTIALS", code: LoginErrorConfiguration, stage: LoginStageProxy, message: "代理认证失败，请检查代理用户名和密码"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := DescribeError(errors.New(tc.raw))
+			if info.Code != tc.code || info.Stage != tc.stage || info.Message != tc.message || info.Retryable != tc.retryable {
+				t.Fatalf("DescribeError() = %#v, want %s/%s/%v", info, tc.code, tc.stage, tc.retryable)
 			}
 		})
 	}
@@ -210,6 +230,33 @@ func TestDescribeErrorDoesNotExposeUnexpectedPageBody(t *testing.T) {
 	info := DescribeError(err)
 	if strings.Contains(info.Message, "4111111111111111") || info.Message != "未进入预期认证页面" {
 		t.Fatalf("unexpected page message = %q", info.Message)
+	}
+}
+
+func TestDescribeErrorDistinguishesAuthPageWaitFromTerminalPage(t *testing.T) {
+	pageWait := fmt.Errorf("%w: %w：等待登录输入框超时", ErrUnexpectedAuthPage, ErrAuthPageTimeout)
+	for _, tc := range []struct {
+		name      string
+		err       error
+		retryable bool
+		code      string
+	}{
+		{"page wait", pageWait, true, LoginErrorUnexpectedPage},
+		{"terminal page", ErrUnexpectedAuthPage, false, LoginErrorUnexpectedPage},
+		{"consent timeout", errors.Join(ErrUnexpectedAuthPage, playwright.ErrTimeout), false, LoginErrorUnexpectedPage},
+		{"HTTP rejection", &authHTTPStatusError{Status: http.StatusForbidden, Cause: pageWait}, false, LoginErrorUnexpectedPage},
+		{"account rejection", errors.Join(&authRejectionError{Code: "invalid_password"}, pageWait), false, LoginErrorPasswordRejected},
+		{"cancellation", errors.Join(context.Canceled, pageWait), false, LoginErrorCanceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := DescribeError(tc.err)
+			if info.Code != tc.code || info.Retryable != tc.retryable || info.Message == "" || strings.Contains(info.Message, "等待登录输入框超时") {
+				t.Fatalf("DescribeError() = %#v, want code=%s retryable=%v with safe message", info, tc.code, tc.retryable)
+			}
+		})
+	}
+	if !errors.Is(pageWait, ErrUnexpectedAuthPage) || !errors.Is(pageWait, ErrAuthPageTimeout) {
+		t.Fatalf("page wait lost its error markers: %v", pageWait)
 	}
 }
 

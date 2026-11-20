@@ -18,6 +18,7 @@ import (
 type LoginErrorInfo struct {
 	Stage         string `json:"stage"`
 	Code          string `json:"code"`
+	UpstreamCode  string `json:"upstream_code,omitempty"`
 	HTTPStatus    int    `json:"http_status,omitempty"`
 	Retryable     bool   `json:"retryable"`
 	Message       string `json:"message"`
@@ -28,6 +29,7 @@ const (
 	LoginStageUnknown       = "unknown"
 	LoginStageAuthorize     = "authorize"
 	LoginStageEmail         = "email"
+	LoginStagePhone         = "phone"
 	LoginStagePassword      = "password"
 	LoginStageMFA           = "mfa"
 	LoginStageConsent       = "consent"
@@ -71,6 +73,9 @@ func DescribeError(err error) LoginErrorInfo {
 	if err == nil {
 		return LoginErrorInfo{Stage: LoginStageUnknown, Code: LoginErrorUnknown, Message: ""}
 	}
+	if errors.Is(err, context.Canceled) {
+		return LoginErrorInfo{Stage: LoginStageBrowser, Code: LoginErrorCanceled, Message: "登录请求已取消"}
+	}
 	var pathErr *os.PathError
 	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
 		errors.As(err, &pathErr) && pathErr.Op == "fork/exec" && errors.Is(pathErr, fs.ErrPermission) {
@@ -107,6 +112,7 @@ func DescribeError(err error) LoginErrorInfo {
 	}
 	var rejection *authRejectionError
 	if errors.As(err, &rejection) {
+		info.UpstreamCode = normalizeAuthCode(rejection.UpstreamCode)
 		if code := normalizeAuthCode(rejection.Code); code != "" {
 			info.Code = code
 		}
@@ -131,7 +137,20 @@ func DescribeError(err error) LoginErrorInfo {
 	if info.Code == "" {
 		info.Code = LoginErrorUnknown
 	}
-	return info
+	// Chromium proxy failures are transport evidence, not upstream account
+	// validation. Ignore URL query words (such as scope=email) when naming
+	// the stage, and never expose the browser's full error or proxy address.
+	if statusErr == nil && rejection == nil {
+		switch text := strings.ToLower(err.Error()); {
+		case strings.Contains(text, "net::err_tunnel_connection_failed"):
+			info.Stage, info.Code, info.Message, info.Retryable = LoginStageProxy, LoginErrorConnectionReset, "代理隧道连接失败，请检查网络出口", true
+		case strings.Contains(text, "net::err_proxy_certificate_invalid"):
+			info.Stage, info.Code, info.Message, info.Retryable = LoginStageProxy, LoginErrorConfiguration, "代理证书无效，请检查代理配置", false
+		case strings.Contains(text, "net::err_invalid_auth_credentials"):
+			info.Stage, info.Code, info.Message, info.Retryable = LoginStageProxy, LoginErrorConfiguration, "代理认证失败，请检查代理用户名和密码", false
+		}
+	}
+	return NormalizeErrorInfo(info)
 }
 
 func classifyLoginCode(err error) string {
@@ -378,6 +397,10 @@ func authStageForPath(path string) string {
 	switch {
 	case strings.Contains(path, "/oauth/token"):
 		return LoginStageToken
+	case strings.Contains(path, "/email-verification"):
+		return LoginStageEmail
+	case strings.Contains(path, "/phone-verification"), strings.Contains(path, "/phone-number"), strings.Contains(path, "/verify-phone"), strings.Contains(path, "/mfa-challenge/sms"):
+		return LoginStagePhone
 	case strings.Contains(path, "/mfa"):
 		return LoginStageMFA
 	case strings.Contains(path, "/workspace/select"), strings.Contains(path, "/consent"):

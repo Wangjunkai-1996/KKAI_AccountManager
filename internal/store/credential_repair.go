@@ -16,6 +16,7 @@ type CredentialRepair struct {
 	Revision       int64      `json:"-"`
 	SourceVersion  int64      `json:"-"`
 	AttemptID      int64      `json:"-"`
+	RecoveryTaskID int64      `json:"-"`
 	State          string     `json:"state"`
 	RetryCount     int        `json:"retry_count"`
 	NextRetryAt    *time.Time `json:"next_retry_at,omitempty"`
@@ -31,6 +32,7 @@ func (s *Store) migrateCredentialRepairs() error {
  revision INTEGER NOT NULL DEFAULT 1,
  source_version INTEGER NOT NULL DEFAULT 0,
  attempt_id INTEGER NOT NULL DEFAULT 0,
+ recovery_task_id INTEGER NOT NULL DEFAULT 0,
  state TEXT NOT NULL,
  retry_count INTEGER NOT NULL DEFAULT 0,
  next_retry_at INTEGER,
@@ -38,16 +40,26 @@ func (s *Store) migrateCredentialRepairs() error {
  manual_action TEXT NOT NULL DEFAULT '',
  updated_at INTEGER NOT NULL
 );`)
+	if err != nil {
+		return err
+	}
+	var hasTaskID bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pragma_table_info('account_credential_repairs') WHERE name='recovery_task_id')`).Scan(&hasTaskID); err != nil {
+		return err
+	}
+	if !hasTaskID {
+		_, err = s.db.Exec(`ALTER TABLE account_credential_repairs ADD COLUMN recovery_task_id INTEGER NOT NULL DEFAULT 0`)
+	}
 	return err
 }
 
-const credentialRepairSelect = `SELECT account_id,revision,source_version,attempt_id,state,retry_count,next_retry_at,last_error,manual_action,updated_at FROM account_credential_repairs`
+const credentialRepairSelect = `SELECT account_id,revision,source_version,attempt_id,recovery_task_id,state,retry_count,next_retry_at,last_error,manual_action,updated_at FROM account_credential_repairs`
 
 func scanCredentialRepair(row scanner) (CredentialRepair, error) {
 	var repair CredentialRepair
 	var due sql.NullInt64
 	var updated int64
-	err := row.Scan(&repair.AccountID, &repair.Revision, &repair.SourceVersion, &repair.AttemptID, &repair.State, &repair.RetryCount, &due, &repair.LastError, &repair.ManualAction, &updated)
+	err := row.Scan(&repair.AccountID, &repair.Revision, &repair.SourceVersion, &repair.AttemptID, &repair.RecoveryTaskID, &repair.State, &repair.RetryCount, &due, &repair.LastError, &repair.ManualAction, &updated)
 	if err != nil {
 		return repair, err
 	}
@@ -84,6 +96,14 @@ func (s *Store) PatchAccountCredentials(ctx context.Context, id int64, patch Cre
 		return CredentialRepair{}, err
 	}
 	defer tx.Rollback()
+	account, err := scanAccount(tx.QueryRowContext(ctx, accountSelect+` WHERE id=?`, id))
+	if err != nil {
+		return CredentialRepair{}, err
+	}
+	if err := account.terminalError(); err != nil {
+		return CredentialRepair{}, err
+	}
+	autoContinue = autoContinue && !account.IsFreeLocal()
 	var active bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM account_recovery_tasks WHERE account_id=? AND state IN ('queued','validating','disabling_schedule','logging_in','login_succeeded','identity_verified','refreshing_credentials','applying_credentials','credentials_applied','enabling_schedule'))`, id).Scan(&active); err != nil {
 		return CredentialRepair{}, err
@@ -99,7 +119,7 @@ func (s *Store) PatchAccountCredentials(ctx context.Context, id int64, patch Cre
 	if !autoContinue {
 		state = "canceled"
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO account_credential_repairs(account_id,source_version,state,next_retry_at,updated_at) VALUES(?,COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=? AND status='success'),0),?,?,?) ON CONFLICT(account_id) DO UPDATE SET revision=account_credential_repairs.revision+1,source_version=excluded.source_version,attempt_id=0,state=excluded.state,retry_count=0,next_retry_at=excluded.next_retry_at,last_error='',manual_action='',updated_at=excluded.updated_at`, id, id, state, now.UnixMilli(), now.UnixMilli()); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO account_credential_repairs(account_id,source_version,state,next_retry_at,updated_at) VALUES(?,COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=? AND status='success'),0),?,?,?) ON CONFLICT(account_id) DO UPDATE SET revision=account_credential_repairs.revision+1,source_version=excluded.source_version,attempt_id=0,recovery_task_id=0,state=excluded.state,retry_count=0,next_retry_at=excluded.next_retry_at,last_error='',manual_action='',updated_at=excluded.updated_at`, id, id, state, now.UnixMilli(), now.UnixMilli()); err != nil {
 		return CredentialRepair{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -186,9 +206,9 @@ func (s *Store) FinishCredentialRepair(ctx context.Context, repair CredentialRep
 	return err
 }
 
-// RetryAccountRecoveryForCredentialRepair consumes one saved edit together
-// with its recovery handoff. A restart must not replay that edit after the
-// recovery has independently failed again or received a Retry-After deadline.
+// RetryAccountRecoveryForCredentialRepair binds one saved edit to its recovery
+// handoff. The next real login consumes it; a restart cannot requeue the edit
+// independently of the recovery task and its retry deadline.
 func (s *Store) RetryAccountRecoveryForCredentialRepair(ctx context.Context, repair CredentialRepair, taskID int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -209,8 +229,30 @@ func (s *Store) RetryAccountRecoveryForCredentialRepair(ctx context.Context, rep
 	if task.AccountID != repair.AccountID {
 		return ErrAccountNotFound
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE account_credential_repairs SET state='completed',next_retry_at=NULL,manual_action='',last_error='新资料已保存，已继续重新登录和恢复',updated_at=? WHERE account_id=? AND revision=?`, time.Now().UnixMilli(), repair.AccountID, repair.Revision); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE account_credential_repairs SET state='recovery_queued',recovery_task_id=?,attempt_id=0,next_retry_at=NULL,manual_action='',last_error='新资料已保存，等待恢复任务继续登录',updated_at=? WHERE account_id=? AND revision=?`, task.ID, time.Now().UnixMilli(), repair.AccountID, repair.Revision); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// CredentialRepairAuthorizesRecovery permits only the exact handoff task to
+// try saved edits once. Beginning any new login consumes this authorization.
+func (s *Store) CredentialRepairAuthorizesRecovery(ctx context.Context, accountID, taskID int64) (bool, error) {
+	var allowed bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM account_credential_repairs r JOIN account_recovery_tasks t ON t.id=r.recovery_task_id AND t.account_id=r.account_id WHERE r.account_id=? AND t.id=? AND r.state='recovery_queued' AND r.attempt_id=0 AND r.source_version=t.source_credential_attempt_id AND r.source_version=COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=r.account_id AND status='success'),0) AND t.result_credential_attempt_id=0 AND t.retry_action='relogin' AND t.state NOT IN ('completed','canceled') AND t.manual_action='')`, accountID, taskID).Scan(&allowed)
+	return allowed, err
+}
+
+func consumeCredentialRepairRecoveryTx(ctx context.Context, tx *sql.Tx, accountID, attemptID int64) error {
+	_, err := tx.ExecContext(ctx, `UPDATE account_credential_repairs SET state='completed',attempt_id=?,next_retry_at=NULL,last_error='新资料已用于本次登录，后续进度请查看恢复任务',manual_action='',updated_at=? WHERE account_id=? AND state='recovery_queued'`, attemptID, time.Now().UnixMilli(), accountID)
+	return err
+}
+
+func finishCredentialRepairRecoveryTx(ctx context.Context, tx *sql.Tx, taskID int64, state, message string) error {
+	manual := ""
+	if state == "requires_action" {
+		manual = message
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE account_credential_repairs SET state=?,next_retry_at=NULL,last_error=?,manual_action=?,updated_at=? WHERE recovery_task_id=? AND state='recovery_queued'`, state, message, manual, time.Now().UnixMilli(), taskID)
+	return err
 }

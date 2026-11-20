@@ -1,0 +1,13 @@
+{
+  "checked_at": "2026-11-13T16:56:53.722940+00:00",
+  "upload_directories_removed": [
+    "/tmp/kkai-auth-20261113T160925Z-account-management",
+    "/tmp/kkai-auth-20261113T163828Z-account-management"
+  ],
+  "candidate_secret_copies_removed": true,
+  "active_release_retained": true,
+  "rollback_release_retained": true,
+  "rejected_release_evidence_retained": true,
+  "operations_archived": true,
+  "backup_retained": true
+}

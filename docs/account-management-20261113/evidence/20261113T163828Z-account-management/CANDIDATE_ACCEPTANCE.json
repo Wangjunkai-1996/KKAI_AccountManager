@@ -1,0 +1,67 @@
+{
+  "release_id": "20261113T163828Z-account-management",
+  "rollback_release": "/opt/openai-login/releases/20261113T104100Z-ipv4-fallback",
+  "binary_sha256": "e308b483a03821d7401c64153e0474f91b1b3bb9a2cc6401144297d64a95afa0",
+  "ready": {
+    "database_ready": true,
+    "status": "ready",
+    "sub2_configured": false
+  },
+  "health": {
+    "max_concurrent": 1,
+    "status": "ok",
+    "sub2_configured": false,
+    "time": "2026-11-13T16:50:47Z"
+  },
+  "recovery_settings": {
+    "success": true,
+    "enabled": false,
+    "auto_recovery_enabled": false,
+    "running": false,
+    "blocked_reason": "Sub2 恢复服务未配置",
+    "interval_seconds": 60,
+    "last_scan_at": null,
+    "next_scan_at": null,
+    "scanning": false,
+    "last_error": "",
+    "auto_check_batch_id": "",
+    "summary": ""
+  },
+  "candidate_database_integrity": "ok",
+  "candidate_runtime": {
+    "release": "/opt/openai-login/releases/20261113T163828Z-account-management",
+    "smoke": "/opt/openai-login/releases/20261113T163828Z-account-management/kkai-auth-login-smoke",
+    "output_file": "/opt/openai-login/releases/20261113T163828Z-account-management/CANDIDATE_RUNTIME.txt",
+    "returncode": 0
+  },
+  "rollback_runtime": {
+    "release": "/opt/openai-login/releases/20261113T104100Z-ipv4-fallback",
+    "smoke": "/opt/openai-login/releases/20261113T104100Z-ipv4-fallback/kkai-auth-login-smoke",
+    "output_file": "/opt/openai-login/releases/20261113T163828Z-account-management/ROLLBACK_RUNTIME.txt",
+    "returncode": 0
+  },
+  "rollback_compatibility": {
+    "ready": {
+      "database_ready": true,
+      "status": "ready",
+      "sub2_configured": false
+    },
+    "health": {
+      "max_concurrent": 1,
+      "status": "ok",
+      "sub2_configured": false,
+      "time": "2026-11-13T16:50:55Z"
+    }
+  },
+  "static_sha256": {
+    "/": {
+      "status": 200,
+      "sha256": "ba3d3cb6f1e2cc4d4632cf4d8efe3afc36841050fa5534400701272e59a95f1c"
+    },
+    "/api/client.js": {
+      "status": 200,
+      "sha256": "a4895f04731bcefd34a4f1b2bba55f0fc71c18aabc045a1e153e1db98068c107"
+    }
+  },
+  "candidate_pid": 1410998
+}

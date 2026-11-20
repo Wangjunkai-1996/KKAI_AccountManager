@@ -32,6 +32,8 @@ func TestDeliveryOptionsDefaultsSnapshotAndGroups(t *testing.T) {
 				return
 			}
 			json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": []any{map[string]any{"id": 7, "name": "GPT", "platform": "openai", "status": "active"}, map[string]any{"id": 9, "platform": "claude", "status": "active"}}})
+		case "GET /admin/egress-routes/assignable":
+			json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"items": []any{}}})
 		case "GET /admin/accounts/42":
 			json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": detail})
 		case "PUT /admin/accounts/42":
@@ -211,7 +213,7 @@ func TestDeliveryOptionsPreserveGroupsAfterEarlierCompletedDelivery(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	next, err := history.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &store.Result{AccessToken: "new-fixture-at", RefreshToken: "new-fixture-rt"}, "fixture", options)
+	next, err := history.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &store.Result{AccessToken: "new-fixture-at", RefreshToken: "new-fixture-rt", PlanType: "plus"}, "fixture", options)
 	attempt.Release()
 	if err != nil {
 		t.Fatal(err)

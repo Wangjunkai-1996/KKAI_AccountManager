@@ -217,6 +217,96 @@ func TestRecoveryDueSelectionExcludesSupersededAndManualTasks(t *testing.T) {
 	}
 }
 
+func TestRecoveryRetryNewerTaskIsDestinationScoped(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	accountID := checkTestAccount(t, s, "retry-two-destinations")
+	alpha, _, err := s.CreateOrGetAccountRecoveryTask(ctx, accountID, 0, 101, true, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordAccountRecoveryFailure(ctx, alpha.ID, RecoveryFailure{State: RecoveryFailed, RetryAction: "relogin"}); err != nil {
+		t.Fatal(err)
+	}
+	beta, _, err := s.CreateOrGetAccountRecoveryTask(ctx, accountID, 0, 202, true, "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RetryAccountRecoveryTask(ctx, alpha.ID, true); !errors.Is(err, ErrAccountBusy) {
+		t.Fatalf("active beta task failed to block alpha: %v", err)
+	}
+	if _, err := s.RecordAccountRecoveryFailure(ctx, beta.ID, RecoveryFailure{State: RecoveryFailed, RetryAction: "relogin"}); err != nil {
+		t.Fatal(err)
+	}
+	if resumed, err := s.RetryAccountRecoveryTask(ctx, alpha.ID, true); err != nil || resumed.State != RecoveryQueued {
+		t.Fatalf("later failed beta task blocked alpha: %+v, %v", resumed, err)
+	}
+	if _, err := s.RetryAccountRecoveryTask(ctx, beta.ID, true); !errors.Is(err, ErrAccountBusy) {
+		t.Fatalf("active alpha task failed to block beta: %v", err)
+	}
+	if _, err := s.RecordAccountRecoveryFailure(ctx, alpha.ID, RecoveryFailure{State: RecoveryFailed, RetryAction: "relogin"}); err != nil {
+		t.Fatal(err)
+	}
+	newAlpha, _, err := s.CreateOrGetAccountRecoveryTask(ctx, accountID, 0, 101, true, "alpha")
+	if err != nil || newAlpha.ID == alpha.ID {
+		t.Fatalf("could not create newer alpha task: %+v, %v", newAlpha, err)
+	}
+	if _, err := s.RecordAccountRecoveryFailure(ctx, newAlpha.ID, RecoveryFailure{State: RecoveryFailed, RetryAction: "relogin"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RetryAccountRecoveryTask(ctx, alpha.ID, true); !errors.Is(err, ErrAccountBusy) {
+		t.Fatalf("newer same-destination task failed to supersede alpha: %v", err)
+	}
+}
+
+func TestRecoveryRetryResolvesOnlyUnambiguousLegacyDestinations(t *testing.T) {
+	for _, tc := range []struct {
+		name, firstDestination, secondDestination string
+		secondRemote                              int64
+		wantBusy                                  bool
+	}{
+		{"legacy_current_other_destination", "", "beta", 202, false},
+		{"legacy_current_same_destination", "", "alpha", 101, true},
+		{"legacy_newer_other_destination", "alpha", "", 202, false},
+		{"legacy_newer_same_destination", "alpha", "", 101, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := testStore(t)
+			ctx := context.Background()
+			accountID := checkTestAccount(t, s, "legacy-retry")
+			if _, err := s.db.Exec(`DELETE FROM sub2_imports WHERE account_id=?`, accountID); err != nil {
+				t.Fatal(err)
+			}
+			for _, binding := range []struct {
+				destination string
+				remoteID    int64
+			}{{"alpha", 101}, {"beta", 202}} {
+				if _, err := s.LinkSub2Account(ctx, binding.destination, accountID, binding.remoteID, "linked-"+binding.destination); err != nil {
+					t.Fatal(err)
+				}
+			}
+			first, _, err := s.CreateOrGetAccountRecoveryTask(ctx, accountID, 0, 101, true, tc.firstDestination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.RecordAccountRecoveryFailure(ctx, first.ID, RecoveryFailure{State: RecoveryFailed, RetryAction: "relogin"}); err != nil {
+				t.Fatal(err)
+			}
+			second, _, err := s.CreateOrGetAccountRecoveryTask(ctx, accountID, 0, tc.secondRemote, true, tc.secondDestination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.RecordAccountRecoveryFailure(ctx, second.ID, RecoveryFailure{State: RecoveryFailed, RetryAction: "relogin"}); err != nil {
+				t.Fatal(err)
+			}
+			_, err = s.RetryAccountRecoveryTask(ctx, first.ID, true)
+			if tc.wantBusy && !errors.Is(err, ErrAccountBusy) || !tc.wantBusy && err != nil {
+				t.Fatalf("legacy destination retry err=%v wantBusy=%v", err, tc.wantBusy)
+			}
+		})
+	}
+}
+
 func TestDeliveryRecoveryHandoffIsIdempotentAndNotRecoveryHistory(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()

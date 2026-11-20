@@ -59,6 +59,21 @@ func TestDeliveryOptionsValidateForImportRequiresNameFields(t *testing.T) {
 	}
 }
 
+func TestDeliveryOptionsPreservesEgressOrder(t *testing.T) {
+	options := DefaultDeliveryOptions()
+	options.EgressRouteIDs = []int64{9, 3, 9, 5}
+	if err := options.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(options.EgressRouteIDs, []int64{9, 3, 5}) {
+		t.Fatalf("egress order changed: %v", options.EgressRouteIDs)
+	}
+	options.EgressRouteIDs = []int64{0}
+	if err := options.Validate(); err == nil {
+		t.Fatal("invalid route ID accepted")
+	}
+}
+
 func TestQueueAccountDeliveryCorrectsUnsentRequiresAction(t *testing.T) {
 	s, _ := testStore(t)
 	if err := s.migrateAccountDeliveries(); err != nil {

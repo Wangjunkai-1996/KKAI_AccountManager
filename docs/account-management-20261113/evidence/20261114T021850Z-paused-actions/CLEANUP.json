@@ -1,0 +1,9 @@
+{
+  "release_id": "20261114T021850Z-paused-actions",
+  "checked_at": "2026-11-14T02:25:52.266295+00:00",
+  "upload_removed": true,
+  "candidate_credentials_removed": true,
+  "diagnostic_credentials_removed": true,
+  "operations_archived": true,
+  "release_and_rollback_retained": true
+}

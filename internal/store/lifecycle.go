@@ -139,7 +139,7 @@ func (s *Store) ListLifecycleEventsForEmail(ctx context.Context, email string, l
 
 func (s *Store) listLifecycleEvents(ctx context.Context, predicate string, limit int, args ...any) ([]LifecycleEvent, error) {
 	queryArgs := append(args, limit)
-	rows, err := s.db.QueryContext(ctx, `SELECT id,COALESCE(account_id,0),email,source,status,COALESCE(reason,''),COALESCE(code,''),http_status,dedupe_key,observed_at FROM account_lifecycle_events `+predicate+` ORDER BY observed_at DESC,id DESC LIMIT ?`, queryArgs...)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,COALESCE(account_id,0),email,source,status,COALESCE(reason,''),COALESCE(code,''),http_status,dedupe_key,observed_at FROM account_lifecycle_events `+predicate+` AND source<>'cleanup_authorization' ORDER BY observed_at DESC,id DESC LIMIT ?`, queryArgs...)
 	if err != nil {
 		return nil, err
 	}

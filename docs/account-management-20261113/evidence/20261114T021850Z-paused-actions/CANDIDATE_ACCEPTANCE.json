@@ -1,0 +1,67 @@
+{
+  "release_id": "20261114T021850Z-paused-actions",
+  "rollback_release": "/opt/openai-login/releases/20261113T163828Z-account-management",
+  "binary_sha256": "7c9475845d75421f2cccab585f4376f4442e56f0caa3d93dd28aa77eb8e29389",
+  "ready": {
+    "database_ready": true,
+    "status": "ready",
+    "sub2_configured": false
+  },
+  "health": {
+    "max_concurrent": 1,
+    "status": "ok",
+    "sub2_configured": false,
+    "time": "2026-11-14T02:20:32Z"
+  },
+  "recovery_settings": {
+    "success": true,
+    "enabled": false,
+    "auto_recovery_enabled": false,
+    "running": false,
+    "blocked_reason": "Sub2 恢复服务未配置",
+    "interval_seconds": 60,
+    "last_scan_at": null,
+    "next_scan_at": null,
+    "scanning": false,
+    "last_error": "",
+    "auto_check_batch_id": "",
+    "summary": ""
+  },
+  "candidate_database_integrity": "ok",
+  "candidate_runtime": {
+    "release": "/opt/openai-login/releases/20261114T021850Z-paused-actions",
+    "smoke": "/opt/openai-login/releases/20261114T021850Z-paused-actions/kkai-auth-login-smoke",
+    "output_file": "/opt/openai-login/releases/20261114T021850Z-paused-actions/CANDIDATE_RUNTIME.txt",
+    "returncode": 0
+  },
+  "rollback_runtime": {
+    "release": "/opt/openai-login/releases/20261113T163828Z-account-management",
+    "smoke": "/opt/openai-login/releases/20261113T163828Z-account-management/kkai-auth-login-smoke",
+    "output_file": "/opt/openai-login/releases/20261114T021850Z-paused-actions/ROLLBACK_RUNTIME.txt",
+    "returncode": 0
+  },
+  "rollback_compatibility": {
+    "ready": {
+      "database_ready": true,
+      "status": "ready",
+      "sub2_configured": false
+    },
+    "health": {
+      "max_concurrent": 1,
+      "status": "ok",
+      "sub2_configured": false,
+      "time": "2026-11-14T02:20:39Z"
+    }
+  },
+  "static_sha256": {
+    "/": {
+      "status": 200,
+      "sha256": "cdfac9409ef3603feefce4d1d5093b57e0c46318c5d994ad7ce0bd4ccd4f75aa"
+    },
+    "/api/client.js": {
+      "status": 200,
+      "sha256": "a95e002ec180b3843ea68900fe95817386dbcb51d7c9aabb9eca9fe7aa4c9aad"
+    }
+  },
+  "candidate_pid": 3577886
+}

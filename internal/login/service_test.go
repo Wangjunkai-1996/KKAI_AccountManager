@@ -586,6 +586,19 @@ func TestWaitOAuthCallbackBrowser(t *testing.T) {
 }
 
 func TestWaitOAuthCallbackDelayedMFABrowser(t *testing.T) {
+	runObservedTOTPBrowser(t, `<input name="code" type="text" autocomplete="one-time-code">`, "code", 11000, "Enter the one-time authentication code shown in your app to verify your identity.")
+}
+
+func TestWaitOAuthCallbackOTPInputBrowser(t *testing.T) {
+	runObservedTOTPBrowser(t, `<input name="code" hidden><input name="otp" type="text">`, "otp", 0, "Enter the one-time authentication code shown in your app to verify your identity.")
+}
+
+func TestWaitOAuthCallbackCurrentCodeBrowser(t *testing.T) {
+	runObservedTOTPBrowser(t, `<input name="code" type="text" autocomplete="one-time-code">`, "code", 0, "Enter the current 6-digit code for your account from your authenticator app.")
+}
+
+func runObservedTOTPBrowser(t *testing.T, inputHTML, fieldName string, delayMS int, prompt string) {
+	t.Helper()
 	if os.Getenv("OPENAI_LOGIN_BROWSER_TEST") != "1" {
 		t.Skip("set OPENAI_LOGIN_BROWSER_TEST=1 to run the Playwright regression test")
 	}
@@ -626,9 +639,9 @@ func TestWaitOAuthCallbackDelayedMFABrowser(t *testing.T) {
 		case requestURL == loginURL:
 			// Keep the browser on the post-password page long enough to catch
 			// implementations that use a short fixed MFA wait.
-			body = `<html><body><p>Password accepted</p><script>setTimeout(() => location.href = '/mfa-challenge/fixture', 11000)</script></body></html>`
+			body = `<html><body><p>Password accepted</p><script>setTimeout(() => location.href = '/mfa-challenge/fixture', ` + strconv.Itoa(delayMS) + `)</script></body></html>`
 		case requestURL == mfaURL:
-			body = `<html><body><form method="post" action="/mfa-submit"><input name="code" autocomplete="one-time-code"><button type="submit">继续</button></form></body></html>`
+			body = `<html><body><h1>Check your authenticator app</h1><p>` + prompt + `</p><form method="post" action="/mfa-submit">` + inputHTML + `<button type="submit">Verify</button></form></body></html>`
 		case strings.HasSuffix(requestURL, "/mfa-submit") && request.Method() == "POST":
 			postData, postErr := request.PostData()
 			if postErr != nil {
@@ -685,8 +698,10 @@ func TestWaitOAuthCallbackDelayedMFABrowser(t *testing.T) {
 		t.Fatalf("MFA submissions = %d, want 1", got)
 	}
 	postData, ok := mfaPostData.Load().(string)
-	if !ok || !strings.HasPrefix(postData, "code=") || strings.TrimPrefix(postData, "code=") == "" {
-		t.Fatalf("MFA form did not include a code: %q", postData)
+	values, parseErr := url.ParseQuery(postData)
+	code := values.Get(fieldName)
+	if !ok || parseErr != nil || len(code) != 6 || strings.Trim(code, "0123456789") != "" {
+		t.Fatal("MFA form did not submit one six-digit code through the visible field")
 	}
 }
 

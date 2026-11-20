@@ -26,6 +26,7 @@ func TestLinkSub2AccountIsTerminalAndPreservesExistingTask(t *testing.T) {
 	if err != nil || again.ID != linked.ID || again.Sub2AccountID != 42 {
 		t.Fatalf("existing binding overwritten: %+v, %v", again, err)
 	}
+	finishLifecycleLogin(t, s, a.Email, "plus")
 	queuedTask, _, err := s.CreateOrGetSub2Import(ctx, "other", a.ID, "queued", "queued-key", []byte(`{}`))
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +99,7 @@ func TestSub2ImportCredentialVersionMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinishAttempt(ctx, attempt.ID, true, &Result{AccessToken: "at", RefreshToken: "rt"}, nil); err != nil {
+	if err := s.FinishAttempt(ctx, attempt.ID, true, &Result{PlanType: "plus", AccessToken: "at", RefreshToken: "rt"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	attempt.Release()

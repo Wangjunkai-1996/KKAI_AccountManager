@@ -131,7 +131,7 @@ func newRecoveryFixture(t *testing.T, schedulable bool, accessTokens ...string) 
 		if email != f.account.Email || password != "password" {
 			t.Fatalf("login did not use saved account credentials")
 		}
-		return &login.LoginResult{Email: email, AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "workspace"}, nil
+		return &login.LoginResult{Email: email, AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "workspace", PlanType: "plus"}, nil
 	}
 	t.Cleanup(f.service.Stop)
 	// Sub2's error state represents an automatic pause after an auth failure;
@@ -462,7 +462,7 @@ func TestSub2RecoveryInvalidGrantLogsInAndCheckpointsVersion(t *testing.T) {
 		if email != f.account.Email || password != "password" {
 			t.Error("login did not use saved account credentials")
 		}
-		return &login.LoginResult{Email: email, AccessToken: "login-at", RefreshToken: "login-rt", ChatGPTAccountID: "workspace"}, nil
+		return &login.LoginResult{Email: email, AccessToken: "login-at", RefreshToken: "login-rt", ChatGPTAccountID: "workspace", PlanType: "plus"}, nil
 	}
 	f.service.process(f.task)
 	got := f.state(t)
@@ -536,52 +536,41 @@ func recoveryAccessToken(t *testing.T, workspace, userID, plan string) string {
 }
 
 func TestSub2RecoveryChangesWorkspaceAndPlan(t *testing.T) {
-	for _, interrupted := range []bool{false, true} {
-		t.Run(map[bool]string{false: "direct", true: "resume_before_remote_update"}[interrupted], func(t *testing.T) {
+	for _, replay := range []bool{false, true} {
+		t.Run(map[bool]string{false: "direct", true: "stale_task_replay"}[replay], func(t *testing.T) {
 			oldToken := recoveryAccessToken(t, "workspace", "same-user", "self_serve_business_prolite")
 			newToken := recoveryAccessToken(t, "personal-workspace", "same-user", "free")
-			f := newRecoveryFixture(t, true, oldToken)
-			f.applyFailsOnce = interrupted
+			f := newRecoveryFixture(t, false, oldToken)
 			f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
 				f.loginCalls++
 				return &login.LoginResult{Email: f.account.Email, AccessToken: newToken, RefreshToken: "new-rt", ChatGPTAccountID: "personal-workspace", PlanType: "free", ExpiresAt: 2100000000}, nil
 			}
 			f.service.process(f.task)
-			if interrupted {
-				if got := f.state(t); got.State != store.RecoveryUnknown || !got.Resumable || f.schedule || f.detailWorkspace != "workspace" {
-					t.Fatalf("checkpoint before apply=%+v schedule=%v workspace=%s", got, f.schedule, f.detailWorkspace)
-				}
-				_, statuses, err := f.service.sub2.syncAccountStatuses(context.Background())
-				status := statuses[f.account.ID]
-				if err != nil || status.Unknown || !status.Exists || status.Sub2AccountID != 901 {
-					t.Fatalf("workspace change hid resumable binding: status=%+v err=%v", status, err)
-				}
-				queued, created, err := f.service.enqueue(context.Background(), f.account.ID)
-				if err != nil || created || queued.ID != f.task.ID || queued.State != store.RecoveryQueued {
-					t.Fatalf("workspace change blocked resume: task=%+v created=%v err=%v", queued, created, err)
-				}
-				f.service.process(queued)
+			if replay {
+				f.service.process(f.task)
 			}
-			if got := f.state(t); got.State != store.RecoveryCompleted || got.Sub2AccountID != 901 || f.loginCalls != 1 || !f.schedule {
-				t.Fatalf("workspace migration=%+v login=%d schedule=%v", got, f.loginCalls, f.schedule)
+			if got := f.state(t); got.State != store.RecoveryCanceled || got.Sub2AccountID != 901 || f.loginCalls != 1 || f.schedule {
+				t.Fatalf("free recovery=%+v login=%d schedule=%v", got, f.loginCalls, f.schedule)
 			}
 			_, saved, err := f.store.GetOAuthResultByID(context.Background(), f.account.ID)
-			if err != nil || saved.AccessToken != newToken || saved.ChatGPTAccountID != "personal-workspace" || saved.PlanType != "free" {
-				t.Fatalf("new local credentials not saved: workspace=%s plan=%s err=%v", saved.ChatGPTAccountID, saved.PlanType, err)
+			if err != nil || saved.AccessToken != newToken || saved.RefreshToken != "new-rt" || saved.ChatGPTAccountID != "personal-workspace" || saved.PlanType != "free" {
+				t.Fatalf("free login not saved locally: workspace=%s plan=%s err=%v", saved.ChatGPTAccountID, saved.PlanType, err)
 			}
-			if f.detailWorkspace != "personal-workspace" || f.detailPlan != "free" || f.detailOrg != "" || f.detailExpiry != 2100000000 {
-				t.Fatalf("remote metadata workspace=%s plan=%s org=%s expires=%d", f.detailWorkspace, f.detailPlan, f.detailOrg, f.detailExpiry)
+			for _, method := range f.methods {
+				if !strings.HasPrefix(method, "GET ") {
+					t.Fatalf("free recovery made a remote write: %v", f.methods)
+				}
 			}
 		})
 	}
 }
 
-func TestSub2RecoveryAllowsDifferentStableUserWhenEmailMatches(t *testing.T) {
+func TestSub2RecoveryAllowsPaidWorkspaceChangeWithSameEmail(t *testing.T) {
 	oldToken := recoveryAccessToken(t, "workspace", "original-user", "self_serve_business_prolite")
 	f := newRecoveryFixture(t, true, oldToken)
 	f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
 		f.loginCalls++
-		return &login.LoginResult{Email: f.account.Email, AccessToken: recoveryAccessToken(t, "personal-workspace", "another-user", "free"), RefreshToken: "new-rt", ChatGPTAccountID: "personal-workspace", PlanType: "free"}, nil
+		return &login.LoginResult{Email: f.account.Email, AccessToken: recoveryAccessToken(t, "personal-workspace", "another-user", "plus"), RefreshToken: "new-rt", ChatGPTAccountID: "personal-workspace", PlanType: "plus"}, nil
 	}
 	f.service.process(f.task)
 	account, err := f.store.GetAccountByID(context.Background(), f.account.ID)
@@ -598,7 +587,7 @@ func TestSub2RecoveryCannotEnableWhenNewWorkspaceWasNotApplied(t *testing.T) {
 	f := newRecoveryFixture(t, true)
 	f.applyKeepsWorkspace = true
 	f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
-		return &login.LoginResult{Email: f.account.Email, AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "personal-workspace", PlanType: "free"}, nil
+		return &login.LoginResult{Email: f.account.Email, AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "personal-workspace", PlanType: "plus"}, nil
 	}
 	f.service.process(f.task)
 	if got := f.state(t); got.State != store.RecoveryUnknown || !got.Resumable || f.schedule || f.testCalls != 0 {

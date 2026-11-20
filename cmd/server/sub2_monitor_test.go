@@ -35,10 +35,12 @@ func newMonitorFixture(t *testing.T) *recoveryFixture {
 }
 
 func TestSub2RecoverySettingsRuntimeStatus(t *testing.T) {
-	for _, scenario := range []string{"running", "disabled", "storage_failure", "stopped", "unconfigured", "transient_error"} {
+	for _, scenario := range []string{"running", "disabled", "storage_failure", "stopped", "unconfigured", "transient_error", "checker_unconfigured", "checker_paused", "checker_stopped"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newRecoveryFixture(t, false)
 			s := f.service
+			s.checker = newAccountCheckService(f.store, "", "")
+			t.Cleanup(s.checker.Stop)
 			s.autoRecovery.Store(true)
 			next := time.Now().Add(time.Minute)
 			s.monitorState.NextScanAt = &next
@@ -72,6 +74,15 @@ func TestSub2RecoverySettingsRuntimeStatus(t *testing.T) {
 				wantReason = "Sub2 恢复服务未配置"
 			case "transient_error":
 				s.monitorState.LastError = "Sub2 状态同步失败，下次扫描重试"
+			case "checker_unconfigured":
+				s.checker = nil
+				wantReason = "账号检测服务未配置"
+			case "checker_paused":
+				s.checker.paused.Store(true)
+				wantReason = "账号检测服务已暂停"
+			case "checker_stopped":
+				s.checker.cancel()
+				wantReason = "账号检测服务已停止"
 			}
 			response := httptest.NewRecorder()
 			s.handleAction(response, httptest.NewRequest(http.MethodGet, "/api/account-recovery/settings", nil))

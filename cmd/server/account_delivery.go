@@ -73,7 +73,7 @@ func (s *accountDeliveryService) runOnce() {
 func (s *accountDeliveryService) update(task store.AccountDelivery, state, message, manual string, next *time.Time, recoveryID int64) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := s.store.UpdateAccountDelivery(ctx, task.ID, state, message, manual, next, recoveryID); err != nil {
+	if _, err := s.store.UpdateAccountDeliveryForOperation(ctx, task, state, message, manual, next, recoveryID); err != nil {
 		if !errors.Is(err, store.ErrAccountNotFound) && !errors.Is(err, store.ErrAccountDeliveryNotFound) && !errors.Is(err, store.ErrAccountDeliverySettled) {
 			s.recovery.pauseRecovery(task.RecoveryTaskID, err)
 		}
@@ -82,6 +82,10 @@ func (s *accountDeliveryService) update(task store.AccountDelivery, state, messa
 	return true
 }
 func (s *accountDeliveryService) failed(task store.AccountDelivery, err error) {
+	if errors.Is(err, store.ErrSub2AccountMissing) {
+		s.update(task, "canceled", store.Sub2MissingMessage, "", nil, 0)
+		return
+	}
 	failure := classifyRecoveryError(err)
 	if errors.Is(err, errSub2AmbiguousMatch) || errors.Is(err, errSub2IdentityConflict) {
 		failure = &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
@@ -111,10 +115,36 @@ func (s *accountDeliveryService) process(ctx context.Context, task store.Account
 		return
 	}
 	defer lease.Release()
+	current, err := s.store.GetAccountDelivery(ctx, task.ID)
+	if err != nil || current.ImportOperationID != task.ImportOperationID || current.State == "canceled" || current.State == "completed" {
+		return
+	}
+	var binding store.Sub2Import
+	if task.ImportOperationID != "" || task.OriginalBindingID != 0 {
+		binding, err = s.store.GetSub2Import(ctx, task.DestinationKey, task.AccountID)
+		if err != nil || !task.AllowCreate && !task.MatchesOriginalBinding(binding) ||
+			task.AllowCreate && binding.OperationID != task.ImportOperationID {
+			s.failed(task, &recoveryOperationError{Code: "identity_changed", RequiresAction: true})
+			return
+		}
+	}
+	account, err := s.store.GetAccountByID(ctx, task.AccountID)
+	if err != nil {
+		s.failed(task, err)
+		return
+	}
+	if err := account.Sub2EligibilityError(); err != nil {
+		s.failed(task, err)
+		return
+	}
+	if err := s.importer.importMissing(ctx, task.AccountID); err != nil {
+		s.failed(task, err)
+		return
+	}
 	// A crash can occur after the recovery task commits but before its link does.
 	// Reattach that exact task even when its automatic re-login advanced version.
 	prior, priorErr := s.store.GetLatestAccountRecoveryTaskForDestination(ctx, task.AccountID, task.DestinationKey)
-	if priorErr == nil && prior.DeliveryID == task.ID && prior.Purpose == "delivery" {
+	if priorErr == nil && prior.DeliveryID == task.ID && prior.Purpose == "delivery" && prior.State != store.RecoveryCanceled {
 		s.update(task, "verifying", "", "", nil, prior.ID)
 		return
 	}
@@ -141,7 +171,16 @@ func (s *accountDeliveryService) process(ctx context.Context, task store.Account
 	if !s.update(task, "checking", "", "", nil, 0) {
 		return
 	}
-	binding, err := s.importer.ensureTask(ctx, task.AccountID, task.Options)
+	if !task.AllowCreate && binding.State != "imported" {
+		binding, err = s.store.GetSub2Import(ctx, task.DestinationKey, task.AccountID)
+		if err != nil || !task.MatchesOriginalBinding(binding) {
+			s.failed(task, &recoveryOperationError{Code: "identity_changed", RequiresAction: true})
+			return
+		}
+	}
+	if binding.State != "imported" {
+		binding, err = s.importer.ensureDeliveryTask(ctx, task.AccountID, task.AllowCreate, task.Options)
+	}
 	if err != nil {
 		s.failed(task, err)
 		return
@@ -171,7 +210,11 @@ func (s *accountDeliveryService) process(ctx context.Context, task store.Account
 		s.failed(task, &recoveryOperationError{Code: "protocol_error"})
 		return
 	}
-	account, err := s.store.GetAccountByID(ctx, task.AccountID)
+	if !task.AllowCreate && !task.MatchesOriginalBinding(binding) {
+		s.failed(task, &recoveryOperationError{Code: "identity_changed", RequiresAction: true})
+		return
+	}
+	account, err = s.store.GetAccountByID(ctx, task.AccountID)
 	if err != nil {
 		s.failed(task, err)
 		return
@@ -187,11 +230,13 @@ func (s *accountDeliveryService) process(ctx context.Context, task store.Account
 	}
 	scheduled, known := boolField(detail, "schedulable")
 	status, _ := detail["status"].(string)
-	if !known || recoveryAccountDisabled(detail) || !scheduled && !strings.EqualFold(status, "error") {
+	if !known || recoveryAccountDisabled(detail) || !scheduled && task.AllowCreate && !strings.EqualFold(status, "error") {
 		s.failed(task, &recoveryOperationError{Code: "manual_pause", RequiresAction: true})
 		return
 	}
-	recovery, _, err := s.store.CreateAccountDeliveryRecoveryTask(ctx, task.ID, task.AccountID, binding.Sub2AccountID, task.CredentialVersion, true)
+	message, _ := detail["error_message"].(string)
+	restoreSchedule := scheduled || strings.EqualFold(status, "error") && strings.Contains(message, "401")
+	recovery, _, err := s.store.CreateAccountDeliveryRecoveryTask(ctx, task.ID, task.AccountID, binding.Sub2AccountID, task.CredentialVersion, restoreSchedule)
 	if err != nil {
 		s.failed(task, err)
 		return
@@ -211,11 +256,15 @@ func listDeliveryStatuses(ctx context.Context, history *store.Store, destination
 	}
 	result := make(map[int64]store.AccountDelivery, len(tasks))
 	for _, task := range tasks {
+		if task.State == "canceled" && task.LastError == store.Sub2MissingMessage {
+			task.ErrorCode = "sub2_account_missing"
+		}
 		if task.RecoveryTaskID > 0 {
 			recovery, err := history.GetAccountRecoveryTaskByIDForDestination(ctx, task.RecoveryTaskID, task.DestinationKey)
 			if err != nil {
 				return nil, err
 			}
+			task.SourceCredentialAttemptID, task.ResultCredentialAttemptID = recovery.SourceCredentialAttemptID, recovery.ResultCredentialAttemptID
 			task.LastError, task.ManualAction, task.RequiresAction = recovery.LastError, recovery.ManualAction, recovery.RequiresAction
 			task.FailureStage, task.ErrorCode, task.HTTPStatus, task.Diagnostic = recovery.FailureStage, recovery.ErrorCode, recovery.HTTPStatus, recovery.Diagnostic
 			task.NextRetryAt, task.RetryCount, task.UpdatedAt = recovery.NextRetryAt, recovery.RetryCount, recovery.UpdatedAt

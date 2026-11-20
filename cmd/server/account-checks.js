@@ -46,16 +46,30 @@
         return '本次持有凭据的历史观察';
     }
     function remaining(summary) { return Math.max(0, Math.ceil(((summary?._cooldownUntil || 0) - Date.now()) / 1000)); }
+    function loginStopped(value, account) {
+        if (typeof loginTaskSuperseded === 'function' && loginTaskSuperseded(account, value)) return false;
+        return Boolean(value && (value.manual_reason ||
+            typeof loginBlockLabel === 'function' && loginBlockLabel(value.last_error_code || value.error_code || value.code) ||
+            value.requires_action === true && value.retryable === false && !value.next_retry_at));
+    }
+    function automationBlocked(account) {
+        const state = account?.sub2_status || {};
+        return Boolean(account && (['deleted', 'deactivated', 'deleted_or_deactivated', 'discarded'].includes(account.status) ||
+            ['free_local', 'official_unavailable', 'discarded'].includes(account.sub2_policy) ||
+            state.remote_missing === true || ['missing', 'unmatched'].includes(state.association_status) ||
+            state.unknown || state.stale || state.exists === false || ['failed', 'error'].includes(account.status) && loginStopped(account) || loginStopped(recoveryStates.get(String(account.id)), account)));
+    }
     function eligible(account) {
         const summary = summaries.get(String(account?.id));
-        return Boolean(account && summary?.eligible && account.status !== 'running' && !['queued', 'running'].includes(summary.latest_task?.state));
+        return Boolean(account && !automationBlocked(account) && summary?.eligible && account.status !== 'running' && !['queued', 'running'].includes(summary.latest_task?.state));
     }
-    function canResumeRecovery(record) {
-        return record?.resumable === true && ['failed', 'unknown'].includes(record.state);
+    function canResumeRecovery(record, account) {
+        return record?.resumable === true && ['failed', 'unknown'].includes(record.state) &&
+            !(typeof loginTaskSuperseded === 'function' && loginTaskSuperseded(account, record));
     }
     function canRecover(account, result, recovery) {
-        if (!account) return false;
-        if (canResumeRecovery(recovery)) return true;
+        if (!account || automationBlocked(account) || loginStopped(recovery, account)) return false;
+        if (canResumeRecovery(recovery, account)) return true;
         if (!result || result.freshness === 'stale') return false;
         return Number(result.http_status) === 401 || credentialOutcomes.includes(result.outcome) ||
             result.outcome === 'unauthorized' || (result.stream_error_code &&
@@ -106,7 +120,7 @@
     }
     async function pollRecovery(id) {
         const key = String(id), current = recoveryStates.get(key);
-        if (!current || !recoveryActiveStates.has(String(current.state))) return;
+        if (!current || automationBlocked(accounts.get(key)) || !recoveryActiveStates.has(String(current.state))) return;
         try {
             const payload = await api(`/api/account-recovery?account_id=${encodeURIComponent(key)}`);
             const record = recoveryRecord(payload); setRecovery(key, record); render();
@@ -211,7 +225,10 @@
     }
     function patchRow(id, parts) {
         const account = accounts.get(id), summary = summaries.get(id), result = summary?.last_result, task = summary?.latest_task;
-        const recovery = recoveryStates.get(id), recoverable = canRecover(account, result, recovery);
+        const storedRecovery = recoveryStates.get(id);
+        const recovery = typeof loginTaskSuperseded === 'function' && loginTaskSuperseded(account, storedRecovery) ? null : storedRecovery;
+        const recoverable = canRecover(account, result, recovery);
+        const blocked = automationBlocked(account);
         put(parts.email, account?.email || '账号已删除');
         put(parts.login, account ? `登录：${typeof historyStatusName === 'function' ? historyStatusName(account.status) : account.status || '暂无状态'}` : '本地账号已删除');
         put(parts.result, !available ? '检测记录未更新' : result ? `上次检测：${resultName(result)}${result.freshness === 'stale' ? `（${freshnessName(result)}）` : ''}` : '尚无完成的检测');
@@ -219,21 +236,21 @@
         put(parts.time, result ? `${time(result.finished_at || result.checked_at)} · ${(Number(result.duration_ms || 0) / 1000).toFixed(1)} 秒 · ${result.route_label || '出口未记录'} · ${result.model || capabilities.model || ''}` : 'AUTH 记录已导入');
         const cooldown = remaining(summary);
         put(parts.task, task && task.state !== 'finished' ? `${taskNames[task.state] || task.state}${task.skip_reason ? `：${skipNames[task.skip_reason] || '当前不可执行'}` : ''}${cooldown ? ` · ${cooldown} 秒后可重测` : ''}` : cooldown ? `${cooldown} 秒后可重新检测` : '');
-        put(parts.recoveryStatus, recovery ? recoveryLabel(recovery) : '');
-        parts.recoveryStatus.hidden = !recovery;
+        put(parts.recoveryStatus, blocked ? '自动处理已暂停 · 关联或登录状态不允许检测恢复' : recovery ? recoveryLabel(recovery) : '');
+        parts.recoveryStatus.hidden = !blocked && !recovery;
         const recoveryState = String(recovery?.state || '').toLowerCase();
         const recoveryActive = recoveryActiveStates.has(recoveryState);
-        parts.recover.hidden = !recoverable && !recoveryActive;
+        parts.recover.hidden = blocked || !recoverable && !recoveryActive;
         const recoveryCurrent = ['completed', 'success'].includes(recoveryState) && recoveryMatchesResult(recovery, result);
         parts.recover.disabled = !canStartRecovery(account, result, recovery);
         put(parts.recover, recoveryActive ? '恢复中…' :
             recoveryCurrent ? '已恢复' :
-                canResumeRecovery(recovery) ? '继续恢复' : '恢复并开启调度');
+                canResumeRecovery(recovery, account) ? '继续恢复' : '恢复并开启调度');
         parts.select.checked = selected.has(id);
         parts.select.disabled = !available || !eligible(account) || submitting || Boolean(pendingRequest);
         parts.select.setAttribute('aria-label', `选择检测 ${account?.email || '已删除账号'}`);
         put(parts.start, activeID ? '查看当前检测' : cooldown ? `${cooldown} 秒后可重测` : '检测状态');
-        parts.start.disabled = !activeID && (!canSubmit() || !eligible(account) || cooldown > 0 || Boolean(pendingRequest));
+        parts.start.disabled = blocked || !activeID && (!canSubmit() || !eligible(account) || cooldown > 0 || Boolean(pendingRequest));
         parts.details.disabled = !account;
     }
     function render(reapply = false) {
@@ -309,7 +326,7 @@
         }
         const imported = new Set((payload.imports || []).filter(item => item.state === 'imported' && Number(item.sub2_account_id) > 0).map(item => String(item.account_id)));
         const previous = accounts;
-        accounts = new Map(payload.data.filter(account => imported.has(String(account.id))).map(account => [String(account.id), account]));
+        accounts = new Map(payload.data.filter(account => imported.has(String(account.id))).map(account => [String(account.id), { ...account, sub2_status: payload.sub2_statuses?.[account.id] }]));
         summaries.clear();
         for (const [id, summary] of Object.entries(payload.checks)) {
             summaries.set(id, { ...summary, _cooldownUntil: Date.now() + Math.max(0, Number(summary.cooldown_remaining_seconds) || 0) * 1000 });
@@ -320,11 +337,11 @@
             for (const [id, recovery] of Object.entries(payload.recoveries)) {
                 const record = recoveryRecord(recovery);
                 setRecovery(id, record);
-                if (recoveryActiveStates.has(record.state)) scheduleRecoveryPoll(id, 500);
+                if (!automationBlocked(accounts.get(id)) && recoveryActiveStates.has(record.state)) scheduleRecoveryPoll(id, 500);
             }
         }
         let removed = 0;
-        for (const id of selected) if (!accounts.has(id) || !summaries.get(id)?.eligible) { selected.delete(id); removed++; }
+        for (const id of selected) if (!eligible(accounts.get(id))) { selected.delete(id); removed++; }
         if (removed) notice(`已移除 ${removed} 个删除或不再符合检测条件的选择。`);
         for (const id of previous.keys()) if (!accounts.has(id) && !pageIDs().includes(id)) rows.delete(id);
         available = true; summaryUpdatedAt = Date.now();

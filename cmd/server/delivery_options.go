@@ -39,6 +39,7 @@ func (s *sub2ImportService) loadOptions(ctx context.Context, requested *store.De
 	if requested != nil {
 		options = *requested
 		options.GroupIDs = append([]int64{}, requested.GroupIDs...)
+		options.EgressRouteIDs = append([]int64{}, requested.EgressRouteIDs...)
 		err = nil
 	}
 	if err != nil {
@@ -69,6 +70,11 @@ func (s *sub2ImportService) resolveOptions(ctx context.Context, requested *store
 			}
 		}
 	}
+	if len(options.EgressRouteIDs) > 0 {
+		if _, err := s.resolveEgressRoutes(ctx, options.EgressRouteIDs); err != nil {
+			return options, err
+		}
+	}
 	return options, nil
 }
 func (s *sub2ImportService) handleImportSettings(w http.ResponseWriter, r *http.Request) {
@@ -92,7 +98,7 @@ func (s *sub2ImportService) handleImportSettings(w http.ResponseWriter, r *http.
 		}
 		options, err := s.resolveOptions(ctx, req)
 		if err != nil {
-			respondJSONStatus(w, 400, LoginResponse{Message: "分组或参数无法确认，请刷新后重试"})
+			respondJSONStatus(w, 400, LoginResponse{Message: "分组、出口或参数无法确认，请刷新后重试"})
 			return
 		}
 		if err = s.store.SaveDeliveryDefaults(ctx, s.destinationKey, options); err != nil {
@@ -106,7 +112,9 @@ func (s *sub2ImportService) handleImportSettings(w http.ResponseWriter, r *http.
 		return
 	}
 	groups, groupErr := s.groups(ctx)
-	respondJSON(w, map[string]any{"success": true, "defaults": defaults, "groups": groups, "groups_available": groupErr == nil})
+	routes, routeErr := s.egressRoutes(ctx)
+	respondJSON(w, map[string]any{"success": true, "defaults": defaults, "groups": groups, "groups_available": groupErr == nil,
+		"egress_routes": routes, "egress_available": routeErr == nil})
 }
 
 // applyDeliveryGroups runs after the recovery probe, before enabling traffic.

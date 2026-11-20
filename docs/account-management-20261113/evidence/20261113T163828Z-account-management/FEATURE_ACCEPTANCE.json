@@ -1,0 +1,41 @@
+{
+  "release_id": "20261113T163828Z-account-management",
+  "single_field_reveal": {
+    "password": true,
+    "totp_secret": true
+  },
+  "ordinary_history_sensitive_fields_absent": true,
+  "ordinary_history_has_no_revealed_secrets": true,
+  "ordinary_history_value_scan": {
+    "password": {
+      "result": "no_match",
+      "public_metadata_collisions": 0
+    },
+    "totp_secret": {
+      "result": "no_match",
+      "public_metadata_collisions": 0
+    }
+  },
+  "invalid_field_status": 400,
+  "cross_origin_status": 403,
+  "public_unauthenticated_reveal_status": 401,
+  "association_counts": {
+    "missing": 257,
+    "unmatched": 160,
+    "linked": 0,
+    "imported": 77,
+    "ambiguous": 0,
+    "conflict": 0,
+    "unknown": 2,
+    "stale": 0
+  },
+  "remote_missing_bindings": 257,
+  "missing_active_recoveries": 0,
+  "missing_active_legacy_recoveries": 0,
+  "effective_auth_routes": [
+    "http://unix:/run/tls/auth/login.sock:"
+  ],
+  "name_available": true,
+  "trusted_custom_name_accounts": 77,
+  "credential_version_available": true
+}

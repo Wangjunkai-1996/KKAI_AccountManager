@@ -1,0 +1,73 @@
+{
+  "checked_at": "2026-11-13T16:55:57.827532+00:00",
+  "release_id": "20261113T163828Z-account-management",
+  "binary_sha256": "e308b483a03821d7401c64153e0474f91b1b3bb9a2cc6401144297d64a95afa0",
+  "service": {
+    "NRestarts": "0",
+    "User": "openai-login",
+    "ActiveState": "active",
+    "SubState": "running"
+  },
+  "pid": 1419452,
+  "ready": {
+    "database_ready": true,
+    "status": "ready",
+    "sub2_configured": true
+  },
+  "health": {
+    "max_concurrent": 10,
+    "status": "ok",
+    "sub2_configured": true,
+    "time": "2026-11-13T16:55:57Z"
+  },
+  "static_hashes": {
+    "/": {
+      "status": 200,
+      "sha256": "ba3d3cb6f1e2cc4d4632cf4d8efe3afc36841050fa5534400701272e59a95f1c"
+    },
+    "/api/client.js": {
+      "status": 200,
+      "sha256": "a4895f04731bcefd34a4f1b2bba55f0fc71c18aabc045a1e153e1db98068c107"
+    }
+  },
+  "journal_errors": {
+    "panic": 0,
+    "fatal": 0,
+    "database_locked": 0,
+    "storage_failure": 0,
+    "listen_failure": 0,
+    "browser_runtime_permission": 0,
+    "login_failed": 0,
+    "oauth_401": 0,
+    "oauth_403": 0,
+    "oauth_5xx": 0
+  },
+  "rollback": {
+    "binary_unchanged": true,
+    "node_unchanged": true,
+    "driver_unchanged": true,
+    "runtime_verified": true,
+    "backup_integrity": "ok",
+    "backup_mode": "0o600"
+  },
+  "recovery_enabled": true,
+  "recovery_running": true,
+  "last_scan_at": "2026-11-13T16:55:31.04026659Z",
+  "scan_advanced": true,
+  "scan_after_production_login": true,
+  "inflight": {
+    "login_attempts_running": 0,
+    "account_checks_active": 0,
+    "check_batches_active": 0,
+    "sub2_imports_active": 0,
+    "recovery_active": 0,
+    "deliveries_active": 0,
+    "rechecks_active": 0,
+    "repairs_active": 0
+  },
+  "database_integrity": "ok",
+  "public_guard_status": 401,
+  "public_reveal_guard_status": 401,
+  "feature_acceptance": true,
+  "candidate_and_production_login": true
+}

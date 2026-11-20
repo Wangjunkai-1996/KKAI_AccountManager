@@ -45,6 +45,7 @@ func initLoginHistory(dbPath, keyPath string) error {
 }
 
 type historyLoginRequest struct {
+	ManualAttempt   bool                   `json:"manual_attempt"`
 	DeliveryOptions *store.DeliveryOptions `json:"delivery_options,omitempty"`
 	AutoDeliver     bool                   `json:"auto_deliver"`
 	AccountID       int64                  `json:"account_id"`
@@ -70,6 +71,7 @@ type historyListResponse struct {
 }
 
 type historyDetailResponse struct {
+	CredentialsMeta           store.CredentialsMeta               `json:"credentials_meta"`
 	Success                   bool                                `json:"success"`
 	Account                   store.Account                       `json:"account"`
 	Attempts                  []store.AttemptRecord               `json:"attempts"`
@@ -99,6 +101,9 @@ func handleHistory() http.HandlerFunc {
 		if err != nil {
 			respondJSONStatus(w, http.StatusInternalServerError, LoginResponse{Message: "读取历史记录失败", Code: "history_read_failed"})
 			return
+		}
+		for i := range accounts {
+			normalizeHistoryLoginFailure(&accounts[i])
 		}
 		var imports []store.Sub2Import
 		var importsErr error
@@ -153,6 +158,10 @@ func handleHistory() http.HandlerFunc {
 
 func handleHistoryDelete() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/credentials/reveal") {
+			handleHistoryCredentialReveal(w, r)
+			return
+		}
 		if strings.HasSuffix(r.URL.Path, "/credentials") {
 			handleHistoryCredentials(w, r)
 			return
@@ -181,10 +190,20 @@ func handleHistoryDelete() http.HandlerFunc {
 			return
 		}
 		if r.Method == http.MethodGet {
+			normalizeHistoryLoginFailure(&account)
+			meta, err := loginHistory.CredentialMetadata(r.Context(), account.ID)
+			if err != nil {
+				respondJSONStatus(w, http.StatusInternalServerError, LoginResponse{Message: "读取登录资料状态失败", Code: "credential_read_failed"})
+				return
+			}
 			attempts, err := loginHistory.ListAttempts(r.Context(), account.Email, 100)
 			if err != nil {
 				respondJSONStatus(w, http.StatusInternalServerError, LoginResponse{Message: "读取登录历史失败", Code: "history_read_failed"})
 				return
+			}
+			for i := range attempts {
+				info := login.NormalizeErrorInfo(login.LoginErrorInfo{Stage: attempts[i].Stage, Code: attempts[i].Code, Message: attempts[i].Message, HTTPStatus: attempts[i].HTTPStatus, Retryable: attempts[i].Retryable})
+				attempts[i].Stage, attempts[i].Code, attempts[i].Message, attempts[i].Retryable = info.Stage, info.Code, info.Message, info.Retryable
 			}
 			destination := ""
 			if sub2Importer != nil && sub2Importer.configured() {
@@ -194,7 +213,7 @@ func handleHistoryDelete() http.HandlerFunc {
 			recoveryHistory, recoveryHistoryTruncated, recoveryHistoryErr := loginHistory.ListAccountRecoveryHistory(r.Context(), account.ID, 100, destination)
 			recoveryFailures, recoveryFailuresTruncated, recoveryFailuresErr := loginHistory.ListAccountRecoveryFailureEvents(r.Context(), account.ID, 100, destination)
 			lifecycleEvents, lifecycleErr := loginHistory.ListLifecycleEventsForAccount(r.Context(), account.ID, 100)
-			respondJSON(w, historyDetailResponse{Success: true, Account: account, Attempts: attempts,
+			respondJSON(w, historyDetailResponse{Success: true, Account: account, Attempts: attempts, CredentialsMeta: meta,
 				RecoveryHistory: recoveryHistory, RecoveryHistoryAvailable: recoveryHistoryErr == nil,
 				RecoveryHistoryTruncated: recoveryHistoryTruncated, RecoveryFailures: recoveryFailures,
 				RecoveryFailuresAvailable: recoveryFailuresErr == nil, RecoveryFailuresTruncated: recoveryFailuresTruncated,
@@ -203,6 +222,12 @@ func handleHistoryDelete() http.HandlerFunc {
 		}
 		if err := loginHistory.DeleteAccountByID(r.Context(), id); errors.Is(err, store.ErrAccountBusy) {
 			respondJSONStatus(w, http.StatusConflict, LoginResponse{Message: "账号有进行中或待确认的登录、导入任务，请结束或核对后再删除", Code: "account_busy"})
+			return
+		} else if errors.Is(err, store.ErrAccountDiscarded) {
+			respondJSONStatus(w, http.StatusGone, LoginResponse{Message: "本地退役记录已保留", Code: "account_discarded"})
+			return
+		} else if errors.Is(err, store.ErrAccountOfficialUnavailable) {
+			respondJSONStatus(w, http.StatusConflict, LoginResponse{Message: "官方终态记录已保留", Code: "account_official_unavailable"})
 			return
 		} else if errors.Is(err, store.ErrAccountNotFound) {
 			respondJSONStatus(w, http.StatusNotFound, LoginResponse{Message: "账号不存在", Code: "account_not_found"})
@@ -215,6 +240,13 @@ func handleHistoryDelete() http.HandlerFunc {
 	}
 }
 
+// Project legacy saved codes through the same classifier as new logins.
+// This does not rewrite historical evidence or infer a verification method.
+func normalizeHistoryLoginFailure(account *store.Account) {
+	info := login.NormalizeErrorInfo(login.LoginErrorInfo{Code: account.LastErrorCode, Message: account.LastError, HTTPStatus: account.LastHTTPStatus})
+	account.LastErrorCode, account.LastError = info.Code, info.Message
+}
+
 func handleHistoryLogin(service *login.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -224,12 +256,6 @@ func handleHistoryLogin(service *login.Service) http.HandlerFunc {
 		limitConcurrentLogins(loginSlots, func(w http.ResponseWriter, r *http.Request) {
 			if loginHistory == nil {
 				respondJSONStatus(w, http.StatusServiceUnavailable, LoginResponse{Message: "历史记录未初始化", Code: "history_unavailable"})
-				return
-			}
-			if delay := limiter.reserve(getClientIP(r)); delay > 0 {
-				seconds := int((delay + time.Second - 1) / time.Second)
-				w.Header().Set("Retry-After", strconv.Itoa(seconds))
-				respondJSONStatus(w, http.StatusTooManyRequests, LoginResponse{Success: false, Message: "平台请求达到上限，等待后继续", Code: "platform_rate_limit", RetryAfter: seconds})
 				return
 			}
 			mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -248,6 +274,19 @@ func handleHistoryLogin(service *login.Service) http.HandlerFunc {
 				respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: "请求只能包含一个 JSON 对象"})
 				return
 			}
+			account, err := loginHistory.GetAccountByID(r.Context(), req.AccountID)
+			if err == nil && (account.Status == "discarded" || account.Sub2Policy == store.Sub2PolicyDiscarded) {
+				respondJSONStatus(w, http.StatusGone, LoginResponse{Message: "账号已在本地退役", Code: "account_discarded"})
+				return
+			}
+			if errors.Is(err, store.ErrAccountNotFound) || err == nil && account.IsOfficialUnavailable() {
+				respondJSONStatus(w, http.StatusNotFound, LoginResponse{Message: "账号不存在或已删除", Code: "account_not_found"})
+				return
+			}
+			if err != nil {
+				respondJSONStatus(w, http.StatusInternalServerError, LoginResponse{Message: "读取账号失败", Code: "history_read_failed"})
+				return
+			}
 			credentials, err := loginHistory.GetCredentialsByID(r.Context(), req.AccountID)
 			if errors.Is(err, store.ErrAccountNotFound) {
 				respondJSONStatus(w, http.StatusNotFound, LoginResponse{Message: "账号不存在或已删除", Code: "account_not_found"})
@@ -262,6 +301,23 @@ func handleHistoryLogin(service *login.Service) http.HandlerFunc {
 				proxy = credentials.Proxy
 			}
 			loginReq := LoginRequest{Email: credentials.Email, Password: credentials.Password, TotpSecret: credentials.TOTPSecret, Proxy: proxy, UpstreamProxy: strings.TrimSpace(req.UpstreamProxy), AutoDeliver: req.AutoDeliver, DeliveryOptions: req.DeliveryOptions}
+			if loginReq.DeliveryOptions == nil && sub2Importer != nil && sub2Importer.configured() {
+				options, err := sub2Importer.historyDeliveryOptions(r.Context(), req.AccountID)
+				if err != nil {
+					respondJSONStatus(w, http.StatusInternalServerError, LoginResponse{Message: "读取历史交付参数失败"})
+					return
+				}
+				loginReq.DeliveryOptions = options
+			}
+			if sub2Importer != nil {
+				loginReq.Proxy, err = sub2Importer.accountLoginProxy(r.Context(), account, loginReq.DeliveryOptions, loginReq.Proxy, service.CheckProxy)
+				if err != nil {
+					failure := classifyRecoveryError(err)
+					respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: failure.Error(), Code: failure.Code})
+					return
+				}
+			}
+			loginReq.UpstreamProxy = ""
 			if err := validateLoginRequest(&loginReq); err != nil {
 				respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: err.Error()})
 				return
@@ -271,6 +327,9 @@ func handleHistoryLogin(service *login.Service) http.HandlerFunc {
 				return service.LoginWithProxiesContext(ctx, loginReq.Email, loginReq.Password, loginReq.TotpSecret, loginReq.Proxy, loginReq.UpstreamProxy)
 			}
 			serveLoginStream(w, r, func(ctx context.Context) (*login.LoginResult, error) {
+				if req.ManualAttempt {
+					ctx = login.WithSingleAttempt(ctx)
+				}
 				return runWithHistoryAccount(ctx, req.AccountID, loginReq, logLogin)
 			})
 		})(w, r)
@@ -283,6 +342,41 @@ func runWithHistory(ctx context.Context, req LoginRequest, run func(context.Cont
 	return runWithHistoryAccount(ctx, 0, req, run)
 }
 
+func (s *sub2ImportService) historyDeliveryOptions(ctx context.Context, accountID int64) (*store.DeliveryOptions, error) {
+	deliveries, err := s.store.ListLatestAccountDeliveries(ctx, s.destinationKey)
+	if err != nil {
+		return nil, err
+	}
+	for _, delivery := range deliveries {
+		if delivery.AccountID == accountID && delivery.DestinationKey == s.destinationKey {
+			options := delivery.Options
+			return &options, nil
+		}
+	}
+	return nil, nil
+}
+
+// Workspace membership can change on a legitimate relogin. Only compare a
+// subject when both access tokens use the same issuer's subject namespace.
+func verifyStoredOAuthSubject(ctx context.Context, history *store.Store, accountID int64, accessToken string) error {
+	current, err := login.ParseJWT(accessToken)
+	if err != nil || current.Issuer == "" || current.Subject == "" {
+		return nil
+	}
+	_, saved, err := history.GetOAuthResultByID(ctx, accountID)
+	if errors.Is(err, store.ErrOAuthCredentialsMissing) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	previous, err := login.ParseJWT(saved.AccessToken)
+	if err == nil && previous.Issuer == current.Issuer && previous.Subject != "" && previous.Subject != current.Subject {
+		return &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
+	}
+	return nil
+}
+
 func runWithHistoryAccount(ctx context.Context, accountID int64, req LoginRequest, run func(context.Context) (*login.LoginResult, error)) (*login.LoginResult, error) {
 	if req.AutoDeliver && (loginHistory == nil || sub2Importer == nil || !sub2Importer.configured()) {
 		return nil, &recoveryOperationError{Code: "configuration", RequiresAction: true}
@@ -291,19 +385,14 @@ func runWithHistoryAccount(ctx context.Context, accountID int64, req LoginReques
 		return run(ctx)
 	}
 	var options store.DeliveryOptions
+	importer := sub2Importer
 	if req.AutoDeliver {
 		requested := req.DeliveryOptions
 		if requested == nil && accountID > 0 {
-			deliveries, err := loginHistory.ListLatestAccountDeliveries(ctx, sub2Importer.destinationKey)
+			var err error
+			requested, err = sub2Importer.historyDeliveryOptions(ctx, accountID)
 			if err != nil {
 				return nil, err
-			}
-			for _, d := range deliveries {
-				if d.AccountID == accountID && d.DestinationKey == sub2Importer.destinationKey {
-					copy := d.Options
-					requested = &copy
-					break
-				}
 			}
 		}
 		var err error
@@ -314,7 +403,7 @@ func runWithHistoryAccount(ctx context.Context, accountID int64, req LoginReques
 	}
 	persistCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, attempt, err := loginHistory.BeginAttempt(persistCtx, store.Credentials{Email: req.Email, Password: req.Password, TOTPSecret: req.TotpSecret, Proxy: req.Proxy, ExistingAccountID: accountID})
+	_, attempt, err := loginHistory.BeginAttempt(persistCtx, store.Credentials{Email: req.Email, Password: req.Password, TOTPSecret: req.TotpSecret, Proxy: req.Proxy, ExistingAccountID: accountID, SingleAttempt: login.IsSingleAttempt(ctx)})
 	if err != nil {
 		return nil, err
 	}
@@ -323,11 +412,21 @@ func runWithHistoryAccount(ctx context.Context, accountID int64, req LoginReques
 	result, loginErr := run(ctx)
 	finishCtx, finishCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer finishCancel()
+	if loginErr == nil && result != nil {
+		loginErr = verifyStoredOAuthSubject(finishCtx, loginHistory, attempt.AccountID, result.AccessToken)
+	}
 	if loginErr != nil {
 		info := describeLoginError(loginErr)
 		failure := &store.Failure{Stage: info.Stage, Code: info.Code, HTTPStatus: info.HTTPStatus, Retryable: info.Retryable, Message: info.Message, AccountStatus: info.AccountStatus}
 		if err := loginHistory.FinishAttempt(finishCtx, attempt.ID, false, nil, failure); err != nil {
 			return nil, fmt.Errorf("save failed login history: %w", err)
+		}
+		account, err := loginHistory.GetAccountByID(finishCtx, attempt.AccountID)
+		if err != nil {
+			return nil, fmt.Errorf("read saved account status: %w", err)
+		}
+		if errors.Is(account.Sub2EligibilityError(), store.ErrAccountDiscarded) {
+			return nil, store.ErrAccountDiscarded
 		}
 		if accountDeactivationConfirmed(info.Code) && versionErr == nil {
 			// FinishAttempt releases the database state, but the per-email attempt
@@ -351,19 +450,35 @@ func runWithHistoryAccount(ctx context.Context, accountID int64, req LoginReques
 	}
 	stored := &store.Result{AccessToken: result.AccessToken, RefreshToken: result.RefreshToken, ChatGPTAccountID: result.ChatGPTAccountID, OrganizationID: result.OrganizationID, PlanType: result.PlanType, ExpiresAt: result.ExpiresAt, ExpiresIn: result.ExpiresIn}
 	result.AccountID = attempt.AccountID
-	if req.AutoDeliver {
-		delivery, err := loginHistory.FinishAttemptAndQueueDelivery(finishCtx, attempt.ID, stored, sub2Importer.destinationKey, options)
-		if err != nil {
-			return nil, fmt.Errorf("save login and delivery: %w", err)
-		}
-		result.Delivery = delivery
-	} else if err := loginHistory.FinishAttempt(finishCtx, attempt.ID, true, stored, nil); err != nil {
+	var delivery store.AccountDelivery
+	switch {
+	case req.AutoDeliver:
+		delivery, err = loginHistory.FinishAttemptAndQueueDelivery(finishCtx, attempt.ID, stored, importer.destinationKey, options)
+	case accountID > 0 && importer.configured():
+		delivery, err = loginHistory.FinishBoundRelogin(finishCtx, attempt.ID, stored, importer.destinationKey)
+	default:
+		err = loginHistory.FinishAttempt(finishCtx, attempt.ID, true, stored, nil)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("save login history: %w", err)
+	}
+	savedAccount, err := loginHistory.GetAccountByID(finishCtx, attempt.AccountID)
+	if err != nil {
+		return nil, fmt.Errorf("read saved account status: %w", err)
+	}
+	if savedAccount.Status == "discarded" || savedAccount.Sub2Policy == store.Sub2PolicyDiscarded {
+		return nil, store.ErrAccountDiscarded
+	}
+	if delivery.State != "" {
+		result.Delivery = delivery
 	}
 	return result, nil
 }
 
 func describeLoginError(err error) login.LoginErrorInfo {
+	if errors.Is(err, store.ErrAccountDiscarded) {
+		return login.LoginErrorInfo{Stage: login.LoginStageConfiguration, Code: "account_discarded", Message: "账号已在本地退役"}
+	}
 	if errors.Is(err, store.ErrAccountBusy) {
 		return login.LoginErrorInfo{Stage: login.LoginStageConfiguration, Code: "account_busy", Retryable: true, Message: "该账号正在登录，请稍后重试"}
 	}

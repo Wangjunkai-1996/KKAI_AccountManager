@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 )
 
 func (s *Store) initRecoverySettings(ctx context.Context) error {
@@ -38,6 +39,25 @@ func (s *Store) ExplicitRecoveryCheck(ctx context.Context, batchID string) (bool
 	var explicit bool
 	err := s.db.QueryRowContext(ctx, `SELECT request_key LIKE 'recovery-manual-%' FROM account_check_batches WHERE id=?`, batchID).Scan(&explicit)
 	return explicit, err
+}
+
+// ClaimExplicitRecoveryCheck consumes the one check-to-recovery handoff. The
+// request key is server-owned; ordinary detection cannot mint this capability.
+func (s *Store) ClaimExplicitRecoveryCheck(ctx context.Context, batchID string) (manual, claimed bool, err error) {
+	var key string
+	if err = s.db.QueryRowContext(ctx, `SELECT request_key FROM account_check_batches WHERE id=?`, batchID).Scan(&key); err != nil {
+		return false, false, err
+	}
+	if !strings.HasPrefix(key, "recovery-manual-") || strings.HasPrefix(key, "recovery-manual-used-") {
+		return false, false, nil
+	}
+	manual = strings.HasPrefix(key, "recovery-manual-once-")
+	result, err := s.db.ExecContext(ctx, `UPDATE account_check_batches SET request_key=? WHERE id=? AND request_key=?`, "recovery-manual-used-"+key, batchID, key)
+	if err != nil {
+		return false, false, err
+	}
+	n, err := result.RowsAffected()
+	return manual, n == 1, err
 }
 
 func (s *Store) AutomaticRecoveryCheck(ctx context.Context, batchID string) (bool, error) {

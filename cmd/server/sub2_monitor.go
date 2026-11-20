@@ -39,6 +39,12 @@ func (s *sub2RecoveryService) recoverySettings() any {
 		blockedReason = "恢复服务已停止"
 	case !s.configured():
 		blockedReason = "Sub2 恢复服务未配置"
+	case s.checker == nil:
+		blockedReason = "账号检测服务未配置"
+	case s.checker.paused.Load():
+		blockedReason = "账号检测服务已暂停，请重启服务"
+	case s.checker.ctx.Err() != nil:
+		blockedReason = "账号检测服务已停止"
 	}
 	running := enabled && blockedReason == ""
 	if !running {
@@ -188,7 +194,22 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 			direct = append(direct, id)
 		}
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	// Use the persisted latest check ID as the scan cursor. Accounts with no
+	// prior check go first, then the least recently queued item, with account ID
+	// as a stable tie breaker. This keeps the existing 100-item limit fair.
+	sort.Slice(ids, func(i, j int) bool {
+		left, right := checks[ids[i]].LatestTask, checks[ids[j]].LatestTask
+		switch {
+		case left == nil && right != nil:
+			return true
+		case left != nil && right == nil:
+			return false
+		case left != nil && right != nil && left.ID != right.ID:
+			return left.ID < right.ID
+		default:
+			return ids[i] < ids[j]
+		}
+	})
 	sort.Slice(direct, func(i, j int) bool { return direct[i] < direct[j] })
 	queued, waiting, submitted, toCheck := 0, 0, 0, make([]int64, 0)
 	for _, id := range ids {
@@ -252,7 +273,11 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 				summary = "已有检测批次运行，下一轮继续检查 Sub2 异常账号"
 				return
 			}
-			lastError = "自动检测暂不可用，请检查检测代理配置"
+			if checkErr != nil {
+				lastError = checkErr.Message
+			} else {
+				lastError = "自动检测入队失败，下次扫描重试"
+			}
 		} else {
 			submitted = len(toCheck)
 			s.monitorMu.Lock()
@@ -267,6 +292,9 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 }
 
 func (s *sub2RecoveryService) automaticRecoveryAllowed(ctx context.Context, id int64) (bool, error) {
+	if failure, err := s.automationFailure(ctx, id); err != nil || failure != nil {
+		return false, err
+	}
 	if _, active, err := s.store.GetActiveAccountRecoveryTaskForDestination(ctx, id, s.sub2.destinationKey); err != nil || active {
 		return false, err
 	}
@@ -278,9 +306,9 @@ func (s *sub2RecoveryService) automaticRecoveryAllowed(ctx context.Context, id i
 		return false, err
 	}
 	// Structured failures are owned by the durable retry path. A fresh scan
-	// must not bypass its deadline or restart a task that needs a person.
+	// must not bypass its deadline or restart a terminal failure.
 	if previous.RetryAction != "" {
-		return false, nil
+		return s.successfulLoginSupersedesFailure(ctx, previous)
 	}
 	// Success is not a failed attempt: a newly revoked credential must be
 	// checked and recovered without waiting for the second delayed recheck.
@@ -310,6 +338,18 @@ func (s *sub2RecoveryService) retryDueRecoveries() {
 			return
 		}
 		if task.Purpose != "delivery" && !s.autoRecovery.Load() {
+			continue
+		}
+		if failure, readErr := s.recoveryAutomationFailure(ctx, task.AccountID, task.ID); readErr != nil {
+			if !errors.Is(readErr, store.ErrAccountNotFound) {
+				s.pauseRecovery(task.ID, readErr)
+				return
+			}
+			continue
+		} else if failure != nil {
+			if task.NextRetryAt != nil || task.RetryAction == "relogin" || task.RetryAction == "resume" {
+				s.recordRecoveryFailure(task, task.FailureStage, failure)
+			}
 			continue
 		}
 		if task.RetryAction == "" && (task.State == store.RecoveryFailed || task.State == store.RecoveryUnknown) {
@@ -401,14 +441,22 @@ func (s *sub2RecoveryService) recordRecoveryEnqueueFailure(accountID int64) {
 	s.monitorState.LastError = fmt.Sprintf("账号 %d 的认证失败已确认，但恢复未能入队；请刷新历史后查看账号绑定与恢复详情", accountID)
 }
 
-func (s *sub2RecoveryService) queueRecoveryChecks(ctx context.Context, ids []int64, manual bool) (store.AccountCheckBatch, error) {
+func (s *sub2RecoveryService) queueRecoveryChecks(ctx context.Context, ids []int64, manual bool, singleAttempt ...bool) (store.AccountCheckBatch, error) {
 	checker := s.checker
-	if checker == nil || checker.paused.Load() || checker.ctx.Err() != nil {
-		return store.AccountCheckBatch{}, errors.New("检测服务不可用")
+	switch {
+	case checker == nil:
+		return store.AccountCheckBatch{}, &store.AccountCheckError{Code: "checker_unconfigured", Message: "账号检测服务未配置"}
+	case checker.paused.Load():
+		return store.AccountCheckBatch{}, &store.AccountCheckError{Code: "checker_paused", Message: "账号检测服务已暂停，请重启服务"}
+	case checker.ctx.Err() != nil:
+		return store.AccountCheckBatch{}, &store.AccountCheckError{Code: "checker_stopped", Message: "账号检测服务已停止，请重启服务"}
 	}
 	prefix := "recovery-auto-"
 	if manual {
 		prefix = "recovery-manual-"
+		if len(singleAttempt) > 0 && singleAttempt[0] {
+			prefix = "recovery-manual-once-"
+		}
 	}
 	var key [16]byte
 	if _, err := rand.Read(key[:]); err != nil {
@@ -417,11 +465,11 @@ func (s *sub2RecoveryService) queueRecoveryChecks(ctx context.Context, ids []int
 	input := store.AccountCheckInput{RequestKey: prefix + hex.EncodeToString(key[:]), AccountIDs: ids, Concurrency: 2, ProxyMode: "direct", DestinationKey: s.sub2.destinationKey}
 	if checker.proxy != "" {
 		if checker.upstreamProxy != "" {
-			return store.AccountCheckBatch{}, errors.New("检测暂不支持前置代理")
+			return store.AccountCheckBatch{}, &store.AccountCheckError{Code: "upstream_proxy_unsupported", Message: "检测暂不支持前置代理"}
 		}
 		client, err := probe.NewClient(checker.proxy)
 		if err != nil {
-			return store.AccountCheckBatch{}, errors.New("检测代理配置无效")
+			return store.AccountCheckBatch{}, &store.AccountCheckError{Code: "invalid_proxy", Message: "检测代理配置无效"}
 		}
 		client.Close()
 		input.ProxyMode, input.Proxy = "default", checker.proxy
@@ -450,25 +498,34 @@ func (s *sub2RecoveryService) handleRecoveryCheck(w http.ResponseWriter, r *http
 		recoveryAPIError(w, 400, "invalid_account_id", "account_id 必须是正整数")
 		return
 	}
+	if req.ManualAttempt && (req.ExpectedTaskID == nil || req.ExpectedRetryCount == nil) {
+		recoveryAPIError(w, http.StatusBadRequest, "recovery_snapshot_required", "请刷新账号状态后重试")
+		return
+	}
 	if !s.remoteRecoverySuspect(r.Context(), req.AccountID) {
 		recoveryAPIError(w, 422, "not_recoverable", "仅恢复仍在 Sub2 池中的异常账号；禁用、人工暂停或未知状态请先核对")
 		return
 	}
-	if task, _, err := s.enqueue(r.Context(), req.AccountID); err == nil {
+	if task, _, err := s.enqueueWithIntent(r.Context(), req.AccountID, req.ManualAttempt, false, req); err == nil {
 		respondJSONStatus(w, 202, map[string]any{"success": true, "task": task})
 		return
 	} else if !errors.Is(err, errRecoveryNotCandidate) {
 		recoveryAPIError(w, 409, "recovery_unavailable", safeRecoveryMessage(err))
 		return
 	}
-	batch, err := s.queueRecoveryChecks(r.Context(), []int64{req.AccountID}, true)
+	batch, err := s.queueRecoveryChecks(r.Context(), []int64{req.AccountID}, true, req.ManualAttempt)
 	if err != nil {
 		var safe *store.AccountCheckError
 		if errors.As(err, &safe) {
-			respondJSONStatus(w, 409, map[string]any{"success": false, "code": safe.Code, "message": safe.Message, "active_batch_id": safe.ActiveBatchID})
+			status := http.StatusConflict
+			switch safe.Code {
+			case "checker_unconfigured", "checker_paused", "checker_stopped", "upstream_proxy_unsupported", "invalid_proxy":
+				status = http.StatusServiceUnavailable
+			}
+			respondJSONStatus(w, status, map[string]any{"success": false, "code": safe.Code, "message": safe.Message, "active_batch_id": safe.ActiveBatchID})
 			return
 		}
-		recoveryAPIError(w, 503, "checks_unavailable", "检测服务不可用，请检查检测代理配置")
+		recoveryAPIError(w, 503, "checks_unavailable", "检测任务入队失败，请稍后重试")
 		return
 	}
 	respondJSONStatus(w, 202, map[string]any{"success": true, "batch_id": batch.ID})

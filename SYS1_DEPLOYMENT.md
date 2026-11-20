@@ -1,5 +1,216 @@
 # sys1 线上部署说明
 
+## 当前线上：重导入旧代理备用与错误展示修复（2026-11-14）
+
+sys1 已上线 `20261114T033924Z-reimport-proxy`。#780 两次重导操作在登录阶段因历史代理的 HTTPS 隧道失败而停止；先前笼统显示“代理配置无效”，并被 Sub2 缺失提示遮蔽。现在未绑定/关联缺失账号没有显式选择出口时会先探测旧代理，连接失败后尝试 sys1 IPv4；认证、证书、取消与无效配置仍保留各自门禁。账号诊断及“更多”同时显示最近持久化登录错误，失败后按钮恢复可用。
+
+产品、后端安全、前端复审及定向检查通过。北京时间 11:48:01 最终验收：候选/正式账号 1581 OAuth 成功，正式用时 12.573 秒；active/running、NRestarts=0、登录后巡检推进、错误聚合全为 0。路由、数据库、静态 hash、0600 一致性备份及回滚版 `20261114T030748Z-reimport` 均验证通过。没有替 #780 再次登录或创建 Sub2；仍保留 remote_missing。全仓完整套件未运行，未提交/推送源码。精确命令、根因、边界与证据见 [修复记录](docs/account-management-20261113/reimport-proxy-fix-20261114.md)。
+
+
+## 历史发布：Sub2 缺失账号显式重新导入（2026-11-14）
+
+sys1 已上线 `20261114T030748Z-reimport`。账号表“更多”对仍保留 `remote_missing` 绑定的账号提供“重新登录并导入 Sub2”：用户确认一次交付参数后，系统以 `auto_deliver:false` 登录 AUTH，刷新并校验凭据版本严格增长及原 `operation_id` 未变化，再提交一次 `reimport:true` 导入。取消、登录失败、历史刷新失败、状态变化、版本未增长、旧 operation、超时未知结果都不会自动重发或创建账号。单账号参数不污染批次或平台默认值；无绑定历史记录、官方删除账号和普通 missing 导入仍不自动重建。
+
+最终候选经产品、后端安全、前端独立复审；Node、后端/store 定向测试、Linux amd64 构建、服务用户浏览器 runtime、桌面 1200px 合成页面和 390px 页面验收通过，页面无 JavaScript 异常或横向溢出。生产真实 OAuth 使用授权验收账号 1581，`auto_deliver=false`，attempt 1594 成功，未创建 Sub2。正式切换后即时与 60 秒延迟 gate 通过：active/running、NRestarts=0、health/ready/socket 正常，公网未认证 401，巡检推进，错误聚合全为 0；备份 `/var/lib/openai-login/backups/accounts-before-20261114T030748Z-reimport.db` 完整性为 ok、权限 0600。
+
+截图中的 AUTH #780 / Sub2 #17075 仍为 `remote_missing`，本轮未触发重建。完整方案、参数契约、浏览器验证和限制见 [重新导入记录](docs/account-management-20261113/reimport-20261114.md)。本轮完整测试套件未运行。
+
+## 历史发布：暂停账号操作与 TOTP 修复（2026-11-14）
+
+sys1 已上线 `20261114T021850Z-paused-actions`，经后端、前端与产品独立复审。自动暂停不再隐藏重登录/恢复入口，“更多”展开区域可用；每次显式操作只执行一轮，单次意图在登录开始前持久化，失败或重启不会被后台重放。新版 TOTP 文案漏识别已修复，Sub2 缺失和身份/分组/调度保护保留。
+
+AUTH 1579、1580 已各一次真实登录成功，沿用原任务 1304、1305 写回原 Sub2 17353、17352；均 active 且有效可调度，没有新建账号。北京时间 10:24:45 最终验收通过，登录后的巡检推进、错误聚合全为 0，active/running、NRestarts=0、数据库/入口/静态资源正常；257 个已删除关联仍阻断。
+
+前版 `20261113T163828Z-account-management`、一致性备份和运行环境完整保留，未自动回滚。隔离凭据副本和上传目录已清理。定向 Go/race/Node/浏览器/vet、候选与正式业务验收通过；全仓完整套件未运行，未提交/推送源码。精确命令、限制与脱敏证据见 [本轮修复和发布记录](docs/account-management-20261113/paused-actions-20261114.md)。
+
+## 历史发布：账号管理与删除保护（2026-11-14 00:55）
+
+sys1 已部署 `20261113T163828Z-account-management`，前一版 `20261113T104100Z-ipv4-fallback` 与一致性备份保留。文档经产品、后端安全、前端审查，代码完成后再次交叉复审；首个候选的真实 TOTP 页面遗漏已拦截并修复，最终候选与正式 OAuth 均成功。
+
+邮箱/手机验证及密码/TOTP 错误停止自动重试并显示具体原因；详情可按字段查看密码与 TOTP 密钥，账号表保留名称前缀并支持套餐筛选。可信 Sub2 缺失持久化 `remote_missing`，停止旧检测、恢复、交付与修复；官方删号仍走独立清理。线上确认 257 个缺失关联、活跃恢复 0；77 个现有关联有可信自定义名称，另 2 个状态未知继续保守处理。
+
+北京时间 00:55:57 最终验收：active/running、NRestarts=0，health/ready/socket 与实际路由正常；真实正式 OAuth 12.467 秒，未触发交付；登录后巡检继续，发布窗口固定错误聚合全为 0。凭据单字段接口、无秘密的普通详情、跨站 403、公网未认证 401 均通过，回滚运行环境与备份完整。临时候选凭据副本及上传目录已清理，操作脚本与验收证据归档。定向测试通过，全仓完整套件未运行；未提交/推送源码。精确命令、结果、限制及脱敏证据见 [实施与发布记录](docs/account-management-20261113/implementation.md)。
+
+## 历史发布：认证页面超时复活修复（2026-11-01 11:52 北京时间）
+
+sys1 当前 `20261101T031600Z-auth-page-timeout`；前一版 `20261031T204209Z-recovery-fix` 保留，未回滚。三个角色审查方案、第四角色复审实现后完成：页面等待超时进入自动退避，真正页面结构错误/明确认证拒绝保持人工处理；父级总超时保留页面原因，不能绕过预算。同任务总失败次数到 3 时，仍报页面等待超时则转人工，不无限重试。无 schema/依赖变更，未提交/推送代码。
+
+只将通过任务/凭据版本/绑定/更新时间校验的 AUTH #842 task654 重新纳入原重试流程。11:49:30 登录成功（attempt1103），11:49:33 任务完成；11:51:42 确认 Sub2 17133 active、schedulable=true，出口仍 route199。AUTH #317 已失败25轮，未释放。首轮延迟复检按原策略在12:19:33进行，当前尚未到期。候选、运行环境、兼容、即时/60秒延迟验收和真实#842恢复通过；服务健康、巡检推进、发布窗口错误聚合0。定向race/vet及脚本测试通过，全量未运行。方案、完整验证命令与证据见 [AUTH_PAGE_TIMEOUT_FIX_20261101.md](AUTH_PAGE_TIMEOUT_FIX_20261101.md)。
+
+## 历史发布：自动检测与恢复修复（2026-11-01）
+
+三角色方案商议后完成修复并上线 sys1。正式 release：`20261031T204209Z-recovery-fix`；回滚：`20261031T194600Z-recent-cost`；Linux amd64 二进制 SHA-256：`732ec7cb6e7268d3758fef493ca2cf084917c1076057c3f6312baae4208701ed`；源码为 `33d64a0401599837246f647d4d5fdf554e8a0015` + 当前工作区，未提交/推送。无 schema 迁移，Sub2 服务未修改。
+
+- 已修复：登录写回 fresh 身份门禁、出口临时故障持久退避、检测队列公平轮转、`Retry-After` 冷却、checker 健康状态、目标隔离、空状态查询和延迟复检入口。
+- 邮箱 `trunk.earthen-97+split42fb6bb24853@icloud.com` 对应 AUTH account `1055`。候选与生产真实 OAuth 均通过，`auto_deliver=false`；候选约 35.8 秒，生产约 12.6 秒；两次均成功保存凭据，数据库完整性为 `ok`。不记录凭据内容。
+- 候选、回滚兼容、服务用户浏览器 smoke、静态资源 hash、数据库完整性均通过。生产切换前后 8 类在途任务均为 0；生产备份 `/var/lib/openai-login/backups/accounts-before-20261031T204209Z-recovery-fix.db`，权限 0600，`integrity_check=ok`。
+- 切换后即时及 60 秒延迟验收通过：active/running、`NRestarts=0`、health/ready/socket 正常、公网未认证 HTTP 401、自动恢复运行且巡检推进、panic/fatal/数据库锁/存储/监听/浏览器权限/登录失败/OAuth 401/403/5xx 聚合均为 0。有效路由仍为 `proxy_pass http://unix:/run/tls/auth/login.sock:;`。
+- 最终只读复核全部 gate 通过：当前 release、binary、静态资源、数据库、回滚、有效路由、自动恢复、扫描推进、延迟验收和 SOURCE manifest 均为 `true`。临时上传与隔离候选已按精确 SHA-256 清理，正式/回滚 release、备份和验收证据保留。
+
+完整方案、验证命令、证据文件和剩余技术边界见 [AUTO_RECOVERY_FIX_20261101.md](AUTO_RECOVERY_FIX_20261101.md)。全量仓库测试未运行；已完成定向 Go/race/vet、Node、shell、发布脚本和生产 gate 验证。
+
+## 近 90 天账号费用发布（2026-11-01 03:54 北京时间）
+
+- 当前 release `20261031T194600Z-recent-cost`；源码 `33d64a0401599837246f647d4d5fdf554e8a0015` + 工作区，未提交/推送。Linux amd64 SHA-256：`4596c724f8969275e570f293c24e480702cbea7223a4c9a44fbcabd65b1e02b9`。前一版 `20261031T173803Z-login-limit-fingerprint` 保留，本轮未回滚。
+- `GET /api/history/usage?account_ids=...` 接 Sub2 `/admin/accounts/:id/stats?days=90`，固定近 90 天，使用 `summary.total_cost` 账号口径（USD）。每批最多 100 个本地 ID，全服务最多 4 个远端读取并发，成功缓存 5 分钟、失败缓存 30 秒；查询失败保留已知金额并标记 stale，无已知值为 unknown，不伪造零。
+- 账号表额度格保留百分比，另显示近 90 天美元；详情显示同步时间、请求数和 Token。仅按当前页读取，30 秒客户端缓存/在途去重，绑定变更失效、迟到响应按账号身份丢弃。小于 $0.01 的正数显示 `<$0.01`；未知与真零区分。
+- 官方 deleted 账号在原清理流程完成后保留本地安全元数据；清空密码、TOTP、代理、AT/RT，并清除原来级联删除的后台任务。删绑定之前保存可信 destination + Sub2 ID 生命周期记录，写失败保留 binding 重试；费用查询可在 binding 删除后回查该 ID。不自动重关联/重登/重交付 deleted 行。无 schema 或 Sub2 变更，手动删除仍能移除本地行。旧版已经彻底删除的账号不重建；探测只记 lifecycle、不改 accounts.status 的原行为维持。
+- 19:51:21 UTC 开始切换。开始准备时有后台恢复任务，等其自然结束后才执行；沿用同会话用户已确认整批结束的授权。停服前再次检查，切换前后 8 类在途均为 0。禁自动回滚脚本归档为 `DEPLOY_SCRIPT.py`。备份 `/var/lib/openai-login/backups/accounts-before-20261031T194600Z-recent-cost.db`，0600，integrity_check=ok。
+- 隔离候选、服务用户 Node/Playwright/Chrome smoke、前一版数据库兼容和运行环境均通过。19:52:27 UTC 延迟验收 active、NRestarts=0、health/ready/socket 正常，公网未认证 401；19:53:29 UTC 巡检继续。发布窗口 panic/fatal/数据库锁/存储/监听/浏览器权限/登录失败/OAuth 401/403/5xx 聚合为 0。服务健康不代表所有账号正常；原有 34 个状态未知、1 个等待/冷却仍按业务处理。
+- 有效 kkai-edge AUTH 路由仍为 `proxy_pass http://unix:/run/tls/auth/login.sock:;`。正式 HTML SHA-256 `ea26a3e289e608271c09920c863febf4d6aba1ecbc0f56711607bb29c2dffde2`，JS SHA-256 `9eef63723a505adec01f70e14d49e5970131d9273e5eed3e385fef61ac773343`，与候选/本地一致。
+- 线上只读验收新费用接口：AUTH 1062=$20.1465308、1061=$12.7473804、已有 Sub2 删除记录的 682=$366.97327228，均返回 90 天、请求数和 Token。仅在远端进程内使用现有管理凭据，未输出秘密。此项证明已有删除绑定可读；全新的无 binding 保留行回查由定向测试验证，未在生产制造官方删号。
+- mock 浏览器 1440/1100/390px 无横向溢出，列表/详情费用显示正常；未执行认证后公网浏览器业务或真实 OAuth。滚动 90 天取决于 Sub2 保留的使用日志，不是终身累计或官方账单。全量套件未运行。
+- 正式 release 保留 `SOURCE.json`、`STAGE_SCRIPT.py`、`DEPLOY_SCRIPT.py`、`CANDIDATE_ACCEPTANCE.json`、`ACCEPTANCE.json`、`DELAYED_ACCEPTANCE.json`、`COST_AND_ROUTING_ACCEPTANCE.json`、运行时证据和 `CLEANUP.json`；临时上传物及隔离候选已清理，当前/前一版和数据库备份保留。
+
+定向验证命令（最终均通过）：
+
+```bash
+go test ./cmd/server -run '^TestRecentAccountCost' -count=1
+go test ./internal/store -run 'TestDeletedAccountRetainsOnlySafeHistoryAndDeactivatedIsRetained|TestOfficialLifecycleEventIsRecordedAndSurvivesAccountDeletion' -count=1
+go test ./cmd/server -run 'TestDeleteDeletedAccount|TestHistoryLoginRejectsRetainedDeletedAccount|TestRecentAccountCost' -count=1
+# 首次下列相关范围中 TestSyncSub2AccountAssociation 旧 mock 把只读 usage/batch POST 误认成修改：
+go test ./cmd/server -run 'Test(Sub2Import|SyncSub2|HistoryLogin|PendingCleanup)' -count=1 -timeout=90s
+# 修正仅该 mock，仍拒绝其余修改；失败项重跑通过：
+go test ./cmd/server -run '^TestSyncSub2AccountAssociation$' -count=1 -timeout=90s
+node --check cmd/server/client.js
+node cmd/server/client.test.cjs
+python3 scripts/auth-deploy-release_test.py
+bash -n verify-runtime.sh
+git diff --check
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c ./internal/login -o /tmp/kkai-auth-recent-cost-smoke.test
+./build-linux.sh /tmp/openai-login-20261031T194600Z-recent-cost
+```
+
+最终再次核对费用、store、`Test(Sub2Import|SyncSub2|HistoryLogin|PendingCleanup)` 相关范围、Node 与 diff：全部通过（Go 分别 0.080s、0.045s、0.199s）。原失败的关联 mock 已修正。
+
+上传后发布命令（均通过；远端临时文件已清理，命令为执行记录）：
+
+```bash
+scp -o BatchMode=yes -o ConnectTimeout=8 /tmp/openai-login-20261031T194600Z-recent-cost /tmp/kkai-auth-recent-cost-smoke.test /tmp/auth-deploy-recent-cost.py /tmp/auth-recent-cost-SOURCE.json scripts/auth-stage-release.py verify-runtime.sh sys1:/tmp/
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-stage-release.py --release-id 20261031T194600Z-recent-cost --binary /tmp/openai-login-20261031T194600Z-recent-cost --smoke /tmp/kkai-auth-recent-cost-smoke.test --verify /tmp/verify-runtime.sh'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-deploy-recent-cost.py --release-id 20261031T194600Z-recent-cost --source-commit 33d64a0401599837246f647d4d5fdf554e8a0015+working-tree --binary-sha256 4596c724f8969275e570f293c24e480702cbea7223a4c9a44fbcabd65b1e02b9 --delay-seconds 60'
+```
+
+
+## 登录累计限额移除与指纹默认值发布（2026-11-01 01:46 北京时间）
+
+- 当前 release `20261031T173803Z-login-limit-fingerprint`；源码 `33d64a0401599837246f647d4d5fdf554e8a0015` + 工作区，未提交/推送。Linux amd64 SHA-256：`ba0e3c8d31be42c6651e59f789598e9cc8eca57cb8b14c43b1ff2a55013a59f5`。保留前一版 `20261031T165353Z-egress-sync`，本轮未回滚。
+- 新登录、SSE 登录、历史重登移除 AUTH 每 IP 每 10 分钟 30 次的累计限制；前端取消整批“平台限流”倒计时。保留并发槽（线上 10）、并发满时单账号等待/停止、输入校验、上游真实限流和代理检测接口独立限流。旧 `-rate-limit` 启动参数继续接受，但已弃用。
+- AUTH 新交付、网页导出、CLI 导出默认 `extra.codex_fingerprint_mode=full`（完全收敛），seed 由 Sub2 按账号生成。已有账号与上线前已持久化的导入 payload 不自动追补。已打开页面需在整批结束后刷新加载新 JS。
+- 保留上一版代理同步功能：交付参数选择 Sub2 HTTP 代理，多选首个用于首次登录、全部用于新账号出口池；复活/历史重登/资料修复读取 Sub2 当前绑定，优先当前主代理，不可达时尝试绑定池备用。AUTH 不回写 Sub2 出口。
+- 用户明确确认“已经全部结束，继续上线”后才切换。切换前、紧邻停服前及停服后核对 8 类在途任务；切换前后均为 0。使用本次临时发布脚本关闭自动回滚分支、计数缺失时阻止切换，避免违反用户不要切回旧版的指示。备份 `/var/lib/openai-login/backups/accounts-before-20261031T173803Z-login-limit-fingerprint.db`，0600，`integrity_check=ok`。
+- 隔离候选、前一版兼容及服务用户 Node/Playwright/Chrome smoke 通过。17:45:15 UTC 开始切换；17:46:21 UTC 延迟验收 active、`NRestarts=0`，health/ready/socket 正常，自动恢复巡检推进至 17:46:19 UTC。有效 `kkai-edge` AUTH 路由为 `/run/tls/auth/login.sock`，公网未认证 401；启动后 panic/fatal/数据库锁/存储/监听/浏览器权限/登录失败/OAuth 401/403/5xx 聚合均为 0。
+- 正式 HTML SHA-256 `f7be2c99b718e4d93a39d59b2061dc1744db74754f4468e7ad62da4f239f6f8e`；JS SHA-256 `15bafbf96a06c4bae205779e3fbf87a5ff81a72256146d043b15998c20928527`，均与本地及候选一致。证据位于当前 release 的 `CANDIDATE_ACCEPTANCE.json`、`ACCEPTANCE.json`、`DELAYED_ACCEPTANCE.json`、`ROUTING_ACCEPTANCE.json` 和 runtime 文本。
+- 定向验证全部通过；全量套件未运行。本次未触发真实账号 OAuth、真实 Sub2 新账号交付或批量覆盖已有指纹；`full` 的新账号请求契约由 mock 回归验证，真实 Sub2 创建后读回仍是验证缺口。未修改 Sub2 服务。自动恢复报告 1 个等待/冷却账号、34 个状态暂时未知，服务健康不等于所有账号健康。
+
+精确验证命令（均通过）：
+
+```bash
+go test ./cmd/server -run 'Test(LoginEndpointsHaveNoCumulativeRequestLimit|BusyLoginPreservesConcurrentSlot|LoginRequestGuards|ClientIPIgnoresForwardedIP|ConcurrentLoginLimitAndRelease|HandleLoginStreamValidationStaysJSON|LoginBusyCarriesJSONRetryAfter|ProxyCheckJSONGuardsAndRateLimit|ReserveReturnsRemainingWaitWithoutConsumingRejection)' -count=1
+go test ./cmd/server ./internal/exporter -run '^TestSub2ImportPostsAndReconcilesUnGroupedAccount$' -count=1
+node --check cmd/server/client.js
+node cmd/server/client.test.cjs
+git diff --check
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c ./internal/login -o /tmp/kkai-auth-login-limit-fingerprint-smoke.test
+./build-linux.sh /tmp/openai-login-20261031T181500Z-login-limit-fingerprint
+```
+
+构建成功后将产物更名为 `/tmp/openai-login-20261031T173803Z-login-limit-fingerprint`，使 release ID 与实际 UTC 时间一致。两个 Go 命令分别通过（server 0.035s、0.036s；exporter 编译通过，无独立测试文件）；三条登录入口同 IP 各 35 次越过原累计限流入口，并发满仍返回 `platform_busy`。Node 交互包括上游 429 不暂停下一账号、Stop 终止并发等待和导出 full。
+
+发布命令（均通过；只上传本地构建产物，未访问代码托管）：
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-stage-release.py --release-id 20261031T173803Z-login-limit-fingerprint --binary /tmp/openai-login-20261031T173803Z-login-limit-fingerprint --smoke /tmp/kkai-auth-login-limit-fingerprint-smoke.test --verify /tmp/verify-runtime.sh'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-deploy-login-limit-fingerprint.py --release-id 20261031T173803Z-login-limit-fingerprint --source-commit 33d64a0401599837246f647d4d5fdf554e8a0015+working-tree --binary-sha256 ba0e3c8d31be42c6651e59f789598e9cc8eca57cb8b14c43b1ff2a55013a59f5 --delay-seconds 60'
+```
+
+## 账号表视觉改版发布（2026-10-29 18:15 北京时间）
+
+- 当前 release `20261029T101042Z-account-table-visual`，本地源码 `33d64a0401599837246f647d4d5fdf554e8a0015` 加工作区改动，未同步代码托管。Linux amd64 二进制 SHA-256 `41828676d03b61e855ad2330250f437853fcd297c70b91679249dfd3bef3977d`；回滚 release `20261029T082510Z-usage-sync` 保留。
+- 账号表改为中性深色工作台，恢复 AUTH、Sub2 调度及删除来源的语义状态色；长状态完整显示时间，1100px 和 390px 布局无横向溢出。此次视觉调整只改 `cmd/server/index.html`，账号数据及交互逻辑不变。
+- 定向验证通过：`go test ./cmd/server -run 'TestSyncSub2AccountStatusesAttachesBatchUsage' -count=1 -timeout=90s`、`node --test cmd/server/client.test.cjs`、`node --check cmd/server/client.js`、`python3 scripts/auth-deploy-release_test.py`、`bash -n verify-runtime.sh`、`git diff --check`、Linux amd64 构建及登录 smoke 编译。完整仓库套件未运行。
+- 隔离候选、当前正式版回滚兼容与运行时 smoke、静态资源 hash、数据库完整性均通过。切换前后 8 类在途任务为 0；生产备份 `/var/lib/openai-login/backups/accounts-before-20261029T101042Z-account-table-visual.db` 为 0600、`integrity_check=ok`。
+- 即时和 60 秒延迟验收通过：正式服务 active、`NRestarts=0`，health/ready/socket 正常，公网未认证返回 HTTP 401，自动恢复巡检继续，发布窗口严重错误聚合为 0。正式页面 `/` 的 SHA-256 为 `900e6ec94d7fbc9639b3d2e60a3e9b1e773aaf4f1ea63bc8403759fed43c116f`，与本地 HTML 一致；正式 release 保留候选、即时、延迟验收与运行时证据。
+
+## Sub2 额度同步修复发布（2026-10-29 16:25 北京时间）
+
+- 当前 release `20261029T082510Z-usage-sync`，源码为 `HEAD + working tree`（本轮未执行代码托管同步）；Linux amd64 二进制 SHA-256 `7044744c346705772e5a92f7c11b3a724fec9b6249f632adecfe7235d13e9970`。回滚 release `20261029T080922Z-account-status-usage` 保留。
+- 账号表现在区分官方删除/停用与 Sub2 删除：官方 AUTH 生命周期事件持久化为 `source=official`，Sub2 详情明确返回 404 且存在本地绑定时记录 `source=sub2,status=deleted`；临时网络/5xx/额度同步失败只显示“未知/待核对”，不会误判为删除。重复轮询按 destination、Sub2 ID 去重。
+- 账号表同步展示 Sub2 `schedulable`、`effective_schedulable`、状态来源、5h/7d/Sonnet/Fable/30d 使用窗口、Credits、更新时间和同步异常；详情页展示生命周期历史。额度同步保留详情接口已有 credits 等字段，批量接口失败不覆盖已确认账号状态。
+- 线上复核结果：账号总数 293；其中 Sub2 active 104、明确 Sub2 404 删除 171、状态未知/过期 18。已记录的 171 条生命周期事件全部为 `source=sub2,status=deleted`，当前没有明确 `source=official` 的删除/停用事件。104 个 Sub2 active 账号均有额度快照，103 个包含 `five_hour`/`seven_day`，另 1 个仅有 `credits`；Sonnet/Fable/30d 当前未被 Sub2 返回。
+- 定向验证通过：Sub2/生命周期 Go 测试、前端 Node 测试、`node --check cmd/server/client.js`、`python3 scripts/auth-deploy-release_test.py`、`bash -n verify-runtime.sh`、`git diff --check`、Linux amd64 登录 smoke 编译。未运行完整仓库套件。
+- 候选与回滚 runtime smoke、候选数据库完整性、旧版本兼容、静态资源、即时及 60 秒延迟验收通过。正式服务 active/running、`NRestarts=0`、本机 health/ready 正常、公网未认证 HTTP 401、自动恢复运行；发布窗口严重错误聚合为 0。切换前后 8 类在途任务均为 0；18 个账号状态未知属于业务状态，不是发布残留。
+- 本轮修复历史同步遗漏批量额度接口的问题，`syncAccountStatuses()` 现在会为当前 Sub2 账号调用 `/admin/accounts/usage/batch` 并写入 5 小时等额度；回归测试已覆盖请求 ID、非 force 参数和额度落库。数据库备份完整性为 `ok`，正式 release 保留候选、即时、延迟验收和回滚运行时证据，临时上传物和候选目录已清理。
+
+## 账号表展示发布（2026-10-29 15:29 北京时间）
+
+- 当前 release `20261029T072243Z-account-table`，源码 `41e6f6d82571afba2d24dcfea3d65e3c6102625e` + 工作区改动；Linux amd64 二进制 SHA-256 `851b0d42f6f74e64e867eb8a5335e4cd98dd4697c8bd57c7979787e1bd01926b`。回滚 release `20261029T0430Z-stop-batch` 保留；本轮未提交或同步代码托管。
+- 账号检测导航已隐藏，账号历史改为账号表，增加账号、AUTH 登录、Sub2 调度、交付/恢复、最近成功和操作列；支持邮箱/账号 ID 搜索、状态筛选、汇总统计、详情中的 Sub2 与恢复进度；旧 `#accountChecksPanel` 深链继续跳转账号表。后台检测、自动恢复和账号行“检测并恢复”保留。
+- 定向验证通过：`node cmd/server/client.test.cjs`、`node cmd/server/account-checks.test.cjs`、`node --check cmd/server/client.js`、`bash -n verify-runtime.sh`、`git diff --check`、Linux amd64 构建及登录 smoke 编译；未运行完整仓库套件。
+- 候选与回滚运行时 smoke、候选数据库完整性、即时及 60 秒延迟验收均通过；切换前后在途任务 8 类计数均为 0。正式服务 active/running、`NRestarts=0`、health/ready/socket 正常、公网未认证 HTTP 401、自动恢复运行且巡检推进，发布窗口严重错误聚合为 0。
+- 发布前备份 `/var/lib/openai-login/backups/accounts-before-20261029T072243Z-account-table.db`，`integrity_check=ok`；正式 release 保留 `CANDIDATE_ACCEPTANCE.json`、`ACCEPTANCE.json`、`PRODUCTION_RUNTIME.txt` 和延迟验收证据。临时上传物已清理。
+
+## 批量登录停止按钮发布（2026-10-29 12:37 上海时间）
+
+- 当前 release `20261029T0430Z-stop-batch`，源码 `41e6f6d82571afba2d24dcfea3d65e3c6102625e` + 工作区改动；二进制 SHA-256 `88f3ee0779cb3f28ffdcc5026cb3a3dfeea01b678eca6a5de10aba70ef5428b5`，源码指纹 `ae34e91cf45ff8322cfa8458f06970385150d1f7045e8f52aa2f1eb4fe2593e3`。与上一版 `SOURCE.json` 的 91 个文件比较，仅 `cmd/server/client.js` 和 `cmd/server/index.html` 改变。回滚 release `20261013T174400Z-queue-retry` 保留；本轮未提交/推送源码。
+- 批量登录新增“停止”：中断在途 SSE、停止排队和限流等待；已成功结果保留。中断时可能已写入的账号先显示“待核对”，历史确认成功后只在历史查看结果，确认失败才开放重试；无法确认时不允许盲目重试。已提交的 Sub2 交付和后台自动恢复不受此按钮控制。
+- 定向验证通过：`node cmd/server/client.test.cjs`、`node --check cmd/server/client.js`、`go test ./cmd/server -run 'Test(ServeLoginStream|HandleLoginStream|LoginRequestGuards|BusyLogin)' -count=1 -timeout=60s`、`python3 scripts/auth-deploy-release_test.py`、`bash -n verify-runtime.sh`、`git diff --check`，以及 `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c ./internal/login -o /tmp/kkai-auth-20261029T0430Z-stop-smoke.test` 和 `./build-linux.sh /tmp/openai-login-20261029T0430Z-stop`。未运行完整仓库套件。
+- 隔离候选数据库完整、无 Sub2 配置且自动恢复关闭；候选和回滚的服务身份浏览器 smoke、旧版数据库兼容、静态资源 hash 均通过。历史验收账号 616 在候选被上游返回 `account_deactivated/403`，不能作为版本故障；改用 AUTH 693 后候选和生产 IPv4 OAuth 均成功，`auto_deliver=false`，凭据已加密保存。该真实 OAuth 验收不是停止按钮的真实账号中途取消演练。
+- 切换前后在途任务均为 0；备份 `/var/lib/openai-login/backups/accounts-before-20261029T0430Z-stop-batch.db` 为 0600 且 `integrity_check=ok`。即时及 60 秒延迟验收通过：服务 active、NRestarts=0、health/ready/socket 正常、公网未认证 HTTP 401、自动恢复运行且生产 OAuth 后巡检推进；发布窗口严重错误聚合为 0。新 release 保存 `SOURCE.json`、候选/生产 OAuth 和两阶段验收证据。
+- 2026-10-29 12:37 左右复核此前 13 个号：交付记录 13/13 `completed` 且 Sub2 均 `active`、`schedulable=true`；其中 12 个因 Sub2 临时限流而 `effective_schedulable=false`，重置时间约为北京时间 16:35-16:49。交付完成与当前可调度是不同状态，不得混称。
+
+## 历史发布：队列暂停恢复与修复（2026-10-14 01:57 上海时间）
+
+- 当前正式 release：`20261013T174400Z-queue-retry`，发布窗口起点 `2026-10-13T17:49:55Z`。本地源码为 `41e6f6d82571afba2d24dcfea3d65e3c6102625e` 加工作区原有改动和本轮修复；未提交或同步代码托管。二进制 SHA-256：`03850f2ae36968b6ec32f587cb1f11f208c06ac3c8f0c1a50c3eefd298f3cc3a`；构建源码指纹：`a7fccaf26680ecfcb1f029a8f3ba6cda837438589ef34fbf6363652c9834bd6c`，各源码文件 hash 保存在正式 release 的 `SOURCE.json`。回滚点：`20261011T154920Z-group-empty-fix`，SHA-256 `e0c54200ae34a346faa4bd1f3859bd35d79eacf4090e18c7d64f86e7a7efa3df`。
+- 事故中检测和恢复 worker 于上海时间 01:13:01 因存储错误暂停，之后交付 worker 不再派发，截图的 10 条交付持续 queued。事故日志没有 SQL 错误分类，不能断言原始数据库错误一定是超时。同期服务撞到 `TasksMax=2048`（`pids.peak=2048`、`pids.events max=21`），出现 Node `uv_thread_create` assertion；内存峰值约 5.2GB、无 OOM。资源限制与数据库等待的因果关系未被直接证明。
+- 01:24:50 确认所有在途任务归零后安全重启，10 条均完成交付并通过首次 Sub2 复检：delivery `108–117` → recovery `366–375` → Sub2 `16989–16998`。对应 AUTH ID 依次为 `616,612,611,610,609,615,618,617,613,614`。数据库 delivery 行保留 `verifying`，关联 recovery 为 `completed`，API 按关联恢复映射为 `completed`；不得手工改写这些行。
+- 修复安全的队列读取/领取等待：单连接等待超时、取消、SQLite BUSY/LOCKED 在 2 秒后重试；领取只有事务尚未开始时才标记 `ErrQueueDeferred`。恢复领取的 CAS 更新和读取在同一事务完成。写入、提交或 checkpoint 失败仍暂停，避免重放结果不确定的远端操作；资料修复触发暂停后同一轮立即停止，不再领取复检。日志增加固定错误分类，不记录 SQL/凭据原文。交付 API 增加运行时 `blocked_reason`，前端明确显示“自动交付已暂停”，终态不被覆盖；无 schema 变更。
+- 生产持久设置 `TasksMax=4096`，保留登录并发 10、`MemoryMax=6GB`。drop-in 为 `/etc/systemd/system.control/openai-login.service.d/50-TasksMax.conf`，已 `daemon-reload`；原资源记录 `/var/lib/openai-login/backups/resources-before-20261014-queue-fix.json`。资源回退为 `sudo systemctl set-property openai-login.service TasksMax=2048`，与二进制回滚分别处理。
+- 隔离候选禁自动恢复、无 Sub2 配置；数据库完整性、health/ready、静态资源、服务身份 Node/driver/原生及有头无头浏览器 smoke、旧二进制数据库兼容均通过。历史验收账号 279 在候选被明确返回 `account_deactivated/403`，证据保留为 `CANDIDATE_LOGIN_ACCOUNT279_REJECTED.json`，不能用于证明生产发布失败或这 10 个账号失效。改用本批 AUTH 616 后候选真实 IPv4 OAuth 成功：17:49:11 UTC，6,782ms，attempt 625；生产成功：17:51:19 UTC，7,516ms，attempt 624。均 `auto_deliver=false`，AT/RT 已加密保存，凭据值未输出。
+- `2026-10-13T17:57:20Z` 最终复核：正式服务 active/running、NRestarts=0，唯一应用 PID 871435（systemd wrapper MainPID 871420），实际 release 与二进制 hash 一致；health/ready/socket 正常，公网未认证 HTTP401，有效 Nginx AUTH 路由 `/run/tls/auth/login.sock`。自动恢复 enabled/running、无阻塞，巡检推进到 17:57:02（生产 OAuth 后）。10 个 Sub2 账号均 active、schedulable/effective_schedulable=true。9 个完成第二轮复检；AUTH 616 已通过首检，其生产 OAuth 更新了本地凭据版本，第二轮旧版本复检由既有保护取消，未强制绕过版本保护。
+- 最终 `TasksCurrent=20`、`pids.peak=246`、`pids.events max=0`。发布以来 panic/fatal、数据库锁、存储/监听、浏览器启动/权限/线程创建、登录失败、OAuth HTTP401/403/5xx 聚合和持久化登录失败均为 0。验收脚本曾把 OAuth “耗时 574ms”误计为 HTTP5xx，已改为只匹配明确的 HTTP/status 字段并留下可运行回归检查。
+- 重启前备份 `/var/lib/openai-login/backups/accounts-before-20261013T172450Z-queue-restart.db`（8,503,296 bytes），发布前备份 `/var/lib/openai-login/backups/accounts-before-20261013T174400Z-queue-retry.db`（8,552,448 bytes），均 0600、integrity_check=ok；生产数据库完整性正常。回滚二进制、可执行权限、Node hash 和 driver 111 个文件树 hash 核对一致，回滚运行时在生产 namespace 验收通过。回滚只原子切 `current` 后重启，不覆盖业务数据库。
+- 正式 release 保留 `SOURCE.json`、候选/即时/延迟/真实 OAuth、`POST_LOGIN_ACCEPTANCE.json` 与运行时证据。02:00:43 上海时间已清理本轮临时上传和中间候选/版本；操作脚本归档到正式 release 的 `operations/`，清理记录为 `CLEANUP.json`，正式版本、回滚版本和数据库备份均保留。下面较早的 release 段落均为历史记录，不覆盖本节当前事实。
+
+本轮精确验证命令与结果（定向验证，未运行完整仓库套件）：
+
+```bash
+# 初次定向 race：server 通过；store 新增 recheck fixture 缺少前置状态失败。
+go test -race ./internal/store ./cmd/server -run 'Test(Queue|Sub2Recovery|AccountCheck|AccountDelivery|CredentialRepair|Delivery|Recovery|HistoryCredential)' -count=1 -timeout=120s
+# 修正 fixture 后仅重跑其 scope，通过。
+go test -race ./internal/store -run 'TestQueue' -count=1 -timeout=30s
+# 补暂停后的停止检查后，server 最终版本通过。
+go test -race ./cmd/server -run 'Test(Sub2Recovery|AccountCheck|AccountDelivery|CredentialRepair|Delivery|Recovery|HistoryCredential)' -count=1 -timeout=120s
+go vet ./internal/store ./cmd/server
+go vet ./cmd/server
+node --check cmd/server/client.js
+node cmd/server/client.test.cjs
+bash -n verify-runtime.sh
+git diff --check
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c ./internal/login -o /tmp/kkai-auth-20261013T174200Z-login-smoke.test
+./build-linux.sh /tmp/openai-login-20261013T174400Z-queue-retry
+python3 scripts/auth-deploy-release_test.py
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-stage-release.py --release-id 20261013T174400Z-queue-retry --binary /tmp/openai-login-20261013T174400Z-queue-retry --smoke /tmp/kkai-auth-20261013T174200Z-login-smoke.test --verify /tmp/verify-runtime.sh'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-queue-retry-login.py --release-id 20261013T174400Z-queue-retry --phase candidate --account-id 616'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-deploy-release.py --release-id 20261013T174400Z-queue-retry --source-commit 41e6f6d82571afba2d24dcfea3d65e3c6102625e --binary-sha256 03850f2ae36968b6ec32f587cb1f11f208c06ac3c8f0c1a50c3eefd298f3cc3a --delay-seconds 60'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-queue-retry-login.py --release-id 20261013T174400Z-queue-retry --phase production --account-id 616'
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 sys1 'sudo -n python3 /tmp/auth-queue-retry-final-verify.py'
+```
+
+除已注明的首次 fixture 失败及账号 279 被上游停用外，最终命令均通过。临时脚本命令为本轮执行记录。覆盖真实单连接等待超过 5 秒后 worker 续跑、四种领取未变更队列再成功、写入失败仍暂停、暂停后不派发复检及前端终态展示。未在生产人为制造数据库写入/提交失败，也未再次以 10 并发压测线程上限；现有证据不承诺所有未来故障均自动恢复。完整仓库测试和认证后公网业务未验证。
+
+## 空分组契约修复发布（2026-10-11 23:49 上海时间）
+
+- `2026-10-11T15:49:20Z` 已切换到 `20261011T154920Z-group-empty-fix`。构建来源为本地 `main` 的 `41e6f6d82571afba2d24dcfea3d65e3c6102625e` 加当前工作区改动；本轮没有进行代码托管同步。Linux amd64 二进制 SHA-256：`e0c54200ae34a346faa4bd1f3859bd35d79eacf4090e18c7d64f86e7a7efa3df`。回滚 release 为 `20261011T135659Z-group-diagnostics`，回滚版本和延迟证据保留。
+- 修复 Sub2 完整详情接口的 `omitempty` 空分组误判：`group_ids`、`groups`、`account_groups` 三个分组字段全部省略时按合法空分组 `[]` 处理，不再把空组误报为无法判断或 `group_conflict`。候选、即时和延迟验收均通过；临时文件和上传产物已清理。
+- 发布前备份 `/var/lib/openai-login/backups/accounts-before-20261011T154920Z-group-empty-fix.db`；候选数据库完整性、候选 health/ready、Node/Playwright/Chrome smoke 通过。候选与生产均保留独立证据，不能混用候选的 Sub2 配置状态。
+- 生产服务 `active/running`、`NRestarts=0`，本机 `/health`、`/ready`、入口 Unix socket 均正常，公网未认证请求返回 HTTP `401`。回滚 release 和延迟验收证据保留。
+- task `318`、AUTH account `561`、Sub2 account `16964` 已完成真实复核：Sub2 为 `active`、`schedulable=true`，`group_ids=[44,47,48]`，`groups` 字段也成功读回。该结果证明本轮修复已覆盖此前的空分组误报。
+- task `224` 的旧 `group_conflict` 结论仍保留为待复核记录，不能直接据此执行管理员修改、目标分组覆盖或“保留当前分组”写入；需在当前修复版本下重新读取 task `224` 的远端详情后再决定后续动作。
+- 本轮已完成候选、即时和延迟验收，临时文件已清理；本段记录的是 `20261011T154920Z-group-empty-fix` 的最终线上证据，不代表 task `224` 已完成复核。
+
+本节是 2026-10-11 的历史发布记录；当前 release、回滚点和本轮验收以本文顶部 2026-10-14 队列修复段落为准，task 224 的待复核状态仍保留。
+
 ## 浏览器运行环境与交付修复发布（2026-10-10 18:38 上海时间）
 
 - `2026-10-10T10:38:03Z` 切换至 `20261010T104000Z-runtime-delivery-fix`，源码 `f2d13b268525e3574893873a3b403bb33d48dfa7` 已推送 `origin/main`。Linux amd64 SHA-256：`19e471fc9515e1ac10414e3008a1d29ce1c2eb09a206412fb0f07016e775b274`。只发布 AUTH；Sub2 源码、配置和版本未修改。
@@ -7,7 +218,7 @@
 - `fork/exec` 权限拒绝显示 `browser_runtime_permission` 固定文案，不泄漏路径；单次登录不盲目重试，后台恢复以 5 分钟起步持久退避，环境修好后可继续，不误落入账号人工处理。
 - 仅交付任务 `probe_failed` 且没有 Retry-After，按 30 秒、60 秒、5 分钟、10 分钟、20 分钟、40 分钟、1 小时退避；429、协议错误、自动恢复及上游明确等待要求保持旧策略。到期仍由每 60 秒巡检入队，再由 worker 执行，期限不等于完成时间。已保存的旧重试期限不批量改写。
 - 锁忙交付保持 queued、延后 2 秒且不计失败；前五条占锁不会阻塞第六条。前端合并在途刷新后的下一轮请求，避免完成状态被旧快照覆盖；等待显示后端安全原因，过期时间改为“已到重试时间，等待后台执行”并每 5 秒刷新。
-- 三条用户反馈的交付在几秒内已导入。task 225 首轮完成、226 首轮检测失败后于 10:13 UTC 完成；224 两次 `probe_failed`，第三次检测成功，但实际分组 `[12,13]` 与提交目标 `[12,44]` 不符，在分组保护处停止。邮箱、workspace、organization、plan、expiry、import/recovery marker 均匹配；尚未收到用户对分组取舍的答复，未覆盖远端分组或解除调度暂停。
+- 三条用户反馈的交付在几秒内已导入。task 225 首轮完成、226 首轮检测失败后于 10:13 UTC 完成；旧记录曾将 task 224 判为实际分组 `[12,13]` 与提交目标 `[12,44]` 不符并在分组保护处停止。`group_contract_audit` 后确认完整详情接口的字段省略可能代表合法空分组，该旧冲突结论已作废；task 224 需在新修复后重新读取和验收，旧记录不能证明发生过管理员修改。
 - 候选副本 116 账号、自动恢复关闭、Sub2 未配置；候选完整 IPv4 OAuth 7,535ms 成功，凭据仅写候选库。候选 health/ready、静态资源、SQLite 完整性和回滚 schema 兼容通过。切换前后登录/导入/恢复/检测/交付/资料任务/复检在途均为 0。
 - 备份 `/var/lib/openai-login/backups/accounts-before-20261010T104000Z-runtime-delivery-fix.db`，3,039,232 字节、0600、integrity_check=ok。回滚保留 `20261010T093908Z-lifecycle-migration-hardening`（已修复 Node 权限），SHA-256 `3fe7edd98296f477761306a6af4962de8e289752c3c58728a3c9cbb7ade24e67`；不回退覆盖数据库。
 - `10:38:44–10:38:52 UTC` 正式服务历史账号 279 IPv4、auto_deliver=false 完整 OAuth 成功，8,110ms，attempt 472 为 success、AT/RT 已持久化。`10:39:50 UTC` 延迟验收 active/running、NRestarts=0、实际二进制匹配、health/ready/socket正常、巡检推进至 10:39:04；公网未认证 HTTP401，有效 AUTH 路由 `/run/tls/auth/login.sock`，静态资源 hash 匹配。启动以来浏览器权限/启动失败、登录失败、panic/fatal、数据库锁、存储/监听、OAuth401/403/5xx 聚合均为 0。
@@ -446,7 +657,7 @@ ssh sys1 'curl -fsS http://127.0.0.1:18082/health'
 4. 隔离候选数据库、关闭自动恢复且不配置 Sub2，清除副本内显式交付/资料任务。验证 health、ready、静态资源、数据库完整性和回滚兼容；切换前完成已授权单账号真实登录验收，凭据只保存在隔离数据库。
 5. 保留现有 release；确认在途任务归零，停服后复查，并创建 SQLite 一致性备份。原子切换 `current`，启动服务，检查实际二进制、health、ready、有效路由、socket、公网认证与后台巡检。
 6. 切换后再次以新服务实际环境运行浏览器 smoke 和已授权单账号 OAuth，并在至少一轮巡检后延迟复核。登录失败、`browser_runtime_permission`、panic、数据库与存储错误必须进入日志聚合；仅统计 OAuth HTTP 401/403/5xx 会漏掉浏览器初始化故障。
-7. 登录验收失败时，原子切回已通过运行时验证的回滚 release，再重启并复查。回滚只切版本，不覆盖业务数据库；如果是已确认的单一运行环境权限错误，可保留证据后原地修复并完成相同验收。
+7. 用户已要求禁止自动回滚。验收失败时保留新版本和证据，诊断并修复；只有获得用户明确回滚指示后才原子切回已验证的 release。切回前重新确认无在途单次任务，回滚只切版本，不覆盖业务数据库；单一运行环境权限错误可保留证据后原地修复并完成相同验收。
 8. 不把账号凭据、代理密码、token 或浏览器任意错误正文写入发布记录。只保留固定错误分类与脱敏指标。
 
 本地构建 smoke（只编译，不启动浏览器）：

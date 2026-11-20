@@ -1,0 +1,18 @@
+{
+  "path": "/mfa-challenge/[id]",
+  "inputs": [
+    {
+      "name": "code",
+      "type": "text",
+      "autocomplete": "one-time-code",
+      "visible": true
+    }
+  ],
+  "prompts": [
+    "Check your authenticator app",
+    "Enter the current 6-digit code for your account from your authenticator app.",
+    "Code",
+    "Can’t find the code?",
+    "ChatGPT Terms of Use and Privacy Policy apply. Your ChatGPT training controls apply to Codex. See what data Codex receives from ChatGPT and how it may use it. Codex can make mistakes, and your ChatGPT rate limits apply."
+  ]
+}

@@ -353,7 +353,7 @@ func (s *Store) CreateAccountCheckBatch(ctx context.Context, input AccountCheckI
 	destination := strings.TrimSpace(input.DestinationKey)
 	for _, id := range ids {
 		var eligible bool
-		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM accounts a JOIN sub2_imports i ON i.account_id=a.id WHERE a.id=? AND i.state='imported' AND i.sub2_account_id>0 AND (?='' OR i.destination_key=?))`, id, destination, destination).Scan(&eligible); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM accounts a JOIN sub2_imports i ON i.account_id=a.id WHERE a.id=? AND a.sub2_policy NOT IN ('free_local','official_unavailable','discarded') AND a.status NOT IN ('deleted','deactivated','deleted_or_deactivated','discarded') AND i.state='imported' AND i.sub2_account_id>0 AND (?='' OR i.destination_key=?))`, id, destination, destination).Scan(&eligible); err != nil {
 			return AccountCheckBatch{}, false, err
 		}
 		if !eligible {
@@ -439,7 +439,7 @@ func (s *Store) claimAccountCheck(ctx context.Context) (*AccountCheckWork, bool,
 	if !accountID.Valid {
 		skip = "account_removed"
 	} else {
-		err = tx.QueryRowContext(ctx, `SELECT a.access_token_cipher,COALESCE(a.chatgpt_account_id,''),a.status,COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=a.id AND status='success'),0),EXISTS(SELECT 1 FROM sub2_imports i WHERE i.account_id=a.id AND i.state='imported' AND i.sub2_account_id>0 AND (?='' OR i.destination_key=?)) FROM accounts a WHERE a.id=?`, destination, destination, accountID.Int64).Scan(&accessCipher, &chatGPTID, &status, &version, &eligible)
+		err = tx.QueryRowContext(ctx, `SELECT a.access_token_cipher,COALESCE(a.chatgpt_account_id,''),a.status,COALESCE((SELECT MAX(id) FROM login_attempts WHERE account_id=a.id AND status='success'),0),a.sub2_policy NOT IN ('free_local','official_unavailable','discarded') AND a.status NOT IN ('deleted','deactivated','deleted_or_deactivated','discarded') AND EXISTS(SELECT 1 FROM sub2_imports i WHERE i.account_id=a.id AND i.state='imported' AND i.sub2_account_id>0 AND (?='' OR i.destination_key=?)) FROM accounts a WHERE a.id=?`, destination, destination, accountID.Int64).Scan(&accessCipher, &chatGPTID, &status, &version, &eligible)
 		if err != nil {
 			return nil, false, err
 		}
@@ -448,13 +448,13 @@ func (s *Store) claimAccountCheck(ctx context.Context) (*AccountCheckWork, bool,
 		} else if status == "running" {
 			skip = "login_in_progress"
 		} else {
-			var prior int64
-			err = tx.QueryRowContext(ctx, `SELECT id FROM account_checks WHERE account_id=? AND state='finished' AND credential_attempt_id=? AND finished_at>? ORDER BY id DESC LIMIT 1`, accountID.Int64, version, time.Now().Add(-30*time.Second).UnixMilli()).Scan(&prior)
-			if err == nil {
+			prior, priorErr := scanCheck(tx.QueryRowContext(ctx, checkSelect+` WHERE c.account_id=? AND c.state='finished' AND c.credential_attempt_id=? ORDER BY c.id DESC LIMIT 1`, accountID.Int64, version))
+			if priorErr != nil && !errors.Is(priorErr, sql.ErrNoRows) {
+				return nil, false, priorErr
+			}
+			if priorErr == nil && accountCheckCooldownRemaining(prior, time.Now().UnixMilli()) > 0 {
 				skip = "cooldown"
-				previous = &prior
-			} else if !errors.Is(err, sql.ErrNoRows) {
-				return nil, false, err
+				previous = &prior.ID
 			}
 		}
 	}
@@ -471,6 +471,9 @@ func (s *Store) claimAccountCheck(ctx context.Context) (*AccountCheckWork, bool,
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE account_checks SET state='running',credential_attempt_id=?,started_at=? WHERE id=? AND state='queued'`, version, now, id)
 	if err != nil {
+		return nil, false, err
+	}
+	if err := freezeLifecycleBindingsTx(ctx, tx, fmt.Sprintf("account_check:%d", id), accountID.Int64); err != nil {
 		return nil, false, err
 	}
 	batch, err := readCheckBatch(ctx, tx, batchID)
@@ -564,20 +567,23 @@ func (s *Store) FinishAccountCheck(ctx context.Context, id int64, result Account
 	if state == "finished" && item.AccountID != nil {
 		if lifecycleStatus, lifecycleCode := lifecycleStatusForAccountCheck(result); lifecycleStatus != "" {
 			var email string
+			currentVersion := int64(0)
+			currentOfficial := false
 			if err = tx.QueryRowContext(ctx, `SELECT email FROM accounts WHERE id=?`, *item.AccountID).Scan(&email); err != nil {
 				if !errors.Is(err, sql.ErrNoRows) {
 					return batch, err
 				}
 			} else {
-				currentVersion := int64(0)
 				if err = tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0) FROM login_attempts WHERE account_id=? AND status='success'`, *item.AccountID).Scan(&currentVersion); err != nil {
 					return batch, err
 				}
-				if item.CredentialAttemptID != nil && currentVersion != *item.CredentialAttemptID {
+				if item.CredentialAttemptID == nil || *item.CredentialAttemptID <= 0 || currentVersion != *item.CredentialAttemptID {
 					// A successful re-login superseded this probe while it was in
 					// flight. Keep the check history, but do not persist a stale
 					// lifecycle conclusion.
 					lifecycleStatus = ""
+				} else {
+					currentOfficial = true
 				}
 			}
 			if email != "" && lifecycleStatus != "" {
@@ -594,6 +600,14 @@ func (s *Store) FinishAccountCheck(ctx context.Context, id int64, result Account
 				}); err != nil {
 					return batch, err
 				}
+				if currentOfficial {
+					if err := authorizeFrozenCleanupTx(ctx, tx, fmt.Sprintf("account_check:%d", id)); err != nil {
+						return batch, err
+					}
+					if err := finalizeOfficialUnavailableTx(ctx, tx, *item.AccountID, result.Message, currentVersion); err != nil {
+						return batch, err
+					}
+				}
 			}
 		}
 	}
@@ -606,6 +620,9 @@ func (s *Store) FinishAccountCheck(ctx context.Context, id int64, result Account
 		}
 	}
 	if err = settleCheckBatch(ctx, tx, batch.ID, now); err != nil {
+		return batch, err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM lifecycle_request_bindings WHERE request_key=?`, fmt.Sprintf("account_check:%d", id)); err != nil {
 		return batch, err
 	}
 	batch, err = readCheckBatch(ctx, tx, batch.ID)
@@ -707,7 +724,7 @@ func (s *Store) ListAccountCheckSummaries(ctx context.Context, destinations ...s
 	if len(destinations) > 0 {
 		destination = strings.TrimSpace(destinations[0])
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.status,EXISTS(SELECT 1 FROM sub2_imports i WHERE i.account_id=a.id AND i.state='imported' AND i.sub2_account_id>0 AND (?='' OR i.destination_key=?)) FROM accounts a`, destination, destination)
+	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.status,a.sub2_policy NOT IN ('free_local','official_unavailable','discarded') AND a.status NOT IN ('deleted','deactivated','deleted_or_deactivated','discarded') AND EXISTS(SELECT 1 FROM sub2_imports i WHERE i.account_id=a.id AND i.state='imported' AND i.sub2_account_id>0 AND (?='' OR i.destination_key=?)) FROM accounts a`, destination, destination)
 	if err != nil {
 		return nil, err
 	}
@@ -751,15 +768,40 @@ func (s *Store) ListAccountCheckSummaries(ctx context.Context, destinations ...s
 		if item.State == "finished" && (summary.LastResult == nil || item.ID > summary.LastResult.ID) {
 			summary.LastResult = item
 		}
-		if item.State == "finished" && item.Freshness == "current" && item.FinishedAt != nil {
-			remaining := *item.FinishedAt + 30000 - now
-			if remaining > 0 {
-				summary.CooldownRemainingSeconds = int((remaining + 999) / 1000)
-			}
-		}
 		summaries[id] = summary
 	}
-	return summaries, nil
+	// Checks use the same upstream credential across destinations. Mirror the
+	// claim guard's global cooldown without exposing another target's result.
+	rows, err = tx.QueryContext(ctx, `SELECT c.account_id,c.finished_at,c.retry_after_seconds FROM account_checks c WHERE c.id IN (SELECT MAX(prior.id) FROM account_checks prior WHERE prior.account_id IS NOT NULL AND prior.state='finished' AND prior.credential_attempt_id=COALESCE((SELECT MAX(la.id) FROM login_attempts la WHERE la.account_id=prior.account_id AND la.status='success'),0) GROUP BY prior.account_id)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var finished, retry sql.NullInt64
+		if err := rows.Scan(&id, &finished, &retry); err != nil {
+			return nil, err
+		}
+		summary := summaries[id]
+		summary.CooldownRemainingSeconds = accountCheckCooldownRemaining(AccountCheck{State: "finished", FinishedAt: nullableInt64(finished), RetryAfterSeconds: nullableInt(retry)}, now)
+		summaries[id] = summary
+	}
+	return summaries, rows.Err()
+}
+
+func accountCheckCooldownRemaining(check AccountCheck, now int64) int {
+	if check.State != "finished" || check.FinishedAt == nil {
+		return 0
+	}
+	wait := 30
+	if check.RetryAfterSeconds != nil && *check.RetryAfterSeconds > wait {
+		wait = *check.RetryAfterSeconds
+	}
+	// Subtract elapsed whole seconds to round the remaining cooldown upward,
+	// without multiplying an untrusted Retry-After value into an overflow.
+	elapsed := max(int64(0), (now-*check.FinishedAt)/1000)
+	return int(max(int64(0), int64(wait)-elapsed))
 }
 
 // RecoverAccountChecks is startup-only: no request owner may still be running.

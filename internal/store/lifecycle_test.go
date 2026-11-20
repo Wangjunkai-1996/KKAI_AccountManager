@@ -2,10 +2,11 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
-func TestOfficialLifecycleEventIsRecordedAndSurvivesAccountDeletion(t *testing.T) {
+func TestOfficialLifecycleEventAndAccountTombstoneAreRetained(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
 	account, err := s.UpsertCredentials(ctx, Credentials{Email: "official@example.test", Password: "pw"})
@@ -28,8 +29,14 @@ func TestOfficialLifecycleEventIsRecordedAndSurvivesAccountDeletion(t *testing.T
 	if events[0].Email != account.Email || events[0].Source != "official" || events[0].Status != "deactivated" || events[0].Code != "account_deactivated" || events[0].HTTPStatus != 403 {
 		t.Fatalf("event = %+v", events[0])
 	}
-	if err := s.DeleteAccountByID(ctx, account.ID); err != nil {
-		t.Fatal(err)
+	if err := s.DeleteAccountByID(ctx, account.ID); !errors.Is(err, ErrAccountOfficialUnavailable) {
+		t.Fatalf("delete tombstone: %v", err)
+	}
+	if _, err := s.UpsertCredentials(ctx, Credentials{Email: account.Email, Password: "replacement"}); !errors.Is(err, ErrAccountOfficialUnavailable) {
+		t.Fatalf("replace tombstone credentials: %v", err)
+	}
+	if secret, err := s.RevealCredential(ctx, account.ID, "password"); secret != "" || !errors.Is(err, ErrAccountOfficialUnavailable) {
+		t.Fatalf("read tombstone credential: %v", err)
 	}
 	byID, err := s.ListLifecycleEventsForAccount(ctx, account.ID, 10)
 	if err != nil || len(byID) != 1 {

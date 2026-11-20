@@ -35,16 +35,18 @@ let accounts = Array.from({ length: 125 }, (_, i) => ({ id: i + 1, email: `accou
 let checks = Object.fromEntries(accounts.map(a => [a.id, { account_id: a.id, eligible: true, latest_task: null, last_result: null, cooldown_remaining_seconds: 0 }]));
 let available = true, active = null, recent = [], recoveries = {}, requests = [], stored = new Map(), timers = new Map(), timerID = 0;
 let historyGate = null, activeGate = null, createFailure = false, recoveryFailure = '';
+let sub2Statuses = {};
 const capabilities = { available: true, model: 'gpt-5.6-luna', max_batch_size: 100, max_concurrency: 2, default_proxy_configured: true, default_proxy_supported: true };
 const batches = new Map();
 const context = vm.createContext({ console, document, window, location: { hash: '' }, crypto: require('node:crypto').webcrypto, AbortController,
+    loginBlockLabel: code => code === 'phone_verification_required' ? '需要手机号验证' : '',
     sessionStorage: { getItem: k => stored.get(k), setItem: (k, v) => stored.set(k, v), removeItem: k => stored.delete(k) },
     setTimeout: (fn, delay) => { timers.set(++timerID, { fn, delay }); return timerID; }, clearTimeout: id => timers.delete(id),
     fetch: async (url, options = {}) => {
         requests.push({ url, options });
         let body;
         if (url === '/api/history') {
-            body = { success: true, data: structuredClone(accounts), imports: accounts.map(a => ({ account_id: a.id, sub2_account_id: a.id + 1000, state: 'imported' })), checks: structuredClone(checks), recoveries: structuredClone(recoveries), imports_available: available, checks_available: available };
+            body = { success: true, data: structuredClone(accounts), imports: accounts.map(a => ({ account_id: a.id, sub2_account_id: a.id + 1000, state: 'imported' })), sub2_statuses: structuredClone(sub2Statuses), checks: structuredClone(checks), recoveries: structuredClone(recoveries), imports_available: available, checks_available: available };
             if (historyGate) { const gate = historyGate; historyGate = null; await gate.promise; }
         } else if (url.endsWith('?active=1')) {
             body = { success: true, active, capabilities };
@@ -319,6 +321,30 @@ const change = async (name, value) => { if (typeof value === 'boolean') el(name)
     assert.equal(part(1, 'recover').hidden, false, 'failed task without checkpoint can retry a current 401');
     assert.equal(part(1, 'recover').disabled, false);
     assert.equal(part(1, 'recover').textContent, '恢复并开启调度');
+    for (const state of [{ association_status: 'missing', exists: true }, { association_status: 'unmatched', exists: true }, { stale: true }, { unknown: true }, { exists: false }]) {
+        sub2Statuses = { 1: state };
+        recoveries[1] = { state: 'unknown', resumable: true };
+        await document.emit('auth-history-changed'); await flush();
+        assert.equal(part(1, 'start').disabled, true, 'non-current Sub2 association cannot be checked');
+        assert.equal(part(1, 'recover').hidden, true, 'old checkpoint cannot resume after association stops');
+        assert.match(part(1, 'recoveryStatus').textContent, /自动处理已暂停/);
+        const beforeBlockedRecovery = recoverySubmissions().length;
+        await window.AccountChecks.recoverAccount(1); await flush();
+        assert.equal(recoverySubmissions().length, beforeBlockedRecovery);
+    }
+    sub2Statuses = {};
+    accounts[0].status = 'failed'; accounts[0].requires_action = true; accounts[0].retryable = false; accounts[0].next_retry_at = null;
+    await document.emit('auth-history-changed'); await flush();
+    assert.equal(part(1, 'start').disabled, true);
+    assert.equal(part(1, 'recover').hidden, true, 'deterministic login terminal blocks even resumable recovery');
+    accounts[0].status = 'active'; delete accounts[0].requires_action; delete accounts[0].retryable;
+    recoveries[1] = { state: 'unknown', resumable: true, error_code: 'phone_verification_required' };
+    await document.emit('auth-history-changed'); await flush();
+    assert.equal(part(1, 'start').disabled, true, 'task canonical stop code prevents another check');
+    assert.equal(part(1, 'recover').hidden, true, 'task canonical stop code defeats a stale resumable checkpoint');
+    const beforeCanonicalStop = recoverySubmissions().length;
+    await window.AccountChecks.recoverAccount(1); await flush();
+    assert.equal(recoverySubmissions().length, beforeCanonicalStop);
     available = false;
     await document.emit('auth-history-changed'); await flush();
     const beforeUnavailable = recoverySubmissions().length;

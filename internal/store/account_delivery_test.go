@@ -17,11 +17,60 @@ func deliveryTestLogin(t *testing.T, s *Store, email string) AccountDelivery {
 		t.Fatal(err)
 	}
 	defer attempt.Release()
-	delivery, err := s.FinishAttemptAndQueueDelivery(context.Background(), attempt.ID, &Result{AccessToken: "fixture-at", RefreshToken: "fixture-rt"}, "fixture-destination")
+	delivery, err := s.FinishAttemptAndQueueDelivery(context.Background(), attempt.ID, &Result{PlanType: "plus", AccessToken: "fixture-at", RefreshToken: "fixture-rt"}, "fixture-destination")
 	if err != nil {
 		t.Fatal(err)
 	}
 	return delivery
+}
+
+func TestAccountDeliveryRejectsUnknownAndDowngradedFree(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		plan   string
+		policy string
+	}{
+		{name: "unknown", policy: Sub2PolicyUnknown},
+		{name: "downgraded_free", plan: "free", policy: Sub2PolicyFreeLocal},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s, _ := testStore(t)
+			ctx := context.Background()
+			email := test.name + "@example.test"
+			if _, err := s.UpsertCredentials(ctx, Credentials{Email: email, Password: "fixture-password"}); err != nil {
+				t.Fatal(err)
+			}
+			if test.plan == "free" {
+				checkTestLogin(t, s, email)
+			}
+			account, attempt, err := s.BeginAttempt(ctx, Credentials{Email: email, Password: "fixture-password"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer attempt.Release()
+			result := &Result{PlanType: test.plan, AccessToken: "local-at", RefreshToken: "local-rt"}
+			delivery, err := s.FinishAttemptAndQueueDelivery(ctx, attempt.ID, result, "fixture")
+			if err != nil || delivery.ID != 0 || delivery.State != "canceled" {
+				t.Fatalf("expected local-only login, got delivery %+v, err=%v", delivery, err)
+			}
+			_, saved, err := s.GetOAuthResultByID(ctx, account.ID)
+			if err != nil || saved.PlanType != test.plan || saved.RefreshToken != result.RefreshToken {
+				t.Fatalf("local login result was not saved: %v", err)
+			}
+			current, err := s.GetAccountByID(ctx, account.ID)
+			if err != nil || current.Sub2Policy != test.policy {
+				t.Fatalf("policy=%q, want %q, err=%v", current.Sub2Policy, test.policy, err)
+			}
+			attempt.Release()
+			if _, err := s.QueueAccountDelivery(ctx, account.ID, "fixture", DefaultDeliveryOptions()); !errors.Is(err, ErrSub2PlanIneligible) {
+				t.Fatalf("explicit delivery should reject ineligible plan: %v", err)
+			}
+			tasks, err := s.ListLatestAccountDeliveries(ctx, "fixture")
+			if err != nil || len(tasks) != 0 {
+				t.Fatalf("expected no durable delivery, got %d, err=%v", len(tasks), err)
+			}
+		})
+	}
 }
 
 func TestAccountDeliveryLoginAndIntentCommitAtomically(t *testing.T) {
@@ -38,7 +87,7 @@ func TestAccountDeliveryLoginAndIntentCommitAtomically(t *testing.T) {
 	if _, err := s.db.Exec(`CREATE TRIGGER reject_delivery BEFORE INSERT ON account_deliveries BEGIN SELECT RAISE(ABORT,'delivery storage unavailable'); END`); err != nil {
 		t.Fatal(err)
 	}
-	result := &Result{AccessToken: "atomic-at", RefreshToken: "atomic-rt"}
+	result := &Result{PlanType: "plus", AccessToken: "atomic-at", RefreshToken: "atomic-rt"}
 	if _, err := s.FinishAttemptAndQueueDelivery(ctx, attempt.ID, result, "test-destination"); err == nil {
 		t.Fatal("delivery insertion error ignored")
 	}
@@ -75,7 +124,7 @@ func TestAccountDeliveryQueriesStayWithinDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinishAttempt(ctx, attempt.ID, true, &Result{AccessToken: "fixture-at", RefreshToken: "fixture-rt"}, nil); err != nil {
+	if err := s.FinishAttempt(ctx, attempt.ID, true, &Result{PlanType: "plus", AccessToken: "fixture-at", RefreshToken: "fixture-rt"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	attempt.Release()
@@ -138,7 +187,7 @@ func TestNewLoginDoesNotCancelAnotherDestinationDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	attempt.Release()
-	if _, err := s.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &Result{AccessToken: "fixture-at", RefreshToken: "fixture-rt"}, "destination-a"); err != nil {
+	if _, err := s.FinishAttemptAndQueueDelivery(ctx, attempt.ID, &Result{PlanType: "plus", AccessToken: "fixture-at", RefreshToken: "fixture-rt"}, "destination-a"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.QueueAccountDelivery(ctx, account.ID, "destination-b", DefaultDeliveryOptions()); err != nil {
@@ -149,7 +198,7 @@ func TestNewLoginDoesNotCancelAnotherDestinationDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nextAttempt.Release()
-	if _, err := s.FinishAttemptAndQueueDelivery(ctx, nextAttempt.ID, &Result{AccessToken: "next-at", RefreshToken: "next-rt"}, "destination-a"); err != nil {
+	if _, err := s.FinishAttemptAndQueueDelivery(ctx, nextAttempt.ID, &Result{PlanType: "plus", AccessToken: "next-at", RefreshToken: "next-rt"}, "destination-a"); err != nil {
 		t.Fatal(err)
 	}
 	deliveries, err := s.ListLatestAccountDeliveries(ctx, "destination-b")

@@ -85,6 +85,10 @@ func handleHistoryCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	repair, err := loginHistory.PatchAccountCredentials(r.Context(), id, store.CredentialPatch{Password: req.Password, TOTPSecret: req.TOTPSecret, Proxy: req.Proxy}, autoContinue)
+	if errors.Is(err, store.ErrAccountDiscarded) {
+		respondJSONStatus(w, http.StatusGone, LoginResponse{Code: "account_discarded", Message: "账号已在本地退役"})
+		return
+	}
 	if errors.Is(err, store.ErrAccountBusy) {
 		respondJSONStatus(w, 409, LoginResponse{Message: "账号正在登录或恢复，请稍后修改", Code: "account_busy"})
 		return
@@ -133,7 +137,7 @@ func (s *sub2RecoveryService) failCredentialRepair(repair store.CredentialRepair
 	if errors.Is(err, store.ErrAccountBusy) {
 		failure = &recoveryOperationError{Code: "account_busy"}
 	}
-	if failure.Code == "manual_pause" || failure.Code == "version_changed" {
+	if failure.Code == "manual_pause" || failure.Code == "version_changed" || failure.Code == "account_discarded" {
 		s.finishCredentialRepair(repair, "canceled", failure.Error(), nil)
 	} else if failure.RequiresAction {
 		s.finishCredentialRepair(repair, "requires_action", failure.Error(), nil)
@@ -152,6 +156,17 @@ func (s *sub2RecoveryService) processCredentialRepair(repair store.CredentialRep
 		return
 	}
 	defer lease.Release()
+	if s.configured() {
+		missing, err := s.store.Sub2AccountMissing(ctx, s.sub2.destinationKey, repair.AccountID)
+		if err != nil {
+			s.pauseRecovery(0, err)
+			return
+		}
+		if missing {
+			s.finishCredentialRepair(repair, "canceled", store.Sub2MissingMessage, nil)
+			return
+		}
+	}
 	latestRepair, err := s.store.GetCredentialRepair(ctx, repair.AccountID)
 	if err != nil {
 		s.pauseRecovery(0, err)
@@ -166,7 +181,7 @@ func (s *sub2RecoveryService) processCredentialRepair(repair store.CredentialRep
 		return
 	}
 	if repair.AttemptID > 0 && version == repair.AttemptID {
-		s.finishCredentialRepair(repair, "completed", "新资料已登录成功，后台继续处理交付", nil)
+		s.finishCredentialRepair(repair, "completed", "新资料已登录成功，凭据保存在 AUTH", nil)
 		return // Login and delivery committed before a process restart.
 	}
 	if version != repair.SourceVersion {
@@ -176,6 +191,10 @@ func (s *sub2RecoveryService) processCredentialRepair(repair store.CredentialRep
 	account, err := s.store.GetAccountByID(ctx, repair.AccountID)
 	if err != nil {
 		s.failCredentialRepair(repair, err)
+		return
+	}
+	if account.IsTerminalUnavailable() {
+		s.finishCredentialRepair(repair, "canceled", "账号已退役，资料修复已停止", nil)
 		return
 	}
 	destination := ""
@@ -252,23 +271,21 @@ func (s *sub2RecoveryService) loginCredentialRepair(ctx context.Context, repair 
 	}
 	var options store.DeliveryOptions
 	if s.configured() {
-		var requested *store.DeliveryOptions
-		deliveries, err := s.store.ListLatestAccountDeliveries(ctx, s.sub2.destinationKey)
+		requested, err := s.sub2.historyDeliveryOptions(ctx, account.ID)
 		if err != nil {
 			s.failCredentialRepair(repair, err)
 			return
-		}
-		for _, delivery := range deliveries {
-			if delivery.AccountID == account.ID && delivery.DestinationKey == s.sub2.destinationKey {
-				copy := delivery.Options
-				requested = &copy
-			}
 		}
 		options, err = s.sub2.loadOptions(ctx, requested)
 		if err != nil {
 			s.failCredentialRepair(repair, err)
 			return
 		}
+	}
+	credentials.Proxy, err = s.sub2.accountLoginProxy(ctx, account, &options, credentials.Proxy, s.checkLoginProxy)
+	if err != nil {
+		s.failCredentialRepair(repair, err)
+		return
 	}
 	release, err := acquireRecoveryLoginSlot(ctx)
 	if err != nil {
@@ -294,6 +311,9 @@ func (s *sub2RecoveryService) loginCredentialRepair(ctx context.Context, repair 
 	}
 	finishCtx, finishCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer finishCancel()
+	if loginErr == nil && result != nil {
+		loginErr = verifyStoredOAuthSubject(finishCtx, s.store, account.ID, result.AccessToken)
+	}
 	if loginErr != nil {
 		info := describeLoginError(loginErr)
 		if err := s.store.FinishAttempt(finishCtx, attempt.ID, false, nil, &store.Failure{Stage: info.Stage, Code: info.Code, HTTPStatus: info.HTTPStatus, Retryable: info.Retryable, Message: info.Message, AccountStatus: info.AccountStatus}); err != nil {
@@ -309,8 +329,13 @@ func (s *sub2RecoveryService) loginCredentialRepair(ctx context.Context, repair 
 		return
 	}
 	stored := &store.Result{AccessToken: result.AccessToken, RefreshToken: result.RefreshToken, ChatGPTAccountID: result.ChatGPTAccountID, OrganizationID: result.OrganizationID, PlanType: result.PlanType, ExpiresAt: result.ExpiresAt, ExpiresIn: result.ExpiresIn}
+	message := "新资料已登录成功，凭据保存在 AUTH"
 	if s.configured() {
-		_, err = s.store.FinishAttemptAndQueueDelivery(finishCtx, attempt.ID, stored, s.sub2.destinationKey, options)
+		var delivery store.AccountDelivery
+		delivery, err = s.store.FinishAttemptAndQueueDeliveryUpdate(finishCtx, attempt.ID, stored, s.sub2.destinationKey, options)
+		if delivery.State == "queued" {
+			message = "新资料已登录成功，等待 Sub2 同步"
+		}
 	} else {
 		err = s.store.FinishAttempt(finishCtx, attempt.ID, true, stored, nil)
 	}
@@ -318,5 +343,5 @@ func (s *sub2RecoveryService) loginCredentialRepair(ctx context.Context, repair 
 		s.pauseRecovery(0, err)
 		return
 	}
-	s.finishCredentialRepair(repair, "completed", "新资料已登录成功，后台继续处理交付", nil)
+	s.finishCredentialRepair(repair, "completed", message, nil)
 }

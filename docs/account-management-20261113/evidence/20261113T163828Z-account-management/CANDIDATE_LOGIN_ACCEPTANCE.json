@@ -1,0 +1,16 @@
+{
+  "phase": "candidate",
+  "account_id": 1581,
+  "auto_deliver": false,
+  "http_status": 200,
+  "success": true,
+  "elapsed_ms": 12130,
+  "code": null,
+  "stage": "",
+  "account_status": "active",
+  "tokens_persisted": true,
+  "new_successful_attempt": true,
+  "attempt_id": 1582,
+  "sub2_import_count_unchanged": true,
+  "database_integrity": "ok"
+}

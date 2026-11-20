@@ -66,6 +66,19 @@ type AccountRecoveryTask struct {
 	UpdatedAt                 time.Time           `json:"updated_at"`
 }
 
+// ManualAttempt is durable only for the active round explicitly requested by
+// the operator. Failure or restart consumes it; automatic queues never set it.
+func (t AccountRecoveryTask) ManualAttempt() bool {
+	return t.RetryAction == "manual_start" || t.RetryAction == "manual_relogin" || t.RetryAction == "manual_resume"
+}
+
+func (t AccountRecoveryTask) ExecutionRetryAction() string {
+	if t.RetryAction == "manual_start" {
+		return ""
+	}
+	return strings.TrimPrefix(t.RetryAction, "manual_")
+}
+
 // RecoveryDiagnostic contains a bounded, structured explanation for an
 // operator action. It deliberately has no upstream response or credential
 // fields; callers may persist only these fixed integer identifiers.
@@ -223,7 +236,7 @@ CREATE INDEX IF NOT EXISTS account_recovery_failures_task ON account_recovery_fa
 // mutation; a persisted checkpoint avoids another login where possible.
 func (s *Store) RecoverAccountRecoveryTasks(ctx context.Context) error {
 	now := time.Now().UnixMilli()
-	_, err := s.db.ExecContext(ctx, `UPDATE account_recovery_tasks SET failure_stage=state,state='unknown',last_error='任务在进程重启时中断，将核对状态后继续',error_code='process_interrupted',retry_action=CASE WHEN result_credential_attempt_id>0 THEN 'resume' ELSE 'relogin' END,next_retry_at=?,retry_count=retry_count+1,manual_action='',updated_at=? WHERE state IN ('validating','disabling_schedule','logging_in','login_succeeded','identity_verified','refreshing_credentials','applying_credentials','credentials_applied','enabling_schedule')`, now, now)
+	_, err := s.db.ExecContext(ctx, `UPDATE account_recovery_tasks SET failure_stage=state,state='unknown',last_error='任务在进程重启时中断，请核对状态',error_code='process_interrupted',retry_action=CASE WHEN retry_action IN ('manual_start','manual_relogin','manual_resume') THEN 'manual' WHEN result_credential_attempt_id>0 THEN 'resume' ELSE 'relogin' END,next_retry_at=CASE WHEN retry_action IN ('manual_start','manual_relogin','manual_resume') THEN NULL ELSE ? END,retry_count=retry_count+1,manual_action=CASE WHEN retry_action IN ('manual_start','manual_relogin','manual_resume') THEN '本次手动尝试已中断，请核对后重新尝试' ELSE '' END,updated_at=? WHERE state IN ('validating','disabling_schedule','logging_in','login_succeeded','identity_verified','refreshing_credentials','applying_credentials','credentials_applied','enabling_schedule')`, now, now)
 	if err != nil {
 		return fmt.Errorf("recover account recovery tasks: %w", err)
 	}
@@ -276,12 +289,34 @@ func scanAccountRecoveryTask(row scanner) (AccountRecoveryTask, error) {
 // CreateOrGetAccountRecoveryTask creates one active recovery task per account.
 // When an active task already exists, it is returned with created=false.
 func (s *Store) CreateOrGetAccountRecoveryTask(ctx context.Context, accountID, checkID, sub2AccountID int64, originalSchedulable bool, destinations ...string) (AccountRecoveryTask, bool, error) {
+	return s.createOrGetAccountRecoveryTask(ctx, accountID, checkID, sub2AccountID, originalSchedulable, false, 0, destinations...)
+}
+
+func (s *Store) CreateOrGetManualAccountRecoveryTask(ctx context.Context, accountID, checkID, sub2AccountID int64, originalSchedulable bool, destination string, expectedLatestTaskID int64) (AccountRecoveryTask, bool, error) {
+	return s.createOrGetAccountRecoveryTask(ctx, accountID, checkID, sub2AccountID, originalSchedulable, true, expectedLatestTaskID, destination)
+}
+
+func (s *Store) createOrGetAccountRecoveryTask(ctx context.Context, accountID, checkID, sub2AccountID int64, originalSchedulable, manual bool, expectedLatestTaskID int64, destinations ...string) (AccountRecoveryTask, bool, error) {
 	if accountID <= 0 || sub2AccountID <= 0 {
 		return AccountRecoveryTask{}, false, errors.New("account and sub2 account are required")
 	}
+	account, err := s.GetAccountByID(ctx, accountID)
+	if err != nil {
+		return AccountRecoveryTask{}, false, err
+	}
+	if err := account.Sub2EligibilityError(); err != nil {
+		return AccountRecoveryTask{}, false, err
+	}
+	if !IsSub2PaidPlan(account.PlanType) {
+		return AccountRecoveryTask{}, false, ErrSub2PlanIneligible
+	}
 	destination := recoveryDestination(destinations)
 	now := time.Now().UnixMilli()
-	result, err := s.db.ExecContext(ctx, `INSERT INTO account_recovery_tasks(account_id,check_id,source_credential_attempt_id,sub2_account_id,original_schedulable,destination_key,state,created_at,updated_at) SELECT ?,?,COALESCE((SELECT credential_attempt_id FROM account_checks WHERE id=? AND account_id=accounts.id),(SELECT MAX(id) FROM login_attempts WHERE account_id=accounts.id AND status='success'),0),?,?,?,?,?,? FROM accounts WHERE id=? ON CONFLICT DO NOTHING`, accountID, checkID, checkID, sub2AccountID, boolInt(originalSchedulable), destination, RecoveryQueued, now, now, accountID)
+	action := ""
+	if manual {
+		action = "manual_start"
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO account_recovery_tasks(account_id,check_id,source_credential_attempt_id,sub2_account_id,original_schedulable,destination_key,state,created_at,updated_at,retry_action) SELECT ?,?,COALESCE((SELECT credential_attempt_id FROM account_checks WHERE id=? AND account_id=accounts.id),(SELECT MAX(id) FROM login_attempts WHERE account_id=accounts.id AND status='success'),0),?,?,?,?,?,?,? FROM accounts WHERE id=? AND (?=0 OR COALESCE((SELECT MAX(id) FROM account_recovery_tasks WHERE account_id=accounts.id AND destination_key IN (?,'')),0)=?) ON CONFLICT DO NOTHING`, accountID, checkID, checkID, sub2AccountID, boolInt(originalSchedulable), destination, RecoveryQueued, now, now, action, accountID, boolInt(manual), destination, expectedLatestTaskID)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			task, found, getErr := s.getActiveAccountRecoveryTask(ctx, accountID, destination)
@@ -309,6 +344,9 @@ func (s *Store) CreateOrGetAccountRecoveryTask(ctx context.Context, accountID, c
 			return AccountRecoveryTask{}, false, ErrAccountNotFound
 		}
 		task, found, getErr := s.getActiveAccountRecoveryTask(ctx, accountID, destination)
+		if manual && getErr == nil && !found {
+			return AccountRecoveryTask{}, false, ErrAccountRecoveryStale
+		}
 		if getErr == nil && !found && destination != "" {
 			if _, globalFound, globalErr := s.getActiveAccountRecoveryTask(ctx, accountID); globalErr != nil {
 				return AccountRecoveryTask{}, false, globalErr
@@ -508,6 +546,16 @@ func (s *Store) UpdateAccountRecoveryTask(ctx context.Context, id int64, state, 
 		return AccountRecoveryTask{}, err
 	}
 	defer tx.Rollback()
+	current, err := scanAccountRecoveryTask(tx.QueryRowContext(ctx, accountRecoverySelect+` WHERE t.id=?`, id))
+	if err != nil {
+		return AccountRecoveryTask{}, err
+	}
+	if current.State == RecoveryCanceled {
+		if state == RecoveryCanceled {
+			return current, nil
+		}
+		return current, ErrAccountRecoveryNotResumable
+	}
 	now := time.Now().UnixMilli()
 	result, err := tx.ExecContext(ctx, `UPDATE account_recovery_tasks SET state=?,last_error=?,next_retry_at=NULL,manual_action='',failure_stage=CASE WHEN ? THEN '' ELSE failure_stage END,error_code=CASE WHEN ? THEN '' ELSE error_code END,probe_http_status=CASE WHEN ? THEN 0 ELSE probe_http_status END,diagnostic_json=CASE WHEN ? THEN '' ELSE diagnostic_json END,retry_action=CASE WHEN ? THEN '' ELSE retry_action END,updated_at=? WHERE id=?`, state, strings.TrimSpace(lastError), state == RecoveryCompleted, state == RecoveryCompleted, state == RecoveryCompleted, state == RecoveryCompleted, state == RecoveryCompleted, now, id)
 	if err != nil {
@@ -520,6 +568,11 @@ func (s *Store) UpdateAccountRecoveryTask(ctx context.Context, id int64, state, 
 	}
 	if state == RecoveryCompleted {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO account_recovery_rechecks(task_id,next_check_at,completed_at,updated_at) SELECT id,?,?,? FROM account_recovery_tasks WHERE id=? AND original_schedulable=1 AND result_credential_attempt_id>0 ON CONFLICT(task_id) DO NOTHING`, now+accountRecoveryFirstRecheckDelay.Milliseconds(), now, now, id); err != nil {
+			return AccountRecoveryTask{}, err
+		}
+	}
+	if state == RecoveryCompleted || state == RecoveryCanceled {
+		if err := finishCredentialRepairRecoveryTx(ctx, tx, id, state, strings.TrimSpace(lastError)); err != nil {
 			return AccountRecoveryTask{}, err
 		}
 	}
@@ -594,6 +647,15 @@ func (s *Store) RecordAccountRecoveryFailure(ctx context.Context, id int64, fail
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO account_recovery_failures(task_id,failure_stage,error_code,http_status,retry_count,diagnostic_json,created_at) VALUES(?,?,?,?,?,?,?)`, id, strings.TrimSpace(failure.Stage), strings.TrimSpace(failure.Code), httpStatus, retryCount, diagnosticJSON, now); err != nil {
 		return AccountRecoveryTask{}, err
+	}
+	if failure.RetryAction == "manual" || failure.State == RecoveryCanceled || strings.TrimSpace(failure.ManualAction) != "" {
+		repairState := "requires_action"
+		if failure.State == RecoveryCanceled {
+			repairState = "canceled"
+		}
+		if err := finishCredentialRepairRecoveryTx(ctx, tx, id, repairState, strings.TrimSpace(failure.Message)); err != nil {
+			return AccountRecoveryTask{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return AccountRecoveryTask{}, err
@@ -722,7 +784,7 @@ func (s *Store) listAccountRecoveryTasks(ctx context.Context, state string, limi
 		args = append(args, state)
 	}
 	if destination := recoveryDestination(destinations); destination != "" {
-		if strings.Contains(query, " WHERE ") {
+		if state != "" {
 			query += ` AND (t.destination_key=? OR (t.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=t.account_id AND legacy_dest.sub2_account_id=t.sub2_account_id AND legacy_dest.state='imported')=1 AND EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=t.account_id AND i.sub2_account_id=t.sub2_account_id AND i.state='imported')))`
 		} else {
 			query += ` WHERE (t.destination_key=? OR (t.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=t.account_id AND legacy_dest.sub2_account_id=t.sub2_account_id AND legacy_dest.state='imported')=1 AND EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=t.account_id AND i.sub2_account_id=t.sub2_account_id AND i.state='imported')))`
@@ -938,8 +1000,14 @@ func (l *AccountRecoveryLease) FinishAttempt(ctx context.Context, taskID, attemp
 		return err
 	}
 	if success {
-		if err := checkpointRecoveryTx(ctx, tx, taskID, l.accountID, attemptID); err != nil {
+		var policy string
+		if err := tx.QueryRowContext(ctx, `SELECT sub2_policy FROM accounts WHERE id=?`, l.accountID).Scan(&policy); err != nil {
 			return err
+		}
+		if policy != Sub2PolicyFreeLocal {
+			if err := checkpointRecoveryTx(ctx, tx, taskID, l.accountID, attemptID); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
@@ -973,7 +1041,19 @@ func (l *AccountRecoveryLease) UpdateOAuthResult(ctx context.Context, taskID int
 		}
 	}
 	now := time.Now().Unix()
-	exec, err := tx.ExecContext(ctx, `UPDATE accounts SET access_token_cipher=?,refresh_token_cipher=?,chatgpt_account_id=CASE WHEN ?<>'' THEN ? ELSE chatgpt_account_id END,organization_id=CASE WHEN ?<>'' THEN ? ELSE organization_id END,plan_type=CASE WHEN ?<>'' THEN ? ELSE plan_type END,expires_at=CASE WHEN ?>0 THEN ? ELSE expires_at END,status='active',attempt_count=attempt_count+1,last_error_code='',last_error='',last_http_status=0,last_success_at=?,updated_at=? WHERE id=?`, access, refresh, result.ChatGPTAccountID, result.ChatGPTAccountID, result.OrganizationID, result.OrganizationID, result.PlanType, result.PlanType, result.ExpiresAt, result.ExpiresAt, now, now, l.accountID)
+	var account Account
+	if err := tx.QueryRowContext(ctx, `SELECT status,sub2_policy FROM accounts WHERE id=?`, l.accountID).Scan(&account.Status, &account.Sub2Policy); err != nil {
+		return 0, err
+	}
+	if err := account.terminalError(); err != nil {
+		return 0, err
+	}
+	nextPolicy := nextSub2Policy(result.PlanType, account.Sub2Policy)
+	if strings.TrimSpace(result.PlanType) == "" {
+		result.PlanType = ""
+		nextPolicy = normalizeSub2Policy(account.Sub2Policy)
+	}
+	exec, err := tx.ExecContext(ctx, `UPDATE accounts SET access_token_cipher=?,refresh_token_cipher=?,chatgpt_account_id=CASE WHEN ?<>'' THEN ? ELSE chatgpt_account_id END,organization_id=CASE WHEN ?<>'' THEN ? ELSE organization_id END,plan_type=CASE WHEN ?<>'' THEN ? ELSE plan_type END,sub2_policy=?,expires_at=CASE WHEN ?>0 THEN ? ELSE expires_at END,status='active',attempt_count=attempt_count+1,last_error_code='',last_error='',last_http_status=0,last_success_at=?,updated_at=? WHERE id=?`, access, refresh, result.ChatGPTAccountID, result.ChatGPTAccountID, result.OrganizationID, result.OrganizationID, result.PlanType, result.PlanType, nextPolicy, result.ExpiresAt, result.ExpiresAt, now, now, l.accountID)
 	if err != nil {
 		return 0, err
 	}
@@ -983,10 +1063,14 @@ func (l *AccountRecoveryLease) UpdateOAuthResult(ctx context.Context, taskID int
 		return 0, ErrAccountNotFound
 	}
 	var version int64
-	if err := tx.QueryRowContext(ctx, `INSERT INTO login_attempts(account_id,status,stage,started_at,finished_at) VALUES(?,'success','token_refresh',?,?) RETURNING id`, l.accountID, now, now).Scan(&version); err != nil {
+	if err := tx.QueryRowContext(ctx, `INSERT INTO login_attempts(account_id,status,stage,started_at,finished_at,plan_type,chatgpt_account_id,organization_id,observation_source) VALUES(?,'success','token_refresh',?,?,?,?,?,'token_refresh') RETURNING id`, l.accountID, now, now, result.PlanType, result.ChatGPTAccountID, result.OrganizationID).Scan(&version); err != nil {
 		return 0, err
 	}
-	if taskID > 0 {
+	if nextPolicy == Sub2PolicyFreeLocal {
+		if err := cancelSub2ForFreeTx(ctx, tx, l.accountID, version, "", result.PlanType); err != nil {
+			return 0, err
+		}
+	} else if taskID > 0 {
 		if err := checkpointRecoveryTx(ctx, tx, taskID, l.accountID, version); err != nil {
 			return 0, err
 		}
@@ -1054,7 +1138,18 @@ func (s *Store) ValidateAccountRecoveryVersion(ctx context.Context, taskID int64
 		return err
 	}
 	defer tx.Rollback()
-	return validateRecoveryVersionTx(ctx, tx, taskID, 0)
+	var accountID int64
+	err = tx.QueryRowContext(ctx, `SELECT account_id FROM account_recovery_tasks WHERE id=?`, taskID).Scan(&accountID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrAccountRecoveryNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if err := ensureSub2EligibleTx(ctx, tx, accountID); err != nil {
+		return err
+	}
+	return validateRecoveryVersionTx(ctx, tx, taskID, accountID)
 }
 
 func (s *Store) ResumeAccountRecoveryTask(ctx context.Context, taskID int64) (AccountRecoveryTask, error) {
@@ -1066,6 +1161,14 @@ func (s *Store) ResumeAccountRecoveryTask(ctx context.Context, taskID int64) (Ac
 // successful login. Callers must prove that relogin is appropriate and recheck
 // the binding and remote state before mutations.
 func (s *Store) RetryAccountRecoveryTask(ctx context.Context, taskID int64, relogin bool) (AccountRecoveryTask, error) {
+	return s.retryAccountRecoveryTask(ctx, taskID, relogin, nil)
+}
+
+func (s *Store) RetryManualAccountRecoveryTask(ctx context.Context, expected AccountRecoveryTask, relogin bool) (AccountRecoveryTask, error) {
+	return s.retryAccountRecoveryTask(ctx, expected.ID, relogin, &expected)
+}
+
+func (s *Store) retryAccountRecoveryTask(ctx context.Context, taskID int64, relogin bool, expected *AccountRecoveryTask) (AccountRecoveryTask, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return AccountRecoveryTask{}, err
@@ -1074,6 +1177,14 @@ func (s *Store) RetryAccountRecoveryTask(ctx context.Context, taskID int64, relo
 	task, err := retryAccountRecoveryTaskTx(ctx, tx, taskID, relogin)
 	if err != nil {
 		return task, err
+	}
+	if expected != nil {
+		if task.AccountID != expected.AccountID || task.State != expected.State || task.RetryCount != expected.RetryCount || !task.UpdatedAt.Equal(expected.UpdatedAt) {
+			return task, ErrAccountRecoveryStale
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE account_recovery_tasks SET retry_action='manual_' || retry_action WHERE id=?`, taskID); err != nil {
+			return task, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return task, err
@@ -1098,8 +1209,16 @@ func retryAccountRecoveryTaskTx(ctx context.Context, tx *sql.Tx, taskID int64, r
 	if !relogin && !task.Resumable {
 		return task, ErrAccountRecoveryNotResumable
 	}
+	destination := task.DestinationKey
+	if destination == "" {
+		// Legacy tasks may inherit a target only from one unambiguous binding.
+		// Unknown ownership keeps the old conservative supersession rule.
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT MIN(destination_key) FROM sub2_imports WHERE account_id=? AND sub2_account_id=? AND state='imported' HAVING COUNT(DISTINCT destination_key)=1),'')`, task.AccountID, task.Sub2AccountID).Scan(&destination); err != nil {
+			return task, err
+		}
+	}
 	var newer, active bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM account_recovery_tasks WHERE account_id=? AND id>?),EXISTS(SELECT 1 FROM account_recovery_tasks WHERE account_id=? AND state IN ('queued','validating','disabling_schedule','logging_in','login_succeeded','identity_verified','refreshing_credentials','applying_credentials','credentials_applied','enabling_schedule'))`, task.AccountID, task.ID, task.AccountID).Scan(&newer, &active); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM account_recovery_tasks newer WHERE newer.account_id=? AND newer.id>? AND (?='' OR newer.destination_key=? OR (newer.destination_key='' AND (SELECT COUNT(DISTINCT i.destination_key) FROM sub2_imports i WHERE i.account_id=newer.account_id AND i.sub2_account_id=newer.sub2_account_id AND i.state='imported')=1 AND EXISTS(SELECT 1 FROM sub2_imports i WHERE i.account_id=newer.account_id AND i.sub2_account_id=newer.sub2_account_id AND i.destination_key=? AND i.state='imported')))),EXISTS(SELECT 1 FROM account_recovery_tasks WHERE account_id=? AND state IN ('queued','validating','disabling_schedule','logging_in','login_succeeded','identity_verified','refreshing_credentials','applying_credentials','credentials_applied','enabling_schedule'))`, task.AccountID, task.ID, destination, destination, destination, task.AccountID).Scan(&newer, &active); err != nil {
 		return task, err
 	}
 	if newer || active {

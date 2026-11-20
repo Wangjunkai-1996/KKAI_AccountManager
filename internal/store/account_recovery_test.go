@@ -16,6 +16,7 @@ func TestAccountRecoveryTaskLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	checkTestLogin(t, s, account.Email)
 	task, created, err := s.CreateOrGetAccountRecoveryTask(ctx, account.ID, 77, 1234, true)
 	if err != nil || !created {
 		t.Fatalf("create task = %+v,%v,%v", task, created, err)
@@ -66,6 +67,7 @@ func TestAccountRecoveryTaskRecoveryOnRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	checkTestLogin(t, s, account.Email)
 	task, _, err := s.CreateOrGetAccountRecoveryTask(ctx, account.ID, 1, 2, true)
 	if err != nil {
 		t.Fatal(err)
@@ -552,6 +554,18 @@ func TestRecoveryQueriesStayWithinDestination(t *testing.T) {
 	}
 	if got, err := s.GetLatestAccountRecoveryTaskForDestination(ctx, account.ID, "beta"); err != nil || got.ID != beta.ID {
 		t.Fatalf("beta latest = %+v,%v", got, err)
+	}
+	for _, tc := range []struct {
+		destination string
+		wantID      int64
+	}{
+		{"alpha", alpha.ID},
+		{"beta", beta.ID},
+	} {
+		tasks, err := s.ListAccountRecoveryTasksForDestination(ctx, "", 10, tc.destination)
+		if err != nil || len(tasks) != 1 || tasks[0].ID != tc.wantID {
+			t.Fatalf("%s unfiltered list = %+v,%v", tc.destination, tasks, err)
+		}
 	}
 	latest, err := s.ListLatestAccountRecoveryTasksForDestination(ctx, "alpha")
 	if err != nil || len(latest) != 1 || latest[0].ID != alpha.ID {

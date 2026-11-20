@@ -98,7 +98,7 @@ func TestCredentialRepairRecoveryHandoffIsAtomicAndNotReplayed(t *testing.T) {
 	if err != nil || repair == nil {
 		t.Fatalf("claim: %+v %v", repair, err)
 	}
-	if _, err := s.db.Exec(`CREATE TRIGGER fail_repair_completion BEFORE UPDATE OF state ON account_credential_repairs WHEN NEW.state='completed' BEGIN SELECT RAISE(ABORT,'completion failure'); END`); err != nil {
+	if _, err := s.db.Exec(`CREATE TRIGGER fail_repair_completion BEFORE UPDATE OF state ON account_credential_repairs WHEN NEW.state='recovery_queued' BEGIN SELECT RAISE(ABORT,'completion failure'); END`); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.RetryAccountRecoveryForCredentialRepair(ctx, *repair, task.ID); err == nil {
@@ -116,9 +116,20 @@ func TestCredentialRepairRecoveryHandoffIsAtomicAndNotReplayed(t *testing.T) {
 	}
 	consumed, _ := s.GetCredentialRepair(ctx, id)
 	queued, _ := s.GetAccountRecoveryTaskByID(ctx, task.ID)
-	if consumed.State != "completed" || queued.State != RecoveryQueued {
+	if consumed.State != "recovery_queued" || consumed.RecoveryTaskID != task.ID || queued.State != RecoveryQueued {
 		t.Fatalf("incomplete atomic handoff: repair=%+v task=%+v", consumed, queued)
 	}
+	if allowed, err := s.CredentialRepairAuthorizesRecovery(ctx, id, task.ID); err != nil || !allowed {
+		t.Fatalf("bound handoff not authorized: %v", err)
+	}
+	var otherTaskID int64
+	if err := s.db.QueryRow(`INSERT INTO account_recovery_tasks(account_id,source_credential_attempt_id,sub2_account_id,original_schedulable,state,retry_action,created_at,updated_at) SELECT account_id,source_credential_attempt_id,sub2_account_id,original_schedulable,'failed','relogin',created_at,updated_at FROM account_recovery_tasks WHERE id=? RETURNING id`, task.ID).Scan(&otherTaskID); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := s.CredentialRepairAuthorizesRecovery(ctx, id, otherTaskID); err != nil || allowed {
+		t.Fatalf("handoff authorized another real task with the same account and source version: %v", err)
+	}
+
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +138,24 @@ func TestCredentialRepairRecoveryHandoffIsAtomicAndNotReplayed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	if allowed, err := s.CredentialRepairAuthorizesRecovery(ctx, id, task.ID); err != nil || !allowed {
+		t.Fatalf("restart lost unconsumed handoff: %v", err)
+	}
+	credentials, err := s.GetCredentialsByID(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, attempt, err := s.BeginAttempt(ctx, credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := s.CredentialRepairAuthorizesRecovery(ctx, id, task.ID); err != nil || allowed {
+		t.Fatalf("new login did not atomically consume handoff: %v", err)
+	}
+	if err := s.FinishAttempt(ctx, attempt.ID, false, nil, &Failure{Code: "password_rejected", Stage: "password", Message: "密码错误"}); err != nil {
+		t.Fatal(err)
+	}
+	attempt.Release()
 	// The requeued recovery failed again before the repair worker's next scan.
 	// Its new failure policy must survive both restart and stale handoff calls.
 	deadline := time.Now().Add(time.Hour).Truncate(time.Millisecond)
@@ -142,5 +171,75 @@ func TestCredentialRepairRecoveryHandoffIsAtomicAndNotReplayed(t *testing.T) {
 	failed, _ = s.GetAccountRecoveryTaskByID(ctx, task.ID)
 	if failed.State != RecoveryFailed || failed.NextRetryAt == nil || !failed.NextRetryAt.Equal(deadline) {
 		t.Fatalf("repair replay bypassed recovery backoff: %+v", failed)
+	}
+}
+
+func TestCredentialRepairAddsRecoveryTaskBindingToExistingDatabase(t *testing.T) {
+	s, dir := testStore(t)
+	ctx := context.Background()
+	id := checkTestAccount(t, s, "legacy-repair")
+	password := "new-password"
+	if _, err := s.PatchAccountCredentials(ctx, id, CredentialPatch{Password: &password}, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`ALTER TABLE account_credential_repairs DROP COLUMN recovery_task_id`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(filepath.Join(dir, "accounts.db"), filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	repair, err := s.GetCredentialRepair(ctx, id)
+	if err != nil || repair.State != "queued" || repair.RecoveryTaskID != 0 {
+		t.Fatalf("legacy repair lost in additive migration: %+v %v", repair, err)
+	}
+}
+
+func TestCredentialRepairHandoffSettlesOnTerminalRecoveryFailure(t *testing.T) {
+	for _, state := range []string{"manual", "canceled"} {
+		t.Run(state, func(t *testing.T) {
+			s, _ := testStore(t)
+			ctx := context.Background()
+			id := checkTestAccount(t, s, "terminal-repair")
+			task, _, err := s.CreateOrGetAccountRecoveryTask(ctx, id, 0, 901, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.RecordAccountRecoveryFailure(ctx, task.ID, RecoveryFailure{State: RecoveryFailed, Stage: RecoveryLoggingIn, Code: "password_rejected", RetryAction: "manual"}); err != nil {
+				t.Fatal(err)
+			}
+			password := "new-password"
+			if _, err := s.PatchAccountCredentials(ctx, id, CredentialPatch{Password: &password}, true); err != nil {
+				t.Fatal(err)
+			}
+			repair, err := s.ClaimCredentialRepair(ctx, time.Now())
+			if err != nil || repair == nil {
+				t.Fatalf("claim: %v", err)
+			}
+			if err := s.RetryAccountRecoveryForCredentialRepair(ctx, *repair, task.ID); err != nil {
+				t.Fatal(err)
+			}
+			want := "requires_action"
+			if state == "canceled" {
+				want = "canceled"
+				_, err = s.UpdateAccountRecoveryTask(ctx, task.ID, RecoveryCanceled, "人工暂停")
+			} else {
+				_, err = s.RecordAccountRecoveryFailure(ctx, task.ID, RecoveryFailure{State: RecoveryFailed, Stage: RecoveryValidating, Code: "identity_changed", RetryAction: "manual", Message: "身份已变化", ManualAction: "身份已变化"})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := s.GetCredentialRepair(ctx, id)
+			if err != nil || got.State != want {
+				t.Fatalf("terminal task left repair waiting: %+v %v", got, err)
+			}
+			if allowed, err := s.CredentialRepairAuthorizesRecovery(ctx, id, task.ID); err != nil || allowed {
+				t.Fatal("terminal handoff still authorized")
+			}
+		})
 	}
 }

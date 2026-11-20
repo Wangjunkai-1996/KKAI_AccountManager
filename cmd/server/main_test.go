@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/store"
 )
 
 func TestHTTPServerTimeoutPolicy(t *testing.T) {
@@ -108,10 +111,9 @@ func TestConcurrentLoginLimitAndRelease(t *testing.T) {
 	}
 }
 
-func TestBusyLoginDoesNotConsumeRateLimit(t *testing.T) {
-	oldLimiter, oldSlots := limiter, loginSlots
-	t.Cleanup(func() { limiter, loginSlots = oldLimiter, oldSlots })
-	limiter = newRateLimiter(1, 10*time.Minute)
+func TestBusyLoginPreservesConcurrentSlot(t *testing.T) {
+	oldSlots := loginSlots
+	t.Cleanup(func() { loginSlots = oldSlots })
 	loginSlots = make(chan struct{}, 1)
 	loginSlots <- struct{}{}
 	validBody := `{"email":"test@example.com","password":"test-password","totp_secret":"JBSWY3DPEHPK3PXP"}`
@@ -122,15 +124,14 @@ func TestBusyLoginDoesNotConsumeRateLimit(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("busy status = %d, want %d", rec.Code, http.StatusTooManyRequests)
 	}
-	if len(limiter.requests) != 0 {
-		t.Fatalf("busy request consumed rate-limit budget: %#v", limiter.requests)
+	if len(loginSlots) != 1 {
+		t.Fatal("busy request changed occupied login slots")
 	}
 }
 
 func TestLoginRequestGuards(t *testing.T) {
-	oldLimiter, oldSlots := limiter, loginSlots
-	t.Cleanup(func() { limiter, loginSlots = oldLimiter, oldSlots })
-	limiter = newRateLimiter(100, 10*time.Minute)
+	oldSlots := loginSlots
+	t.Cleanup(func() { loginSlots = oldSlots })
 	loginSlots = make(chan struct{}, 1)
 	loginSlots <- struct{}{}
 	validBody := `{"email":"test@example.com","password":"test-password","totp_secret":"JBSWY3DPEHPK3PXP"}`
@@ -163,10 +164,7 @@ func TestLoginRequestGuards(t *testing.T) {
 	}
 }
 
-func TestLoginRateLimitIgnoresForwardedIP(t *testing.T) {
-	oldLimiter := limiter
-	t.Cleanup(func() { limiter = oldLimiter })
-	limiter = newRateLimiter(1, 10*time.Minute)
+func TestClientIPIgnoresForwardedIP(t *testing.T) {
 	for i, expected := range []int{http.StatusBadRequest, http.StatusBadRequest} {
 		req := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{}`))
 		req.RemoteAddr = "[::1]:12345"
@@ -182,8 +180,63 @@ func TestLoginRateLimitIgnoresForwardedIP(t *testing.T) {
 			t.Fatalf("request %d status = %d, want %d", i+1, recorder.Code, expected)
 		}
 	}
-	if len(limiter.requests) != 0 {
-		t.Fatalf("invalid login requests consumed rate-limit budget: %#v", limiter.requests)
+}
+
+func TestLoginEndpointsHaveNoCumulativeRequestLimit(t *testing.T) {
+	history := newTestHistory(t)
+	oldSlots, oldImporter := loginSlots, sub2Importer
+	t.Cleanup(func() { loginSlots, sub2Importer = oldSlots, oldImporter })
+	loginSlots = make(chan struct{}, 1)
+	sub2Importer = nil
+	legacyFlag := flag.Lookup("rate-limit")
+	if legacyFlag == nil {
+		t.Fatal("legacy rate-limit flag must remain accepted")
+	}
+	oldFlag := legacyFlag.Value.String()
+	t.Cleanup(func() { _ = legacyFlag.Value.Set(oldFlag) })
+	if err := legacyFlag.Value.Set("1"); err != nil {
+		t.Fatal(err)
+	}
+	// Stop at local proxy validation after admission, without starting a browser.
+	account, err := history.UpsertCredentials(context.Background(), store.Credentials{
+		Email: "batch@example.com", Password: "password-123", TOTPSecret: "JBSWY3DPEHPK3PXP", Proxy: "socks5://proxy.invalid:1234",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newBody := `{"email":"batch@example.com","password":"password-123","totp_secret":"JBSWY3DPEHPK3PXP","proxy":"socks5://proxy.invalid:1234"}`
+	for _, tt := range []struct {
+		path    string
+		body    string
+		handler http.HandlerFunc
+	}{
+		{"/api/login", newBody, handleLogin(nil)},
+		{"/api/login/stream", newBody, handleLoginStream(nil)},
+		{"/api/history/login", `{"account_id":` + itoa(account.ID) + `}`, handleHistoryLogin(nil)},
+	} {
+		t.Run(tt.path, func(t *testing.T) {
+			for i := 0; i < 35; i++ {
+				req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+				req.Header.Set("Content-Type", "application/json")
+				rec := httptest.NewRecorder()
+				tt.handler(rec, req)
+				if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "代理配置无效") || rec.Header().Get("Retry-After") != "" {
+					t.Fatalf("request %d = %d %s, Retry-After=%q", i+1, rec.Code, rec.Body.String(), rec.Header().Get("Retry-After"))
+				}
+				if len(loginSlots) != 0 {
+					t.Fatal("completed request retained its concurrency slot")
+				}
+			}
+			loginSlots <- struct{}{}
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			tt.handler(rec, req)
+			<-loginSlots
+			if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), `"code":"platform_busy"`) {
+				t.Fatalf("busy request = %d %s", rec.Code, rec.Body.String())
+			}
+		})
 	}
 }
 

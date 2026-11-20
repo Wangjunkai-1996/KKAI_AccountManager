@@ -38,7 +38,7 @@ func checkTestLogin(t *testing.T, s *Store, email string) {
 		t.Fatal(err)
 	}
 	defer attempt.Release()
-	if err = s.FinishAttempt(ctx, attempt.ID, true, &Result{AccessToken: "test-secret-at", RefreshToken: "test-secret-rt", ChatGPTAccountID: "workspace"}, nil); err != nil {
+	if err = s.FinishAttempt(ctx, attempt.ID, true, &Result{PlanType: "plus", AccessToken: "test-secret-at", RefreshToken: "test-secret-rt", ChatGPTAccountID: "workspace"}, nil); err != nil {
 		t.Fatal(err)
 	}
 }

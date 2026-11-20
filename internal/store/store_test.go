@@ -254,45 +254,83 @@ func TestAttemptHistoryBusySuccessAndFailure(t *testing.T) {
 	}
 }
 
-func TestDeletedAccountIsRetainedUntilFinalizedAndDeactivatedIsRetained(t *testing.T) {
+func TestDeletedAccountRetainsOnlySafeHistoryAndDeactivatedIsRetained(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
-	if _, err := s.UpsertCredentials(ctx, Credentials{Email: "deleted@example.com", Password: "pw"}); err != nil {
-		t.Fatal(err)
+	for _, scenario := range []struct {
+		name, email, code, status string
+	}{
+		{name: "deactivated", email: "deactivated@example.com", code: "account_deactivated", status: "deactivated"},
+		{name: "deleted", email: "deleted@example.com", code: "account_deleted", status: "deleted"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			if _, err := s.UpsertCredentials(ctx, Credentials{Email: scenario.email, Password: "pw", TOTPSecret: "totp", Proxy: "http://proxy"}); err != nil {
+				t.Fatal(err)
+			}
+			attempt, err := s.StartAttempt(ctx, scenario.email)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.FinishAttempt(ctx, attempt.ID, false, nil, &Failure{Code: scenario.code, AccountStatus: scenario.status}); err != nil {
+				t.Fatal(err)
+			}
+			attempt.Release()
+			account, err := s.GetAccount(ctx, scenario.email)
+			if err != nil || account.Status != scenario.status || !account.IsOfficialUnavailable() {
+				t.Fatalf("official tombstone = %+v, err=%v", account, err)
+			}
+			var events int
+			if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_lifecycle_events WHERE account_id=? AND status=? AND code=? AND source='official'`, account.ID, scenario.status, scenario.code).Scan(&events); err != nil || events != 1 {
+				t.Fatalf("lifecycle audit count=%d err=%v", events, err)
+			}
+			if _, err := s.StartAttempt(ctx, scenario.email); !errors.Is(err, ErrAccountOfficialUnavailable) {
+				t.Fatalf("official account accepted new login: %v", err)
+			}
+			var attemptStatus, code string
+			if err := s.db.QueryRowContext(ctx, `SELECT status,error_code FROM login_attempts WHERE account_id=? AND id=?`, account.ID, attempt.ID).Scan(&attemptStatus, &code); err != nil || attemptStatus != "failed" || code != scenario.code {
+				t.Fatalf("retained attempt = %s/%s, err=%v", attemptStatus, code, err)
+			}
+		})
 	}
-	attempt, err := s.StartAttempt(ctx, "deleted@example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.FinishAttempt(ctx, attempt.ID, false, nil, &Failure{Code: "account_deactivated", AccountStatus: "deactivated"}); err != nil {
-		t.Fatal(err)
-	}
-	attempt.Release()
-	if _, err := s.GetAccount(ctx, "deleted@example.com"); err != nil {
-		t.Fatalf("deactivated account removed: %v", err)
-	}
-	attempt, err = s.StartAttempt(ctx, "deleted@example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.FinishAttempt(ctx, attempt.ID, false, nil, &Failure{Code: "account_deleted", AccountStatus: "deleted"}); err != nil {
-		t.Fatal(err)
-	}
-	attempt.Release()
 	deleted, err := s.GetAccount(ctx, "deleted@example.com")
-	if err != nil || deleted.Status != "deleted" {
-		t.Fatalf("deleted account tombstone = %+v, err=%v", deleted, err)
-	}
-	lease, err := s.AcquireAccountRecovery(ctx, deleted.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lease.Release()
+	for _, query := range []string{
+		`UPDATE accounts SET access_token_cipher=X'01',refresh_token_cipher=X'02',expires_at=123 WHERE id=?`,
+		`INSERT INTO account_recovery_tasks(account_id,sub2_account_id,state,created_at,updated_at) VALUES(?,42,'queued',1,1)`,
+		`INSERT INTO account_deliveries(account_id,credential_version,destination_key,state,created_at,updated_at) VALUES(?,1,'test','queued',1,1)`,
+		`INSERT INTO account_credential_repairs(account_id,state,updated_at) VALUES(?,'queued',1)`,
+	} {
+		if _, err := s.db.ExecContext(ctx, query, deleted.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := s.FinalizeDeletedAccount(ctx, deleted.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetAccount(ctx, "deleted@example.com"); !errors.Is(err, ErrAccountNotFound) {
-		t.Fatalf("finalized deleted account lookup = %v", err)
+	retained, err := s.GetAccount(ctx, "deleted@example.com")
+	if err != nil || retained.ID != deleted.ID || retained.Status != "deleted" || retained.AttemptCount != deleted.AttemptCount {
+		t.Fatalf("retained deleted account = %+v, err=%v", retained, err)
+	}
+	var cleared bool
+	if err := s.db.QueryRowContext(ctx, `SELECT length(password_cipher)=0 AND totp_cipher IS NULL AND proxy_cipher IS NULL AND access_token_cipher IS NULL AND refresh_token_cipher IS NULL AND expires_at=0 FROM accounts WHERE id=?`, deleted.ID).Scan(&cleared); err != nil || !cleared {
+		t.Fatalf("deleted credentials were not cleared: %v", err)
+	}
+	for _, table := range []string{"account_recovery_tasks", "account_deliveries", "account_credential_repairs"} {
+		var count int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table+` WHERE account_id=? AND state='canceled'`, deleted.ID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("canceled work in %s: count=%d", table, count)
+		}
+	}
+	if _, _, err := s.GetOAuthResultByID(ctx, deleted.ID); !errors.Is(err, ErrAccountOfficialUnavailable) {
+		t.Fatalf("deleted account OAuth lookup = %v", err)
+	}
+	if _, err := s.GetAccountByID(ctx, deleted.ID); err != nil {
+		t.Fatalf("official tombstone was removed: %v", err)
 	}
 }
 

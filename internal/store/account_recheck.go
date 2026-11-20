@@ -108,9 +108,25 @@ func (s *Store) listAccountRecoveryRechecks(ctx context.Context, destinations ..
 
 // RetryAccountRecoveryRecheck is called after account/configuration details
 // were corrected. The worker still revalidates versions, binding and pauses.
-func (s *Store) RetryAccountRecoveryRecheck(ctx context.Context, accountID int64) (bool, error) {
+func (s *Store) RetryAccountRecoveryRecheck(ctx context.Context, taskID int64, destination string) (bool, error) {
+	destination = strings.TrimSpace(destination)
+	if taskID <= 0 || destination == "" {
+		return false, nil
+	}
 	now := time.Now().UnixMilli()
-	result, err := s.db.ExecContext(ctx, `UPDATE account_recovery_rechecks SET state='pending',next_check_at=?,manual_action='',last_error='',retry_count=0,updated_at=? WHERE state='requires_action' AND task_id=(SELECT id FROM account_recovery_tasks WHERE account_id=? ORDER BY id DESC LIMIT 1)`, now, now, accountID)
+	// Resolve legacy ownership by the same unique binding rule used by reads.
+	// The exact task and latest-in-destination checks are part of this UPDATE,
+	// so a stale page cannot retry a replacement task or another destination.
+	result, err := s.db.ExecContext(ctx, `WITH owned AS (
+ SELECT t.id,t.account_id FROM account_recovery_tasks t
+ WHERE t.destination_key=? OR (t.destination_key='' AND
+ (SELECT COUNT(DISTINCT i.destination_key) FROM sub2_imports i WHERE i.account_id=t.account_id AND i.sub2_account_id=t.sub2_account_id AND i.state='imported')=1 AND
+ EXISTS (SELECT 1 FROM sub2_imports i WHERE i.destination_key=? AND i.account_id=t.account_id AND i.sub2_account_id=t.sub2_account_id AND i.state='imported'))
+ ) UPDATE account_recovery_rechecks SET state='pending',next_check_at=?,manual_action='',last_error='',retry_count=0,updated_at=?
+ WHERE state='requires_action' AND task_id=? AND task_id IN (
+ SELECT t.id FROM account_recovery_tasks t JOIN owned o ON o.id=t.id
+ WHERE t.state='completed' AND t.id=(SELECT MAX(latest.id) FROM owned latest WHERE latest.account_id=t.account_id)
+ )`, destination, destination, now, now, taskID)
 	if err != nil {
 		return false, err
 	}
@@ -198,6 +214,16 @@ func (s *Store) QueueAccountRecoveryFromRecheck(ctx context.Context, parentID in
 	parent, err := scanAccountRecoveryTask(tx.QueryRowContext(ctx, accountRecoverySelect+` WHERE t.id=?`, parentID))
 	if err != nil {
 		return AccountRecoveryTask{}, err
+	}
+	var status, policy, plan string
+	if err := tx.QueryRowContext(ctx, `SELECT status,COALESCE(sub2_policy,'unknown'),COALESCE(plan_type,'') FROM accounts WHERE id=?`, parent.AccountID).Scan(&status, &policy, &plan); err != nil {
+		return AccountRecoveryTask{}, err
+	}
+	if err := (Account{Status: status, Sub2Policy: policy}).Sub2EligibilityError(); err != nil || !IsSub2PaidPlan(plan) {
+		if err != nil {
+			return AccountRecoveryTask{}, err
+		}
+		return AccountRecoveryTask{}, ErrSub2PlanIneligible
 	}
 	check, err := scanAccountRecoveryRecheck(tx.QueryRowContext(ctx, accountRecheckSelect+` WHERE r.task_id=?`, parentID))
 	if err != nil {

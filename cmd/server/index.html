@@ -840,8 +840,10 @@
         .history-more > summary { border: 1px solid var(--border); background: var(--bg-elevated); color: var(--text-secondary); cursor: pointer; list-style: none; }
         .history-more > summary::after { content: ' ···'; }
         .history-more-menu { display: flex; flex-wrap: wrap; gap: .4rem; padding-top: .55rem; }
-        .history-more[open] { flex-basis: 100%; }
+        .history-more[open] { flex: 1 0 100%; min-width: 100%; }
+        .history-account-card:has(.history-more[open]) .history-row-actions { grid-column: 2 / -1; }
         .history-more[open] > summary { width: max-content; margin-left: auto; }
+        .history-more-status { flex: 1 0 100%; color: var(--warning); font-size: .72rem; line-height: 1.4; overflow-wrap: anywhere; }
         .history-more-menu button[data-history-action="delete"] { color: var(--error); margin-left: auto; }
         .history-recovery-count:focus-visible, .history-account-card summary:focus-visible, .history-account-card button:focus-visible { outline: 2px solid #87a4ff; outline-offset: 3px; }
         @media (max-width: 1100px) {
@@ -926,6 +928,20 @@
         .action-confirm-buttons button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
         .action-confirm-buttons .btn-danger { color: var(--error); border-color: var(--error); }
         .action-confirm-buttons .btn-danger:hover { color: var(--error); border-color: var(--error); background: rgba(248, 113, 113, 0.1); }
+        .history-account-email, .history-name-source { margin-top: .25rem; font-size: .72rem; color: var(--text-dim); overflow-wrap: anywhere; }
+        .history-credentials { margin-bottom: 1rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); }
+        .history-credentials h4 { margin-bottom: .75rem; }
+        .history-credential-row { display: grid; grid-template-columns: minmax(8rem, .8fr) minmax(0, 1.5fr) auto; gap: .5rem; align-items: center; margin: .6rem 0; font-size: .82rem; }
+        .history-credential-value { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+        .history-credential-actions { display: flex; gap: .4rem; }
+        .history-credential-status { grid-column: 2 / -1; color: var(--text-secondary); font-size: .75rem; }
+        .history-credential-edit { margin-top: .75rem; }
+        .history-credential-edit summary { cursor: pointer; font-size: .8rem; color: var(--text-secondary); }
+        @media (max-width: 560px) {
+            .history-credential-row { grid-template-columns: minmax(0, 1fr) auto; }
+            .history-credential-row > span:first-child { grid-column: 1 / -1; }
+            .history-credential-status { grid-column: 1 / -1; }
+        }
         .account-form-dialog { width: min(580px, calc(100% - 2rem)); }
         .account-form-dialog .input-group { margin: 1rem 0; }
         .account-form-dialog .hint { overflow-wrap: anywhere; }
@@ -935,6 +951,8 @@
         .delivery-group-option { display: flex; gap: .5rem; align-items: center; padding: .5rem .75rem; border: 1px solid var(--border); border-radius: 8px; font-size: .85rem; min-height: 42px; }
         .delivery-group-option input, .account-form-dialog input[type="checkbox"] { width: auto; }
         .delivery-group-option:has(input:checked) { border-color: var(--accent); background: rgba(139, 92, 246, .12); }
+        .delivery-primary-badge { margin-left: auto; color: var(--accent); white-space: nowrap; font-size: .75rem; }
+        .delivery-primary-badge[hidden] { display: none; }
         .account-form-dialog .form-status { min-height: 1.5em; color: var(--text-secondary); font-size: .85rem; margin: .75rem 0; white-space: pre-wrap; overflow-wrap: anywhere; }
         .account-form-dialog .form-status.error { color: var(--error); }
         .account-form-dialog input[type="password"], .account-form-dialog input[type="text"] { width: 100%; }
@@ -951,11 +969,11 @@
 
         .history-detail-header h3 {
             min-width: 0;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
+            overflow-wrap: anywhere;
+            white-space: normal;
             font-size: 1rem;
         }
+        .history-detail-header .btn-icon { flex: 0 0 32px; }
 
         .history-detail-summary {
             display: grid;
@@ -1280,6 +1298,592 @@
         @media (prefers-reduced-motion: reduce) {
             *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
         }
+
+        /* ===== ACCOUNT TABLE VISUAL PASS ===== */
+        #panel-history {
+            background: #0a0f17;
+        }
+
+        #panel-history .tab-history-inner {
+            max-width: 1580px;
+            padding-bottom: 2rem;
+        }
+
+        #panel-history .history-card {
+            padding: 1.15rem 1.25rem 1rem;
+            border: 1px solid rgba(144, 164, 194, .14);
+            border-radius: 14px;
+            background: #101823;
+            box-shadow: 0 18px 48px rgba(0, 0, 0, .2);
+        }
+
+        #panel-history .history-card > .card-header {
+            margin-bottom: .9rem;
+            padding-bottom: .9rem;
+            border-bottom-color: rgba(144, 164, 194, .14);
+        }
+
+        #panel-history .card-title {
+            font-size: 1.2rem;
+            letter-spacing: -.01em;
+        }
+
+        #panel-history .history-toolbar {
+            gap: .55rem .8rem;
+        }
+
+        #panel-history .history-refresh-status,
+        #panel-history .history-setting-status {
+            font-size: .75rem;
+        }
+
+        #panel-history .history-setting-toggle {
+            padding: .35rem .55rem;
+            border: 1px solid rgba(144, 164, 194, .14);
+            border-radius: 6px;
+            background: rgba(255, 255, 255, .025);
+        }
+
+        #panel-history #refreshHistoryBtn {
+            min-height: 34px;
+            padding: .4rem .75rem;
+            border-radius: 7px;
+        }
+
+        #panel-history .history-monitor-details {
+            margin: -.25rem 0 .75rem;
+        }
+
+        #panel-history .history-attention {
+            margin: .65rem 0 .85rem;
+            border: 1px solid rgba(233, 165, 104, .24);
+            border-left: 3px solid var(--warning);
+            border-radius: 7px;
+            background: rgba(233, 165, 104, .045);
+        }
+
+        #panel-history .history-attention > summary {
+            padding: .55rem .7rem;
+            font-size: .8rem;
+        }
+
+        #panel-history .account-table-controls {
+            grid-template-columns: minmax(280px, 1.35fr) minmax(420px, 1fr);
+            gap: .7rem 1rem;
+            margin-bottom: .7rem;
+            padding: .8rem;
+            border: 1px solid rgba(144, 164, 194, .1);
+            border-radius: 9px;
+            background: #0c131d;
+        }
+
+        #panel-history .account-table-controls .input-group label,
+        #panel-history .history-filter-toolbar label {
+            color: var(--text-dim);
+            font-size: .7rem;
+            letter-spacing: .04em;
+            text-transform: uppercase;
+        }
+
+        #panel-history .account-table-controls input,
+        #panel-history .account-table-controls select {
+            height: 38px;
+            border-color: rgba(144, 164, 194, .14);
+            background: #111b28;
+            border-radius: 7px;
+            font-size: .8rem;
+        }
+
+        #panel-history .account-table-controls input:focus,
+        #panel-history .account-table-controls select:focus {
+            border-color: rgba(106, 145, 255, .7);
+            box-shadow: 0 0 0 3px rgba(59, 109, 255, .12);
+        }
+
+        #panel-history .history-filter-toolbar {
+            gap: .65rem;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+
+        #panel-history .history-filter-toolbar select {
+            margin-top: .3rem;
+        }
+
+        #panel-history .history-list-toolbar {
+            margin-top: 0;
+            padding: .55rem .15rem .7rem;
+            border-bottom: 1px solid rgba(144, 164, 194, .1);
+        }
+
+        #panel-history .history-select-all,
+        #panel-history .history-selection-status {
+            font-size: .75rem;
+        }
+
+        #panel-history .history-grid {
+            border: 1px solid rgba(144, 164, 194, .12);
+            border-radius: 9px;
+            background: #0d151f;
+            overflow: hidden;
+        }
+
+        #panel-history .account-table-heading,
+        #panel-history .history-account-card {
+            grid-template-columns: 36px minmax(12rem, 1.4fr) minmax(7rem, .8fr) minmax(10rem, 1.1fr) minmax(8rem, .9fr) minmax(9rem, 1fr) minmax(12rem, 1.2fr) minmax(7rem, .75fr) minmax(7.5rem, .8fr);
+            column-gap: .75rem;
+        }
+
+        #panel-history:focus {
+            outline: none;
+        }
+
+        #panel-history:focus-visible {
+            outline: 1px solid rgba(106, 145, 255, .38);
+            outline-offset: -1px;
+        }
+
+        #panel-history .account-table-heading {
+            padding: .65rem .8rem;
+            border-top: 0;
+            border-bottom: 1px solid rgba(144, 164, 194, .14);
+            background: #121c2a;
+            color: #7f91aa;
+            font-size: .67rem;
+            font-weight: 650;
+            letter-spacing: .04em;
+            text-transform: uppercase;
+        }
+
+        #panel-history .history-account-card {
+            min-height: 74px;
+            padding: .72rem .8rem;
+            border: 0;
+            border-bottom: 1px solid rgba(144, 164, 194, .1);
+            background: transparent;
+        }
+
+        #panel-history .history-account-card:last-child {
+            border-bottom: 0;
+        }
+
+        #panel-history .history-account-card:hover {
+            background: #121d2b;
+        }
+
+        #panel-history .history-account-card.history-selected {
+            background: rgba(59, 109, 255, .08);
+            box-shadow: inset 2px 0 0 var(--accent);
+        }
+
+        #panel-history .history-account-card .history-email {
+            font-size: .8rem;
+            line-height: 1.35;
+        }
+
+        #panel-history .history-account-number,
+        #panel-history .history-row-time {
+            color: #71829a;
+            font-size: .69rem;
+        }
+
+        #panel-history .history-account-card .history-status {
+            max-width: 100%;
+            overflow: hidden;
+            border: 0;
+            border-left: 2px solid currentColor;
+            border-radius: 3px;
+            background: rgba(144, 164, 194, .06);
+            padding: .16rem .42rem;
+            font-size: .72rem;
+            line-height: 1.35;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+        }
+
+        #panel-history .history-account-card .history-status.sub2-warning {
+            background: rgba(233, 165, 104, .075);
+        }
+
+        #panel-history .history-source {
+            border: 0;
+            border-left: 2px solid currentColor;
+            border-radius: 0;
+            background: transparent;
+            padding: .08rem .4rem;
+            font-size: .7rem;
+        }
+
+        #panel-history .history-quota-summary {
+            display: flex;
+            gap: .3rem;
+            color: #a9b7c9;
+            font-size: .69rem;
+        }
+
+        #panel-history .history-quota-summary span {
+            padding: .18rem .38rem;
+            border: 1px solid rgba(144, 164, 194, .12);
+            border-radius: 5px;
+            background: rgba(144, 164, 194, .055);
+            font-variant-numeric: tabular-nums;
+        }
+
+        #panel-history .history-workflow-state {
+            color: #d8e2ef;
+            font-size: .76rem;
+            font-weight: 650;
+            line-height: 1.4;
+        }
+
+        #panel-history .history-diagnostics {
+            margin-top: .25rem;
+        }
+
+        #panel-history .history-account-card .history-actions .btn-secondary,
+        #panel-history .history-more > summary {
+            min-height: 30px;
+            padding: .28rem .48rem;
+            border-radius: 6px;
+            border-color: rgba(144, 164, 194, .16);
+            background: #121c2a;
+            font-size: .7rem;
+        }
+
+        #panel-history .history-account-card button[data-history-action="details"] {
+            color: #b9caff;
+            border-color: rgba(106, 145, 255, .32);
+            background: rgba(59, 109, 255, .1);
+        }
+
+        #panel-history .history-pagination {
+            margin-top: .8rem;
+            padding-top: .7rem;
+            border-top: 1px solid rgba(144, 164, 194, .1);
+            font-size: .74rem;
+        }
+
+        @media (max-width: 1100px) {
+            #panel-history .history-card {
+                padding: .9rem;
+            }
+
+            #panel-history .history-grid {
+                border: 0;
+                background: transparent;
+                overflow: visible;
+            }
+
+            #panel-history .account-table-heading {
+                display: none;
+            }
+
+            #panel-history .history-account-card {
+                min-height: 0;
+                border: 1px solid rgba(144, 164, 194, .12);
+                border-radius: 9px;
+                background: #0d151f;
+            }
+
+            #panel-history .history-account-card:hover {
+                background: #121d2b;
+            }
+        }
+
+        @media (max-width: 640px) {
+            #panel-history .history-filter-toolbar { grid-template-columns: 1fr; }
+            #panel-history {
+                padding: .75rem;
+            }
+
+            #panel-history .history-card {
+                padding: .75rem;
+                border-radius: 11px;
+            }
+
+            #panel-history .history-card > .card-header {
+                align-items: flex-start;
+            }
+
+            #panel-history .account-table-controls {
+                grid-template-columns: minmax(0, 1fr);
+                padding: .65rem;
+            }
+
+            #panel-history .history-quota-summary {
+                flex-wrap: wrap;
+            }
+        }
+
+        /* Account workspace: neutral surfaces keep status colors meaningful. */
+        #panel-history {
+            background: #141719;
+        }
+
+        #panel-history .history-card {
+            padding: 0;
+            background: transparent;
+            border: 0;
+            border-radius: 0;
+            box-shadow: none;
+        }
+
+        #panel-history .history-card > .card-header {
+            align-items: center;
+            padding: .4rem 0 1rem;
+            border-bottom-color: #32383b;
+        }
+
+        #panel-history .card-title::before {
+            width: 3px;
+            height: 1.1rem;
+            background: var(--accent);
+        }
+
+        #panel-history .history-refresh-status {
+            color: #b1babd;
+            font-variant-numeric: tabular-nums;
+        }
+
+        #panel-history .history-setting-toggle {
+            color: #c7d0d2;
+            background: #242a2c;
+            border-color: #3c4547;
+        }
+
+        #panel-history .account-table-controls {
+            padding: .7rem 0 .85rem;
+            border: 0;
+            background: transparent;
+        }
+
+        #panel-history .account-table-controls .input-group label,
+        #panel-history .history-filter-toolbar label {
+            color: #adb8ba;
+            font-size: .75rem;
+            letter-spacing: 0;
+            text-transform: none;
+        }
+
+        #panel-history .account-table-controls input,
+        #panel-history .account-table-controls select {
+            background: #202527;
+            border-color: #41494b;
+            color: #e9eeee;
+        }
+
+        #panel-history .account-table-controls input::placeholder {
+            color: #94a0a2;
+        }
+
+        #panel-history .history-list-toolbar {
+            border-bottom-color: #343c3e;
+        }
+
+        #panel-history .history-grid {
+            min-height: 220px;
+            border-color: #3a4345;
+            background: #1c2123;
+        }
+
+        #panel-history .account-table-heading {
+            background: #282e30;
+            border-bottom-color: #414a4c;
+            color: #b5c0c1;
+            font-size: .72rem;
+        }
+
+        #panel-history .history-account-card {
+            min-height: 72px;
+            background: #1c2123;
+            border-bottom-color: #343c3e;
+        }
+
+        #panel-history .history-account-card:hover {
+            background: #283032;
+        }
+
+        #panel-history .history-account-card.history-selected {
+            background: #233539;
+            box-shadow: inset 3px 0 0 var(--accent);
+        }
+
+        #panel-history .history-account-card .history-email {
+            color: #f1f5f5;
+            font-weight: 600;
+            font-size: .83rem;
+        }
+
+        #panel-history .history-account-card .history-status {
+            display: inline-flex;
+            align-items: center;
+            max-width: 100%;
+            min-height: 25px;
+            color: #c7d0d2;
+            background: #262d2f;
+            font-size: .76rem;
+        }
+
+        #panel-history .history-account-card .history-status.success,
+        #panel-history .history-account-card .history-status.active,
+        #panel-history .history-account-card .history-status.sub2-ok { color: #81d9ad; }
+        #panel-history .history-account-card .history-status.error,
+        #panel-history .history-account-card .history-status.failed,
+        #panel-history .history-account-card .history-status.deleted,
+        #panel-history .history-account-card .history-status.deactivated,
+        #panel-history .history-account-card .history-status.deleted_or_deactivated,
+        #panel-history .history-account-card .history-status.sub2-error { color: #f29b99; }
+        #panel-history .history-account-card .history-status.running { color: #92b5ee; }
+        #panel-history .history-account-card .history-status.sub2-unknown { color: #e2bf88; }
+        #panel-history .history-account-card .history-status.sub2-warning {
+            color: #e7bc82;
+            background: #302b24;
+        }
+        #panel-history .history-account-card .history-row-sub2 .history-status {
+            white-space: normal;
+            overflow: visible;
+            text-overflow: clip;
+            line-height: 1.4;
+        }
+
+        #panel-history .history-source {
+            color: #adb8ba;
+            font-size: .74rem;
+        }
+        #panel-history .history-source.official { color: #f29b99; }
+        #panel-history .history-source.sub2 { color: #e7bc82; }
+        #panel-history .history-source.unknown { color: #e2bf88; }
+
+        #panel-history .history-quota-summary {
+            color: #d5dfe0;
+            font-size: .75rem;
+        }
+
+        #panel-history .history-quota-summary span {
+            border-color: #3d4749;
+            background: #273032;
+        }
+
+        #panel-history .history-cost-summary {
+            display: block;
+            margin-top: .35rem;
+            color: #b7dfcb;
+            font-size: .74rem;
+            font-variant-numeric: tabular-nums;
+            line-height: 1.3;
+        }
+
+        #panel-history .history-cost-summary.is-pending { color: #acb9bb; }
+        #panel-history .history-cost-summary span { color: #e2bf88; }
+
+        #panel-history .history-workflow-state {
+            color: #e6eded;
+        }
+
+        #panel-history .history-account-card .history-actions .btn-secondary,
+        #panel-history .history-more > summary {
+            color: #d2dcdd;
+            border-color: #424b4e;
+            background: #282f31;
+            font-size: .76rem;
+        }
+
+        #panel-history .history-account-card .history-actions .btn-secondary:hover:not(:disabled),
+        #panel-history .history-more > summary:hover {
+            color: #ffffff;
+            border-color: #6c999e;
+            background: #334043;
+        }
+
+        #panel-history .history-pagination {
+            color: #b6c1c2;
+            border-top-color: #343c3e;
+        }
+
+        #panel-history .history-pagination select {
+            background: #242b2d;
+            border-color: #41494b;
+        }
+
+        #panel-history .empty-state {
+            min-height: 220px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: .7rem;
+            color: #aebabc;
+        }
+
+        #panel-history .empty-state .empty-icon {
+            display: grid;
+            width: 52px;
+            height: 52px;
+            place-items: center;
+            border: 1px solid #41494b;
+            border-radius: 14px;
+            background: #273032;
+            font-size: 1.8rem;
+        }
+
+        @media (max-width: 1100px) {
+            #panel-history .history-account-card {
+                grid-template-columns: 20px repeat(4, minmax(0, 1fr));
+                background: #1c2123;
+                border-color: #3a4345;
+            }
+            #panel-history .history-account-card .history-select { grid-column: 1; grid-row: 1 / span 2; }
+            #panel-history .history-account-card .history-row-identity { grid-column: 2 / 4; }
+            #panel-history .history-account-card .history-row-auth { grid-column: 4; }
+            #panel-history .history-account-card .history-row-sub2 { grid-column: 5; }
+            #panel-history .history-account-card .history-row-sub2 .history-status {
+                white-space: normal;
+                overflow: visible;
+                text-overflow: clip;
+            }
+            #panel-history .history-account-card .history-row-source { grid-column: 2; }
+            #panel-history .history-account-card .history-row-quota { grid-column: 3; }
+            #panel-history .history-account-card .history-row-workflow { grid-column: 4; }
+            #panel-history .history-account-card .history-row-time { grid-column: 5; }
+            #panel-history .history-account-card .history-row-actions { grid-column: 2 / -1; }
+        }
+
+        @media (max-width: 640px) {
+            #panel-history .history-account-card { grid-template-columns: 20px repeat(2, minmax(0, 1fr)); }
+            #panel-history .history-account-card .history-select { grid-column: 1; grid-row: 1 / span 4; }
+            #panel-history .history-account-card .history-row-identity { grid-column: 2 / -1; }
+            #panel-history .history-account-card .history-row-auth,
+            #panel-history .history-account-card .history-row-sub2 { grid-column: 2 / -1; }
+            #panel-history .history-account-card .history-row-sub2 .history-status {
+                white-space: normal;
+                overflow: visible;
+                text-overflow: clip;
+            }
+            #panel-history .history-account-card .history-row-source,
+            #panel-history .history-account-card .history-row-workflow { grid-column: 2; }
+            #panel-history .history-account-card .history-row-quota,
+            #panel-history .history-account-card .history-row-time { grid-column: 3; }
+            #panel-history .history-account-card .history-row-actions { grid-column: 2 / -1; }
+            #panel-history .history-selection-status {
+                flex: 1 0 100%;
+                line-height: 1.5;
+            }
+            #panel-history .history-card > .card-header {
+                gap: .65rem;
+            }
+
+            #panel-history .history-toolbar {
+                width: 100%;
+                justify-content: flex-start;
+            }
+
+            #panel-history .history-pagination {
+                justify-content: flex-start;
+            }
+
+            #panel-history .history-pagination #historyPageInfo {
+                flex: 1 0 100%;
+            }
+        }
     </style>
 </head>
 <body>
@@ -1342,25 +1946,7 @@
                 </div>
 
                 <details class="login-advanced">
-                    <summary>网络与处理方式 <span id="loginConnectionSummary">IPv4 直连 · 并发模式</span></summary>
-                    <div class="input-group">
-                    <div class="input-label-row">
-                        <label for="proxyInput">HTTP 代理</label>
-                        <button class="btn-secondary" id="proxyCheckBtn" type="button">测试代理</button>
-                    </div>
-                    <input
-                        id="proxyInput"
-                        type="text"
-                        inputmode="url"
-                        autocomplete="off"
-                        spellcheck="false"
-                        placeholder="代理地址；或 direct 使用服务器 IPv4 直连">
-                    <p class="hint">
-                        留空走服务器 IPv4。其他出口可填 <code>http://user:pass@host:port</code>，或填 <code>direct</code> 明确直连。
-                    </p>
-                    <p class="hint" id="proxyCheckStatus" role="status" aria-live="polite"></p>
-                </div>
-
+                    <summary>网络与处理方式 <span id="loginConnectionSummary">服务器默认网络 · 并发模式</span></summary>
                     <div class="input-group">
                         <label for="modeSelect">处理模式</label>
                         <select id="modeSelect">
@@ -1462,7 +2048,7 @@
             <div class="account-table-controls">
                 <div class="input-group">
                     <label for="historySearchInput">搜索账号</label>
-                    <input type="search" id="historySearchInput" placeholder="邮箱或账号 ID" autocomplete="off" spellcheck="false" aria-controls="historyGrid" disabled>
+                    <input type="search" id="historySearchInput" placeholder="名称、前缀、邮箱或账号 ID" autocomplete="off" spellcheck="false" aria-controls="historyGrid" disabled>
                 </div>
                 <div class="history-filter-toolbar">
                 <label for="historyStatusFilter">状态
@@ -1475,9 +2061,15 @@
                         <option value="available">最近登录成功</option>
                         <option value="failed">登录失败</option>
                         <option value="deactivated">停用或删除</option>
+                        <option value="discarded">已废弃</option>
                         <option value="processing">登录处理中</option>
                         <option value="expired">访问令牌已过期</option>
                         <option value="other">中断或未知</option>
+                    </select>
+                </label>
+                <label for="historyPlanFilter">账号类型
+                    <select id="historyPlanFilter">
+                        <option value="all" selected>全部类型</option>
                     </select>
                 </label>
                 <label for="historySort">排序
@@ -1628,11 +2220,16 @@
                 <div class="delivery-group-list" id="deliveryGroups"></div>
                 <p class="hint" id="deliveryGroupsHint">不选分组时进入未分组。</p>
             </fieldset>
+            <fieldset class="input-group" style="border:0;padding:0">
+                <legend>Sub2 出口 IP（可多选）</legend>
+                <div class="delivery-group-list" id="deliveryEgressRoutes"></div>
+                <p class="hint" id="deliveryEgressHint">不选时登录使用服务器默认网络；Sub2 使用其默认出口。</p>
+            </fieldset>
             <div class="controls">
                 <div class="control-group"><label for="deliveryPriority">Sub2 优先级</label><input type="number" id="deliveryPriority" min="0" max="2147483647" step="1" required></div>
                 <div class="control-group"><label for="deliveryConcurrency">Sub2 账号并发</label><input type="number" id="deliveryConcurrency" min="1" max="10000" step="1" required></div>
             </div>
-            <p class="hint">数值越小优先级越高。账号并发用于 Sub2 请求调度，与批量登录并发独立；已有 Sub2 账号保留原配置。</p>
+            <p class="hint">数值越小优先级越高。选择出口时，并发数应用到每个出口，与批量登录并发独立；已有 Sub2 账号保留原配置。</p>
             <label class="history-setting-toggle"><input type="checkbox" id="deliverySaveDefault"><span>同时保存为平台默认参数</span></label>
             <p class="form-status" id="deliveryOptionsStatus" role="status" aria-live="polite"></p>
             <div class="action-confirm-buttons"><button class="btn-secondary" id="deliveryOptionsCancel" type="button">取消</button><button class="btn-secondary" id="deliveryOptionsApply" type="submit">用于本批</button></div>
@@ -1640,15 +2237,14 @@
     </dialog>
 
     <dialog class="history-detail-panel action-confirm-dialog account-form-dialog" id="credentialsDialog" aria-labelledby="credentialsTitle" aria-describedby="credentialsAccount">
-        <h3 id="credentialsTitle">更新资料并自动继续</h3>
+        <h3 id="credentialsTitle">更新登录资料</h3>
         <p class="hint" id="credentialsAccount"></p>
         <form id="credentialsForm" autocomplete="off">
-            <p class="hint">只填写需要更新的内容，留空保留原资料；已保存的密码、TOTP 和代理不会显示在这里。</p>
+            <p class="hint">只填写需要更新的内容，留空保留原资料；已保存的密码和 TOTP 不会显示在这里。</p>
             <div class="input-group"><label for="credentialsPassword">新密码</label><input id="credentialsPassword" type="password" autocomplete="new-password" placeholder="留空保留原密码"></div>
             <div class="input-group"><label for="credentialsTotp">TOTP 密钥</label><input id="credentialsTotp" type="password" autocomplete="new-password" placeholder="留空保留原密钥"><label class="history-setting-toggle"><input id="credentialsClearTotp" type="checkbox"><span>明确移除已保存的 TOTP</span></label></div>
-            <div class="input-group"><label for="credentialsProxy">登录代理</label><input id="credentialsProxy" type="password" autocomplete="new-password" placeholder="代理地址；或 direct 使用 IPv4 直连"><p class="hint">输入 direct 使用服务器 IPv4 直连；留空保留账号原线路。直连可用性以实际登录结果为准。</p><label class="history-setting-toggle"><input id="credentialsClearProxy" type="checkbox"><span>清除账号代理，使用服务默认线路</span></label></div>
             <p class="form-status" id="credentialsStatus" role="status" aria-live="polite"></p>
-            <div class="action-confirm-buttons"><button class="btn-secondary" id="credentialsCancel" type="button">取消</button><button class="btn-secondary" id="credentialsSave" type="submit">保存并自动继续</button></div>
+            <div class="action-confirm-buttons"><button class="btn-secondary" id="credentialsCancel" type="button">取消</button><button class="btn-secondary" id="credentialsSave" type="submit">保存资料</button></div>
         </form>
     </dialog>
 

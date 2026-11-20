@@ -1,0 +1,93 @@
+{
+  "release_id": "20261114T021850Z-paused-actions",
+  "source_commit": "33d64a0401599837246f647d4d5fdf554e8a0015",
+  "binary_sha256": "7c9475845d75421f2cccab585f4376f4442e56f0caa3d93dd28aa77eb8e29389",
+  "phase": "immediate",
+  "started_at": "2026-11-14T02:22:09Z",
+  "active_release": "/opt/openai-login/releases/20261114T021850Z-paused-actions",
+  "rollback_release": "/opt/openai-login/releases/20261113T163828Z-account-management",
+  "backup_db": "/var/lib/openai-login/backups/accounts-before-20261114T021850Z-paused-actions.db",
+  "backup_integrity": "ok",
+  "before_counts": {
+    "login_attempts_running": 0,
+    "account_checks_active": 0,
+    "check_batches_active": 0,
+    "sub2_imports_active": 0,
+    "recovery_active": 0,
+    "deliveries_active": 0,
+    "rechecks_active": 0,
+    "repairs_active": 0
+  },
+  "after_counts": {
+    "login_attempts_running": 0,
+    "account_checks_active": 0,
+    "check_batches_active": 0,
+    "sub2_imports_active": 0,
+    "recovery_active": 0,
+    "deliveries_active": 0,
+    "rechecks_active": 0,
+    "repairs_active": 0
+  },
+  "ready": {
+    "database_ready": true,
+    "status": "ready",
+    "sub2_configured": true
+  },
+  "health": {
+    "max_concurrent": 10,
+    "status": "ok",
+    "sub2_configured": true,
+    "time": "2026-11-14T02:22:10Z"
+  },
+  "socket_health": {
+    "max_concurrent": 10,
+    "status": "ok",
+    "sub2_configured": true,
+    "time": "2026-11-14T02:22:14Z"
+  },
+  "public_unauthenticated_status": "401",
+  "static_hashes": {
+    "/": {
+      "status": 200,
+      "sha256": "cdfac9409ef3603feefce4d1d5093b57e0c46318c5d994ad7ce0bd4ccd4f75aa"
+    },
+    "/api/client.js": {
+      "status": 200,
+      "sha256": "a95e002ec180b3843ea68900fe95817386dbcb51d7c9aabb9eca9fe7aa4c9aad"
+    }
+  },
+  "runtime_smoke": {
+    "pid": 3586646,
+    "release": "/opt/openai-login/releases/20261114T021850Z-paused-actions",
+    "output": "/opt/openai-login/releases/20261114T021850Z-paused-actions/PRODUCTION_RUNTIME.txt",
+    "returncode": 0
+  },
+  "recovery_settings": {
+    "success": true,
+    "enabled": true,
+    "auto_recovery_enabled": true,
+    "running": true,
+    "blocked_reason": "",
+    "interval_seconds": 60,
+    "last_scan_at": "2026-11-14T02:22:10.523110569Z",
+    "next_scan_at": "2026-11-14T02:23:10.523110616Z",
+    "scanning": false,
+    "last_error": "",
+    "auto_check_batch_id": "",
+    "summary": "待恢复账号 2 个，提交检测 0 个，直接提交恢复 0 个，等待或冷却 2 个；2 个状态暂时未知"
+  },
+  "journal_errors": {
+    "panic": 0,
+    "fatal": 0,
+    "database_locked": 0,
+    "storage_failure": 0,
+    "listen_failure": 0,
+    "browser_runtime_permission": 0,
+    "login_failed": 0,
+    "oauth_401": 0,
+    "oauth_403": 0,
+    "oauth_5xx": 0
+  },
+  "service_state": "active",
+  "nrestarts": "0"
+}

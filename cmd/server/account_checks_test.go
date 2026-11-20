@@ -37,7 +37,7 @@ func accountCheckFixture(t *testing.T, count int) (*store.Store, []int64) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = s.FinishAttempt(ctx, attempt.ID, true, &store.Result{AccessToken: "fixture-at", RefreshToken: "fixture-rt", ChatGPTAccountID: name}, nil)
+		err = s.FinishAttempt(ctx, attempt.ID, true, &store.Result{PlanType: "plus", AccessToken: "fixture-at", RefreshToken: "fixture-rt", ChatGPTAccountID: name}, nil)
 		attempt.Release()
 		if err != nil {
 			t.Fatal(err)
@@ -276,19 +276,45 @@ func TestAccountCheckWorkerFinalRequestEvidence(t *testing.T) {
 func runAccountCheckSub2CleanupTest(t *testing.T, outcome, errorCode, requestKey string) {
 	t.Helper()
 	history, ids := accountCheckFixture(t, 1)
+	const beforePause = "2026-11-19T00:00:00Z"
+	const afterPause = "2026-11-19T00:00:01Z"
+	var paused, confirmedMissing atomic.Bool
 	var deleted atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method + " " + r.URL.Path {
 		case http.MethodGet + " /api/v1/admin/accounts/101":
+			if deleted.Load() != 0 {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 404, "message": "account not found"})
+				confirmedMissing.Store(true)
+				return
+			}
+			stamp := beforePause
+			if paused.Load() {
+				stamp = afterPause
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
 				"id": 101, "platform": "openai", "type": "oauth",
+				"updated_at": stamp, "schedulable": !paused.Load(),
 				"credentials": map[string]any{"email": "fixture-0@example.test", "chatgpt_account_id": "fixture-0"},
-				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": ids[0]}},
+				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": ids[0], "operation_id": "fixture-0"}},
 			}})
+		case http.MethodGet + " /api/v1/admin/accounts":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"items":[{"id":101}],"total":1}}`))
+		case http.MethodPost + " /api/v1/admin/accounts/101/schedulable":
+			var request map[string]any
+			if json.NewDecoder(r.Body).Decode(&request) != nil || request["schedulable"] != false {
+				t.Error("expected pause")
+			}
+			paused.Store(true)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"id": 101, "schedulable": false, "updated_at": afterPause}})
 		case http.MethodDelete + " /api/v1/admin/accounts/101":
+			if !paused.Load() {
+				t.Error("delete before pause")
+			}
 			deleted.Add(1)
-			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"message": "deleted"}})
+			_, _ = w.Write([]byte(`{"code":0}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -313,11 +339,14 @@ func runAccountCheckSub2CleanupTest(t *testing.T, outcome, errorCode, requestKey
 		t.Fatalf("check result = %+v", items)
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for deleted.Load() == 0 && time.Now().Before(deadline) {
+	for !confirmedMissing.Load() && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if deleted.Load() != 1 {
 		t.Fatalf("delete requests = %d, want 1", deleted.Load())
+	}
+	if !confirmedMissing.Load() {
+		t.Fatal("original Sub2 account was not checked after deletion")
 	}
 }
 

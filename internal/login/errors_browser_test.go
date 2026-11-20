@@ -67,7 +67,7 @@ func TestObserveAuthResponsesExtractsNestedMFAJSON(t *testing.T) {
 			t.Fatalf("message = %q, want nested message", statusErr.Message)
 		}
 		info := DescribeError(err)
-		if info.Code != "invalid_mfa" || info.Stage != LoginStageMFA || info.Retryable {
+		if info.Code != LoginErrorVerificationCodeRejected || info.UpstreamCode != "invalid_mfa" || info.Stage != LoginStageMFA || info.Retryable {
 			t.Fatalf("DescribeError() = %#v, want nested terminal detail", info)
 		}
 	case <-time.After(3 * time.Second):

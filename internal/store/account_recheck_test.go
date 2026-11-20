@@ -167,3 +167,81 @@ func TestAccountRecoveryRecheckShortensOnlyUntouchedLegacyFirstPlans(t *testing.
 		}
 	}
 }
+
+func TestAccountRecoveryRecheckRetryIsExactAndDestinationScoped(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	accountID := checkTestAccount(t, s, "recheck-target")
+	newTask := func(destination, recheckState string) int64 {
+		t.Helper()
+		task, _, err := s.CreateOrGetAccountRecoveryTask(ctx, accountID, 0, 901, true, destination)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.UpdateAccountRecoveryTask(ctx, task.ID, RecoveryCompleted, ""); err != nil {
+			t.Fatal(err)
+		}
+		completed := time.Now().Add(-time.Minute).UnixMilli()
+		if _, err := s.db.Exec(`INSERT INTO account_recovery_rechecks(task_id,state,round,retry_count,last_error,manual_action,completed_at,updated_at) VALUES(?,?,2,3,'needs attention','check configuration',?,?)`, task.ID, recheckState, completed, completed); err != nil {
+			t.Fatal(err)
+		}
+		return task.ID
+	}
+	read := func(taskID int64) AccountRecoveryRecheck {
+		t.Helper()
+		item, err := scanAccountRecoveryRecheck(s.db.QueryRowContext(ctx, accountRecheckSelect+` WHERE r.task_id=?`, taskID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	assertRetry := func(taskID int64, destination string, want bool) {
+		t.Helper()
+		resumed, err := s.RetryAccountRecoveryRecheck(ctx, taskID, destination)
+		if err != nil || resumed != want {
+			t.Fatalf("task=%d destination=%q resumed=%v err=%v want=%v", taskID, destination, resumed, err, want)
+		}
+	}
+
+	alpha := newTask("alpha", "requires_action")
+	beta := newTask("beta", "requires_action")
+	alphaBefore, betaBefore := read(alpha), read(beta)
+	assertRetry(0, "alpha", false)
+	assertRetry(alpha, "", false)
+	assertRetry(beta+1, "alpha", false)
+	assertRetry(beta, "alpha", false)
+	assertRetry(alpha, "beta", false)
+	if got := read(beta); got.State != betaBefore.State || got.UpdatedAt != betaBefore.UpdatedAt {
+		t.Fatalf("wrong task or destination changed beta: %+v", got)
+	}
+	assertRetry(alpha, " alpha ", true)
+	after := read(alpha)
+	if after.State != "pending" || after.NextCheckAt == nil || after.NextCheckAt.After(time.Now()) || after.RequiresAction || after.ManualAction != "" || after.LastError != "" || after.RetryCount != 0 || after.Round != alphaBefore.Round || !after.CompletedAt.Equal(alphaBefore.CompletedAt) {
+		t.Fatalf("retry did not preserve original follow-up while clearing its manual failure: %+v", after)
+	}
+	if got := read(beta); got.State != "requires_action" {
+		t.Fatalf("retrying alpha also reset beta: %+v", got)
+	}
+	assertRetry(alpha, "alpha", false)
+
+	// The supplied ID remains authoritative when a newer same-target task
+	// exists: a stale button must never reset that new task instead.
+	if _, err := s.db.Exec(`UPDATE account_recovery_rechecks SET state='requires_action' WHERE task_id=?`, alpha); err != nil {
+		t.Fatal(err)
+	}
+	newAlpha := newTask("alpha", "requires_action")
+	assertRetry(alpha, "alpha", false)
+	if old, current := read(alpha), read(newAlpha); old.State != "requires_action" || current.State != "requires_action" {
+		t.Fatalf("stale retry changed old/new follow-ups: old=%+v current=%+v", old, current)
+	}
+	assertRetry(newAlpha, "alpha", true)
+	// A newer alpha task never supersedes beta's own latest follow-up.
+	assertRetry(beta, "beta", true)
+	if _, err := s.db.Exec(`UPDATE account_recovery_rechecks SET state='canceled',next_check_at=NULL WHERE task_id=?`, newAlpha); err != nil {
+		t.Fatal(err)
+	}
+	assertRetry(newAlpha, "alpha", false)
+	if got := read(newAlpha); got.State != "canceled" || got.NextCheckAt != nil {
+		t.Fatalf("canceled follow-up was resumed: %+v", got)
+	}
+}
