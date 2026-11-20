@@ -20,6 +20,7 @@ var (
 type AccountDelivery struct {
 	SourceCredentialAttemptID int64               `json:"source_credential_attempt_id,omitempty"`
 	ResultCredentialAttemptID int64               `json:"result_credential_attempt_id,omitempty"`
+	BoundApplyStarted         bool                `json:"-"`
 	OriginalBindingID         int64               `json:"-"`
 	OriginalRemoteID          int64               `json:"-"`
 	OriginalBindingVersion    int64               `json:"-"`
@@ -104,12 +105,12 @@ CREATE INDEX IF NOT EXISTS account_delivery_history ON account_deliveries(accoun
 	if err != nil {
 		return err
 	}
-	for _, column := range []string{"allow_create", "import_operation_id", "original_binding_id", "original_remote_id", "original_binding_version"} {
+	for _, column := range []string{"allow_create", "import_operation_id", "original_binding_id", "original_remote_id", "original_binding_version", "bound_handoff_state"} {
 		if columns[column] {
 			continue
 		}
 		declaration := " INTEGER NOT NULL DEFAULT 0"
-		if column == "import_operation_id" {
+		if column == "import_operation_id" || column == "bound_handoff_state" {
 			declaration = " TEXT NOT NULL DEFAULT ''"
 		}
 		if _, err := s.db.Exec("ALTER TABLE account_deliveries ADD COLUMN " + column + declaration); err != nil {
@@ -119,14 +120,14 @@ CREATE INDEX IF NOT EXISTS account_delivery_history ON account_deliveries(accoun
 	return s.migrateDeliveryOptions()
 }
 
-const accountDeliverySelect = `SELECT id,account_id,credential_version,destination_key,recovery_task_id,state,last_error,next_retry_at,manual_action,retry_count,created_at,updated_at,options_json,allow_create,import_operation_id,original_binding_id,original_remote_id,original_binding_version FROM account_deliveries`
+const accountDeliverySelect = `SELECT id,account_id,credential_version,destination_key,recovery_task_id,state,last_error,next_retry_at,manual_action,retry_count,created_at,updated_at,options_json,allow_create,import_operation_id,original_binding_id,original_remote_id,original_binding_version,bound_handoff_state='apply_started' FROM account_deliveries`
 
 func scanAccountDelivery(row scanner) (AccountDelivery, error) {
 	var delivery AccountDelivery
 	var options string
 	var next sql.NullInt64
 	var created, updated int64
-	if err := row.Scan(&delivery.ID, &delivery.AccountID, &delivery.CredentialVersion, &delivery.DestinationKey, &delivery.RecoveryTaskID, &delivery.State, &delivery.LastError, &next, &delivery.ManualAction, &delivery.RetryCount, &created, &updated, &options, &delivery.AllowCreate, &delivery.ImportOperationID, &delivery.OriginalBindingID, &delivery.OriginalRemoteID, &delivery.OriginalBindingVersion); err != nil {
+	if err := row.Scan(&delivery.ID, &delivery.AccountID, &delivery.CredentialVersion, &delivery.DestinationKey, &delivery.RecoveryTaskID, &delivery.State, &delivery.LastError, &next, &delivery.ManualAction, &delivery.RetryCount, &created, &updated, &options, &delivery.AllowCreate, &delivery.ImportOperationID, &delivery.OriginalBindingID, &delivery.OriginalRemoteID, &delivery.OriginalBindingVersion, &delivery.BoundApplyStarted); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return AccountDelivery{}, ErrAccountDeliveryNotFound
 		}
@@ -148,21 +149,15 @@ func scanAccountDelivery(row scanner) (AccountDelivery, error) {
 // FinishAttemptAndQueueDelivery commits the encrypted OAuth result and its
 // delivery intent together. The caller retains the login attempt's account lock.
 func (s *Store) FinishAttemptAndQueueDelivery(ctx context.Context, attemptID int64, result *Result, destination string, options ...DeliveryOptions) (AccountDelivery, error) {
-	return s.finishAttemptAndQueueDelivery(ctx, attemptID, result, destination, true, false, options...)
+	return s.finishAttemptAndQueueDelivery(ctx, attemptID, result, destination, true, options...)
 }
 
 // FinishAttemptAndQueueDeliveryUpdate preserves repair's update-only intent.
 func (s *Store) FinishAttemptAndQueueDeliveryUpdate(ctx context.Context, attemptID int64, result *Result, destination string, options ...DeliveryOptions) (AccountDelivery, error) {
-	return s.finishAttemptAndQueueDelivery(ctx, attemptID, result, destination, false, false, options...)
+	return s.finishAttemptAndQueueDelivery(ctx, attemptID, result, destination, false, options...)
 }
 
-// FinishBoundRelogin saves a history login and updates its initial binding.
-// An unbound local-only login has no delivery row.
-func (s *Store) FinishBoundRelogin(ctx context.Context, attemptID int64, result *Result, destination string) (AccountDelivery, error) {
-	return s.finishAttemptAndQueueDelivery(ctx, attemptID, result, destination, false, true)
-}
-
-func (s *Store) finishAttemptAndQueueDelivery(ctx context.Context, attemptID int64, result *Result, destination string, allowCreate, onlyIfBound bool, options ...DeliveryOptions) (AccountDelivery, error) {
+func (s *Store) finishAttemptAndQueueDelivery(ctx context.Context, attemptID int64, result *Result, destination string, allowCreate bool, options ...DeliveryOptions) (AccountDelivery, error) {
 	opt := DefaultDeliveryOptions()
 	if len(options) > 0 {
 		opt = options[0]
@@ -195,9 +190,6 @@ func (s *Store) finishAttemptAndQueueDelivery(ctx context.Context, attemptID int
 	}
 	if err := s.finishAttemptTx(ctx, tx, attemptID, true, result, nil); err != nil {
 		return AccountDelivery{}, err
-	}
-	if onlyIfBound && bindingID == 0 {
-		return AccountDelivery{}, tx.Commit()
 	}
 	if strings.TrimSpace(result.AccessToken) == "" || strings.TrimSpace(result.RefreshToken) == "" {
 		return AccountDelivery{}, errors.New("complete OAuth tokens are required")
@@ -266,7 +258,7 @@ func (s *Store) finishAttemptAndQueueDelivery(ctx context.Context, attemptID int
 	if _, err := tx.ExecContext(ctx, `UPDATE account_deliveries SET state='canceled',last_error='已有更新的登录结果，旧交付已取消',next_retry_at=NULL,manual_action='',updated_at=? WHERE account_id=? AND destination_key=? AND recovery_task_id=0 AND state NOT IN ('completed','canceled')`, now, accountID, destination); err != nil {
 		return AccountDelivery{}, err
 	}
-	insert, err := tx.ExecContext(ctx, `INSERT INTO account_deliveries(account_id,credential_version,destination_key,state,created_at,updated_at,options_json,allow_create,import_operation_id,original_binding_id,original_remote_id,original_binding_version) VALUES(?,?,?,'queued',?,?,?,?,?,?,?,?)`, accountID, attemptID, destination, now, now, string(raw), boolInt(allowCreate), operationID, bindingID, remoteID, bindingVersion)
+	insert, err := tx.ExecContext(ctx, `INSERT INTO account_deliveries(account_id,credential_version,destination_key,state,created_at,updated_at,options_json,allow_create,import_operation_id,original_binding_id,original_remote_id,original_binding_version,bound_handoff_state) VALUES(?,?,?,'queued',?,?,?,?,?,?,?,?,CASE WHEN ?>0 THEN 'ready' ELSE '' END)`, accountID, attemptID, destination, now, now, string(raw), boolInt(allowCreate), operationID, bindingID, remoteID, bindingVersion, bindingID)
 	if err != nil {
 		return AccountDelivery{}, err
 	}
@@ -278,6 +270,19 @@ func (s *Store) finishAttemptAndQueueDelivery(ctx context.Context, attemptID int
 		return AccountDelivery{}, err
 	}
 	return s.GetAccountDelivery(ctx, id)
+}
+
+// StartBoundDeliveryApply consumes the right to write this credential version
+// before dispatch. After a crash only a matching remote marker can confirm it.
+func (s *Store) StartBoundDeliveryApply(ctx context.Context, task AccountRecoveryTask) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE account_deliveries SET bound_handoff_state='apply_started'
+ WHERE id=? AND account_id=? AND credential_version=? AND state='verifying' AND recovery_task_id=?
+ AND original_binding_id>0 AND bound_handoff_state='ready'`, task.DeliveryID, task.AccountID, task.ResultCredentialAttemptID, task.ID)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
 }
 
 func (s *Store) GetAccountDelivery(ctx context.Context, id int64) (AccountDelivery, error) {

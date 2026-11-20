@@ -201,7 +201,7 @@ func (s *Store) QueueAccountDelivery(ctx context.Context, accountID int64, desti
 	if lookupErr == nil {
 		// An explicit first import can replace an update-only repair intent that
 		// never acquired a remote binding. A new operation fences old workers.
-		if !bound && existing.RecoveryTaskID == 0 && !existing.AllowCreate && (existing.State == "canceled" || existing.State == "requires_action") {
+		if !bound && existing.OriginalBindingID == 0 && existing.RecoveryTaskID == 0 && !existing.AllowCreate && (existing.State == "canceled" || existing.State == "requires_action") {
 			nonce := make([]byte, 16)
 			if _, err := rand.Read(nonce); err != nil {
 				return AccountDelivery{}, err

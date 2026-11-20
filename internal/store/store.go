@@ -213,6 +213,10 @@ func Open(dbPath, keyPath string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err = s.retireLifecycleDeliveries(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("retire legacy lifecycle deliveries: %w", err)
+	}
 	if err = s.convergeTerminalCredentials(context.Background()); err != nil {
 		db.Close()
 		return nil, err

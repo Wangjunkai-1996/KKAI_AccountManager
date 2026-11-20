@@ -31,6 +31,7 @@ type recoveryFixture struct {
 	detailEmail         string
 	detailWorkspace     string
 	detailOrg           string
+	detailOperation     string
 	detailPlan          string
 	detailExpiry        int64
 	detailStatus        string
@@ -116,7 +117,7 @@ func newRecoveryFixture(t *testing.T, schedulable bool, accessTokens ...string) 
 	}
 	f := &recoveryFixture{
 		store: history, db: db, account: account, schedule: schedulable,
-		detailEmail: account.Email, detailStatus: "error", detailError: "401 unauthorized",
+		detailEmail: account.Email, detailOperation: "operation", detailStatus: "error", detailError: "401 unauthorized",
 		detailWorkspace: "workspace", detailOrg: "business-org", detailPlan: "self_serve_business_prolite",
 		credentialReady: true, probeOK: true,
 	}
@@ -157,7 +158,7 @@ func (f *recoveryFixture) handle(w http.ResponseWriter, r *http.Request) {
 			"status": f.detailStatus, "error_message": f.detailError,
 			"credentials":        map[string]any{"email": f.detailEmail, "chatgpt_account_id": f.detailWorkspace, "organization_id": f.detailOrg, "plan_type": f.detailPlan, "expires_at": f.detailExpiry},
 			"credentials_status": map[string]any{"has_access_token": f.credentialReady, "has_refresh_token": f.credentialReady},
-			"extra":              map[string]any{"kkai_auth_import": map[string]any{"source_account_id": f.account.ID}},
+			"extra":              map[string]any{"kkai_auth_import": map[string]any{"source_account_id": f.account.ID, "operation_id": f.detailOperation}},
 		}
 		if f.externalAccount {
 			detail["extra"] = map[string]any{}

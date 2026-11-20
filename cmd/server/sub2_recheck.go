@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -29,7 +28,7 @@ func (s *sub2RecoveryService) handleRecheckRetry(w http.ResponseWriter, r *http.
 		recoveryAPIError(w, http.StatusInternalServerError, "recovery_read_failed", "读取恢复任务失败")
 		return
 	}
-	if err := s.validateRecheckOwnership(r.Context(), task, nil); err != nil {
+	if err := s.validateRecheckOwnership(r.Context(), task); err != nil {
 		recoveryAPIError(w, http.StatusConflict, "recheck_not_resumable", safeRecoveryMessage(err))
 		return
 	}
@@ -102,19 +101,14 @@ func (s *sub2RecoveryService) processRecheck(check store.AccountRecoveryRecheck)
 		s.recheckFailure(check, err)
 		return
 	}
-	var probe func() error
-	if err := s.validateRecheckOwnership(ctx, task, &probe); err != nil {
+	if err := s.validateRecheckOwnership(ctx, task); err != nil {
 		s.recheckFailure(check, err)
 		return
 	}
-	if probe != nil {
-		err = probe()
-	} else {
-		err = s.verifySub2AccountProbe(ctx, task.Sub2AccountID)
-	}
+	err = s.verifySub2AccountProbe(ctx, task.Sub2AccountID)
 	// The admin test uses Sub2's current token and egress. Re-read ownership and
 	// operator state after it, because its remote request can outlive a pause.
-	if ownershipErr := s.validateRecheckOwnership(ctx, task, nil); ownershipErr != nil {
+	if ownershipErr := s.validateRecheckOwnership(ctx, task); ownershipErr != nil {
 		s.recheckFailure(check, ownershipErr)
 		return
 	}
@@ -142,7 +136,7 @@ func (s *sub2RecoveryService) processRecheck(check store.AccountRecoveryRecheck)
 	s.notify()
 }
 
-func (s *sub2RecoveryService) validateRecheckOwnership(ctx context.Context, task store.AccountRecoveryTask, probe *func() error) error {
+func (s *sub2RecoveryService) validateRecheckOwnership(ctx context.Context, task store.AccountRecoveryTask) error {
 	if failure, err := s.automationFailure(ctx, task.AccountID); err != nil {
 		return err
 	} else if failure != nil {
@@ -179,7 +173,7 @@ func (s *sub2RecoveryService) validateRecheckOwnership(ctx context.Context, task
 	if verifySub2RecoveryIdentity(detail, task.Sub2AccountID, task.AccountID, account, binding) != nil {
 		return &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
 	}
-	if err := s.verifyRecheckCheckpoint(ctx, task, detail, binding, probe); err != nil {
+	if err := s.verifyRecheckCheckpoint(ctx, task, detail, binding); err != nil {
 		return err
 	}
 	scheduled, ok := boolField(detail, "schedulable")
@@ -193,7 +187,7 @@ func (s *sub2RecoveryService) validateRecheckOwnership(ctx context.Context, task
 	return nil
 }
 
-func (s *sub2RecoveryService) verifyRecheckCheckpoint(ctx context.Context, task store.AccountRecoveryTask, detail map[string]any, binding store.Sub2Import, probe *func() error) error {
+func (s *sub2RecoveryService) verifyRecheckCheckpoint(ctx context.Context, task store.AccountRecoveryTask, detail map[string]any, binding store.Sub2Import) error {
 	changed := &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
 	if task.Purpose == "delivery" && task.DeliveryID > 0 {
 		delivery, err := s.store.GetAccountDelivery(ctx, task.DeliveryID)
@@ -201,43 +195,11 @@ func (s *sub2RecoveryService) verifyRecheckCheckpoint(ctx context.Context, task 
 			return err
 		}
 		if delivery.OriginalBindingID > 0 {
-			extra, _ := detail["extra"].(map[string]any)
-			_, hasMarker := extra["kkai_auth_import"]
 			if !delivery.MatchesOriginalBinding(binding) || delivery.RecoveryTaskID != task.ID ||
 				delivery.CredentialVersion != task.ResultCredentialAttemptID || task.ResultCredentialAttemptID <= 0 ||
-				delivery.State == "canceled" || hasMarker && !matchesImportMarker(detail, binding) {
+				delivery.State == "canceled" || !boundImportMarkerMatches(detail, binding) {
 				return changed
 			}
-			operation := fmt.Sprintf("auth-delivery-%d-%d", delivery.ID, delivery.CredentialVersion)
-			path := fmt.Sprintf("/admin/accounts/%d/lifecycle-oauth/%s", task.Sub2AccountID, operation)
-			var receipt lifecycleOAuthReceipt
-			if err := s.sub2JSONBody(ctx, http.MethodGet, path, nil, &receipt); err != nil {
-				return err
-			}
-			stamp, _ := detail["updated_at"].(string)
-			revision, err := time.Parse(time.RFC3339Nano, stamp)
-			if err != nil || !receipt.AccountRevision.Equal(revision) || receipt.ID != task.Sub2AccountID ||
-				receipt.OperationID != operation || receipt.SourceAccountID != task.AccountID ||
-				receipt.ImportOperationID != binding.OperationID || receipt.CredentialRevision != delivery.CredentialVersion ||
-				receipt.Phase != "enable" || !receipt.MayEnable || !receipt.Schedulable {
-				return changed
-			}
-			if probe != nil {
-				credentials, _ := detail["credentials"].(map[string]any)
-				workspace, _ := credentials["chatgpt_account_id"].(string)
-				if workspace == "" {
-					return changed
-				}
-				*probe = func() error {
-					return s.sub2JSONBody(ctx, http.MethodPost, strings.TrimSuffix(path, "/"+operation), map[string]any{
-						"phase": "probe", "expected_updated_at": revision.UTC(), "expected_email": task.AccountEmail,
-						"expected_workspace": workspace, "source_account_id": task.AccountID,
-						"import_operation_id": binding.OperationID, "operation_id": operation,
-						"credential_revision": delivery.CredentialVersion,
-					}, nil)
-				}
-			}
-			return nil
 		}
 	}
 	if !recoveryMarkerMatches(detail, task) {
@@ -255,7 +217,7 @@ func (s *sub2RecoveryService) delayedRecheckRetryOwned(ctx context.Context, task
 		return false
 	}
 	binding, err := s.store.GetSub2Import(ctx, s.sub2.destinationKey, task.AccountID)
-	if err != nil || binding.State != "imported" || binding.Sub2AccountID != task.Sub2AccountID || s.verifyRecheckCheckpoint(ctx, parent, detail, binding, nil) != nil {
+	if err != nil || binding.State != "imported" || binding.Sub2AccountID != task.Sub2AccountID || s.verifyRecheckCheckpoint(ctx, parent, detail, binding) != nil {
 		return false
 	}
 	scheduled, ok := boolField(detail, "schedulable")

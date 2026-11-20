@@ -549,20 +549,20 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		require(store.RecoveryValidating, "identity_changed")
 		return
 	}
+	var frozenBinding bool
 	if task.Purpose == "delivery" && task.DeliveryID > 0 {
 		delivery, err := s.store.GetAccountDelivery(ctx, task.DeliveryID)
 		if err != nil {
 			fail(store.RecoveryValidating, err)
 			return
 		}
+		frozenBinding = delivery.OriginalBindingID > 0
 		if !delivery.MatchesOriginalBinding(binding) {
 			require(store.RecoveryValidating, "identity_changed")
 			return
 		}
-		if delivery.OriginalBindingID > 0 {
-			if err := s.processBoundLifecycleOAuth(ctx, lease, task, delivery, account, binding); err != nil {
-				fail(store.RecoveryValidating, err)
-			}
+		if delivery.State == "canceled" || frozenBinding && delivery.CredentialVersion != task.ResultCredentialAttemptID {
+			require(store.RecoveryValidating, "version_changed")
 			return
 		}
 	}
@@ -574,7 +574,7 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		fail(store.RecoveryValidating, err)
 		return
 	}
-	if verifySub2RecoveryIdentity(detail, task.Sub2AccountID, task.AccountID, account, binding) != nil {
+	if verifySub2RecoveryIdentity(detail, task.Sub2AccountID, task.AccountID, account, binding) != nil || frozenBinding && !boundImportMarkerMatches(detail, binding) {
 		require(store.RecoveryValidating, "identity_changed")
 		return
 	}
@@ -585,6 +585,12 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 	scheduled, ok := boolField(detail, "schedulable")
 	if !ok {
 		require(store.RecoveryValidating, "checkpoint_unconfirmed")
+		return
+	}
+	// A standard probe can change remote status. Leave an operator-paused
+	// binding untouched when the delivery has no intent to restore scheduling.
+	if frozenBinding && !task.OriginalSchedulable {
+		require(store.RecoveryValidating, "manual_pause")
 		return
 	}
 	if task.RetryAction != "" {
@@ -675,7 +681,7 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		return
 	}
 	if err != nil || currentBinding.State != "imported" || currentBinding.ID != binding.ID ||
-		currentBinding.Sub2AccountID != binding.Sub2AccountID || currentBinding.OperationID != binding.OperationID {
+		currentBinding.Sub2AccountID != binding.Sub2AccountID || currentBinding.OperationID != binding.OperationID || currentBinding.CredentialVersion != binding.CredentialVersion {
 		require(store.RecoveryIdentityVerified, "identity_changed")
 		return
 	}
@@ -717,6 +723,17 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 	if !alreadyApplied {
 		if !s.setState(task.ID, store.RecoveryApplyingCredentials, "正在写回原 Sub2 账号") {
 			return
+		}
+		if frozenBinding {
+			started, err := s.store.StartBoundDeliveryApply(ctx, task)
+			if err != nil {
+				s.pauseRecovery(task.ID, err)
+				return
+			}
+			if !started {
+				require(store.RecoveryApplyingCredentials, "checkpoint_unconfirmed")
+				return
+			}
 		}
 		if err := s.applyCredentials(ctx, task, oauth); err != nil {
 			fail(store.RecoveryApplyingCredentials, err)
@@ -1271,11 +1288,16 @@ func (s *sub2RecoveryService) verifyRecoveryRetry(ctx context.Context, task stor
 		if err != nil {
 			return err
 		}
-		if delivery.OriginalBindingID > 0 {
-			if !delivery.MatchesOriginalBinding(binding) {
-				return &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
-			}
-			return nil
+		if !delivery.MatchesOriginalBinding(binding) {
+			return &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
+		}
+		if delivery.State == "canceled" || delivery.OriginalBindingID > 0 && delivery.CredentialVersion != task.ResultCredentialAttemptID {
+			return &recoveryOperationError{Code: "version_changed", RequiresAction: true}
+		}
+		// The standard endpoint can write credentials before its marker. An
+		// ambiguous apply on a frozen binding must never be sent a second time.
+		if delivery.BoundApplyStarted && !recoveryMarkerMatches(detail, task) {
+			return &recoveryOperationError{Code: "checkpoint_unconfirmed", RequiresAction: true}
 		}
 	}
 	if !task.OriginalSchedulable || recoveryAccountDisabled(detail) {
@@ -1399,19 +1421,6 @@ func (s *sub2RecoveryService) sub2JSONBody(ctx context.Context, method, path str
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if method == http.MethodPost && strings.HasSuffix(path, "/lifecycle-oauth") && resp.StatusCode == http.StatusBadGateway {
-			var envelope struct {
-				Reason   string            `json:"reason"`
-				Metadata map[string]string `json:"metadata"`
-			}
-			if json.NewDecoder(io.LimitReader(resp.Body, 16<<10)).Decode(&envelope) == nil && envelope.Reason == "LIFECYCLE_PROBE_FAILED" {
-				status, _ := strconv.Atoi(envelope.Metadata["upstream_status"])
-				code := envelope.Metadata["upstream_code"]
-				if (status == http.StatusUnauthorized || status == http.StatusForbidden) && accountDeactivationConfirmed(code) {
-					return &recoveryOperationError{Code: code, HTTPStatus: status}
-				}
-			}
-		}
 		return recoveryHTTPError(resp.StatusCode, recoveryRetryAfter(resp.Header.Get("Retry-After")))
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))

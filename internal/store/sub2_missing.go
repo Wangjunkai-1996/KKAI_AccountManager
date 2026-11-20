@@ -192,7 +192,7 @@ func (s *Store) AuthorizeRemoteMissingReimport(ctx context.Context, binding Sub2
 	if _, err := tx.ExecContext(ctx, `INSERT INTO account_deliveries(account_id,credential_version,destination_key,state,created_at,updated_at,options_json,allow_create,import_operation_id)
  VALUES(?,?,?,'queued',?,?,?,1,?) ON CONFLICT(destination_key,account_id,credential_version) DO UPDATE SET
  state='queued',recovery_task_id=0,last_error='',next_retry_at=NULL,manual_action='',retry_count=0,updated_at=excluded.updated_at,
- options_json=excluded.options_json,allow_create=1,import_operation_id=excluded.import_operation_id,original_binding_id=0,original_remote_id=0,original_binding_version=0`, binding.AccountID, version, binding.DestinationKey, now, now, string(rawOptions), operation); err != nil {
+ options_json=excluded.options_json,allow_create=1,import_operation_id=excluded.import_operation_id,original_binding_id=0,original_remote_id=0,original_binding_version=0,bound_handoff_state=''`, binding.AccountID, version, binding.DestinationKey, now, now, string(rawOptions), operation); err != nil {
 		return Sub2Import{}, err
 	}
 	if err := tx.Commit(); err != nil {

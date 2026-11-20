@@ -398,7 +398,7 @@ func TestSub2MissingUntrustedCleanup404KeepsBindingWithSecretsCleared(t *testing
 					return
 				}
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = fmt.Fprintf(w, `{"code":0,"data":{"id":42,"platform":"openai","type":"oauth","schedulable":false,"updated_at":"2026-11-20T00:00:00Z","credentials":{"email":%q,"chatgpt_account_id":%q}}}`, account.Email, account.ChatGPTAccountID)
+				_, _ = fmt.Fprintf(w, `{"code":0,"data":{"id":42,"platform":"openai","type":"oauth","schedulable":true,"updated_at":"2026-11-20T00:00:00Z","credentials":{"email":%q,"chatgpt_account_id":%q}}}`, account.Email, account.ChatGPTAccountID)
 			}))
 			defer remote.Close()
 			service := &sub2ImportService{store: history, baseURL: remote.URL, adminAPIKey: "key", destinationKey: "test", client: remote.Client()}

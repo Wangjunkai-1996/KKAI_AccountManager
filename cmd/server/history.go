@@ -451,12 +451,9 @@ func runWithHistoryAccount(ctx context.Context, accountID int64, req LoginReques
 	stored := &store.Result{AccessToken: result.AccessToken, RefreshToken: result.RefreshToken, ChatGPTAccountID: result.ChatGPTAccountID, OrganizationID: result.OrganizationID, PlanType: result.PlanType, ExpiresAt: result.ExpiresAt, ExpiresIn: result.ExpiresIn}
 	result.AccountID = attempt.AccountID
 	var delivery store.AccountDelivery
-	switch {
-	case req.AutoDeliver:
+	if req.AutoDeliver {
 		delivery, err = loginHistory.FinishAttemptAndQueueDelivery(finishCtx, attempt.ID, stored, importer.destinationKey, options)
-	case accountID > 0 && importer.configured():
-		delivery, err = loginHistory.FinishBoundRelogin(finishCtx, attempt.ID, stored, importer.destinationKey)
-	default:
+	} else {
 		err = loginHistory.FinishAttempt(finishCtx, attempt.ID, true, stored, nil)
 	}
 	if err != nil {

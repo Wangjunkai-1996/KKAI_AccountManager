@@ -16,6 +16,20 @@ import (
 
 func newDeliveryFixture(t *testing.T) (*recoveryFixture, *accountDeliveryService, store.AccountDelivery) {
 	t.Helper()
+	// This fixture represents established deliveries created before binding snapshots.
+	f, service, delivery := newBoundDeliveryFixture(t)
+	if _, err := f.db.Exec("UPDATE account_deliveries SET original_binding_id=0,original_remote_id=0,original_binding_version=0,bound_handoff_state='' WHERE id=?", delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := f.store.GetAccountDelivery(context.Background(), delivery.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f, service, delivery
+}
+
+func newBoundDeliveryFixture(t *testing.T) (*recoveryFixture, *accountDeliveryService, store.AccountDelivery) {
+	t.Helper()
 	f := newRecoveryFixture(t, true)
 	ctx := context.Background()
 	if _, err := f.store.UpdateAccountRecoveryTask(ctx, f.task.ID, store.RecoveryCanceled, "fixture setup"); err != nil {
@@ -29,13 +43,6 @@ func newDeliveryFixture(t *testing.T) (*recoveryFixture, *accountDeliveryService
 		AccessToken: "delivery-at", RefreshToken: "delivery-rt", ChatGPTAccountID: "new-delivery-workspace", PlanType: "plus", ExpiresAt: 2100000000,
 	}, "fixture", store.DeliveryOptions{Priority: 1, Concurrency: 3, Merchant: "测试号商", Deadline: "2026-12-31"})
 	attempt.Release()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.db.Exec("UPDATE account_deliveries SET original_binding_id=0,original_remote_id=0,original_binding_version=0 WHERE id=?", delivery.ID); err != nil {
-		t.Fatal(err)
-	}
-	delivery, err = f.store.GetAccountDelivery(ctx, delivery.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,223 +274,116 @@ func TestHistoryReloginDoesNotAdoptChangedBinding(t *testing.T) {
 	}
 }
 
-func TestAccountDeliveryBoundHistoryReloginReachesSub2(t *testing.T) {
-	for _, scenario := range []string{"auth_error", "operator_pause", "linked_without_marker", "official_deleted", "stale_receipt", "ordinary_401", "ordinary_502", "recheck_binding_changed", "recheck_parent"} {
+func TestHistoryReloginBoundSavesOnlyToAUTH(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	ctx := context.Background()
+	if _, err := f.store.UpdateAccountRecoveryTask(ctx, f.task.ID, store.RecoveryCanceled, "fixture setup"); err != nil {
+		t.Fatal(err)
+	}
+	oldHistory, oldImporter := loginHistory, sub2Importer
+	loginHistory, sub2Importer = f.store, f.service.sub2
+	t.Cleanup(func() { loginHistory, sub2Importer = oldHistory, oldImporter })
+	req := LoginRequest{Email: f.account.Email, Password: "password"}
+	loginOnce := func(context.Context) (*login.LoginResult, error) {
+		return &login.LoginResult{Email: f.account.Email, AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "workspace", PlanType: "plus", ExpiresAt: 2100000000}, nil
+	}
+	result, err := runWithHistoryAccount(ctx, f.account.ID, req, loginOnce)
+	if err != nil || result.Delivery != nil {
+		t.Fatalf("ordinary history login returned a delivery or failed: %v", err)
+	}
+	_, saved, err := f.store.GetOAuthResultByID(ctx, f.account.ID)
+	if err != nil || saved.RefreshToken != "new-rt" {
+		t.Fatalf("local credentials missing: %v", err)
+	}
+	service := newAccountDeliveryService(f.store, f.service.sub2, f.service)
+	defer service.Stop()
+	service.runOnce()
+	deliveries, err := f.store.ListLatestAccountDeliveries(ctx)
+	if err != nil || len(deliveries) != 0 {
+		t.Fatalf("ordinary history login queued delivery: %d, %v", len(deliveries), err)
+	}
+	latest, err := f.store.GetLatestAccountRecoveryTaskForDestination(ctx, f.account.ID, "fixture")
+	if err != nil || latest.ID != f.task.ID || latest.State != store.RecoveryCanceled || len(f.methods) != 0 {
+		t.Fatalf("ordinary history login started remote work: methods=%v, err=%v", f.methods, err)
+	}
+
+	req.AutoDeliver = true
+	result, err = runWithHistoryAccount(ctx, f.account.ID, req, loginOnce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, ok := result.Delivery.(store.AccountDelivery)
+	if !ok || delivery.State != "queued" || delivery.OriginalBindingID == 0 || delivery.AllowCreate {
+		t.Fatal("explicit delivery did not capture the original binding")
+	}
+	service.runOnce()
+	delivery, err = f.store.GetAccountDelivery(ctx, delivery.ID)
+	if err != nil || delivery.RecoveryTaskID == 0 {
+		t.Fatalf("explicit delivery did not reach recovery: %v", err)
+	}
+	task, err := f.store.ClaimAccountRecoveryTask(ctx, delivery.RecoveryTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.service.process(task)
+	task, err = f.store.GetAccountRecoveryTaskByID(ctx, task.ID)
+	if err != nil || task.State != store.RecoveryCompleted || f.applyCalls != 1 || f.testCalls != 1 || !f.schedule {
+		t.Fatalf("explicit delivery state=%s apply=%d probes=%d scheduled=%v err=%v", task.State, f.applyCalls, f.testCalls, f.schedule, err)
+	}
+}
+
+func TestAccountDeliveryFrozenBindingStopsBeforeRemoteWrites(t *testing.T) {
+	for _, scenario := range []string{"manual_pause", "replaced_operation"} {
 		t.Run(scenario, func(t *testing.T) {
-			f := newRecoveryFixture(t, false)
+			f, service, delivery := newBoundDeliveryFixture(t)
 			ctx := context.Background()
-			manualPause := scenario == "operator_pause"
-			importOperation := "operation"
-			extra := map[string]any{"kkai_auth_import": map[string]any{"source_account_id": f.account.ID, "operation_id": importOperation}}
-			if scenario == "linked_without_marker" {
-				importOperation = "linked-fixture"
-				extra = map[string]any{}
-				if _, err := f.db.Exec("UPDATE sub2_imports SET operation_id=? WHERE account_id=?", importOperation, f.account.ID); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if manualPause {
-				f.detailStatus, f.detailError = "active", ""
+			want := "identity_changed"
+			if scenario == "manual_pause" {
+				f.schedule, f.detailStatus, f.detailError = false, "active", ""
+				want = "manual_pause"
 			} else {
-				f.detailError = "Token revoked (401): fixture"
+				// Replacing the remote import marker alone must invalidate the
+				// old binding, even if the email, source ID and remote ID agree.
+				f.detailOperation = "replacement"
 			}
-			revision := time.Now().UTC()
-			var receipt lifecycleOAuthReceipt
-			endpoint := "/admin/accounts/901/lifecycle-oauth"
-			var phases []string
-			reconciled := false
-			mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/admin/accounts/901" && r.Method == http.MethodGet {
-					f.methods = append(f.methods, r.Method+" "+r.URL.Path)
-					writeRecoveryEnvelope(w, map[string]any{
-						"id": 901, "platform": "openai", "type": "oauth", "status": f.detailStatus,
-						"error_message": f.detailError, "schedulable": f.schedule, "updated_at": revision,
-						"credentials": map[string]any{"email": f.account.Email, "chatgpt_account_id": "workspace"},
-						"extra":       extra,
-					})
-					return
-				}
-				if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, endpoint+"/") {
-					if receipt.Phase == "" {
-						writeRecoveryError(w, http.StatusNotFound, "LIFECYCLE_RECEIPT_MISSING", "Operation receipt not found")
-					} else if r.URL.Path == endpoint+"/"+receipt.OperationID {
-						reconciled = true
-						current := receipt
-						if scenario == "stale_receipt" && f.testCalls > 0 {
-							current.CredentialRevision++
-						}
-						writeRecoveryEnvelope(w, current)
-					} else {
-						t.Errorf("wrong operation receipt path: %s", r.URL.Path)
-						w.WriteHeader(http.StatusConflict)
-					}
-					return
-				}
-				var body map[string]any
-				if r.Method != http.MethodPost || r.URL.Path != endpoint || json.NewDecoder(r.Body).Decode(&body) != nil {
-					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-					w.WriteHeader(http.StatusBadRequest)
-					return
-				}
-				operation, _ := body["operation_id"].(string)
-				version, _ := body["credential_revision"].(float64)
-				phase, _ := body["phase"].(string)
-				if receipt.Phase == "enable" && phase == "probe" &&
-					body["expected_updated_at"] == revision.Format(time.RFC3339Nano) &&
-					operation == receipt.OperationID && int64(version) == receipt.CredentialRevision {
-					f.testCalls++
-					writeRecoveryEnvelope(w, receipt)
-					return
-				}
-				expected := []string{"pause", "apply", "probe", "enable"}
-				if len(phases) >= len(expected) || phase != expected[len(phases)] ||
-					body["expected_updated_at"] != revision.Format(time.RFC3339Nano) ||
-					body["import_operation_id"] != importOperation || body["source_account_id"] != float64(f.account.ID) ||
-					body["expected_email"] != f.account.Email || body["expected_workspace"] != "workspace" ||
-					operation == "" || version <= 0 || receipt.Phase != "" && (operation != receipt.OperationID || int64(version) != receipt.CredentialRevision) {
-					t.Errorf("incorrect lifecycle preconditions for %s", phase)
-					w.WriteHeader(http.StatusConflict)
-					return
-				}
-				phases = append(phases, phase)
-				switch phase {
-				case "pause":
-					receipt.MayEnable = body["explicit_enable"] == true
-				case "apply":
-					f.applyCalls++
-					f.applyBody = body
-				case "probe":
-					f.testCalls++
-					if scenario == "official_deleted" || scenario == "stale_receipt" || scenario == "ordinary_401" || scenario == "ordinary_502" {
-						metadata := map[string]string{}
-						if scenario != "ordinary_502" {
-							metadata["upstream_status"] = "401"
-						}
-						if scenario == "official_deleted" || scenario == "stale_receipt" {
-							metadata["upstream_code"] = "account_deleted"
-						}
-						w.WriteHeader(http.StatusBadGateway)
-						_ = json.NewEncoder(w).Encode(map[string]any{"reason": "LIFECYCLE_PROBE_FAILED", "metadata": metadata})
-						return
-					}
-					f.detailStatus = "active"
-				case "enable":
-					f.schedule = true
-				}
-				if phase != "probe" {
-					revision = revision.Add(time.Second)
-				}
-				receipt.ID, receipt.OperationID, receipt.SourceAccountID = 901, operation, f.account.ID
-				receipt.ImportOperationID, receipt.CredentialRevision = importOperation, int64(version)
-				receipt.Phase, receipt.AccountRevision, receipt.Schedulable = phase, revision, f.schedule
-				if phase == "apply" {
-					w.WriteHeader(http.StatusServiceUnavailable)
-					return
-				}
-				writeRecoveryEnvelope(w, receipt)
-			}))
-			defer mock.Close()
-			f.service.sub2.baseURL, f.service.sub2.client = mock.URL, mock.Client()
-			if _, err := f.store.UpdateAccountRecoveryTask(ctx, f.task.ID, store.RecoveryCanceled, "fixture setup"); err != nil {
-				t.Fatal(err)
-			}
-			oldHistory, oldImporter := loginHistory, sub2Importer
-			loginHistory, sub2Importer = f.store, f.service.sub2
-			t.Cleanup(func() { loginHistory, sub2Importer = oldHistory, oldImporter })
-			result, err := runWithHistoryAccount(ctx, f.account.ID, LoginRequest{Email: f.account.Email, Password: "password"}, func(context.Context) (*login.LoginResult, error) {
-				return &login.LoginResult{Email: f.account.Email, AccessToken: "relogin-at", RefreshToken: "relogin-rt", ChatGPTAccountID: "workspace", PlanType: "plus", ExpiresAt: 2100000000}, nil
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			delivery, ok := result.Delivery.(store.AccountDelivery)
-			if !ok || delivery.AllowCreate || delivery.OriginalBindingID == 0 {
-				t.Fatalf("missing bound update-only delivery: %#v", result.Delivery)
-			}
-			service := newAccountDeliveryService(f.store, f.service.sub2, f.service)
-			defer service.Stop()
 			service.runOnce()
 			current, err := f.store.GetAccountDelivery(ctx, delivery.ID)
-			if err != nil || current.RecoveryTaskID == 0 {
-				t.Fatalf("handoff missing: %+v, %v", current, err)
+			if err != nil {
+				t.Fatal(err)
 			}
 			task, err := f.store.ClaimAccountRecoveryTask(ctx, current.RecoveryTaskID)
 			if err != nil {
 				t.Fatal(err)
 			}
 			f.service.process(task)
-			f.task = task
-			finished := f.state(t)
-			if scenario == "official_deleted" || scenario == "stale_receipt" || scenario == "ordinary_401" || scenario == "ordinary_502" {
-				account, err := f.store.GetAccountByID(ctx, f.account.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				binding, err := f.store.GetSub2Import(ctx, "fixture", account.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				official := scenario == "official_deleted"
-				if account.IsOfficialUnavailable() != official || (binding.State == "cleanup_pending") != official ||
-					official && binding.CredentialVersion != delivery.CredentialVersion || f.schedule || f.testCalls != 1 || len(phases) != 3 {
-					t.Fatalf("unexpected probe outcome: official=%v binding_state=%s phases=%v task=%s", account.IsOfficialUnavailable(), binding.State, phases, finished.State)
-				}
-				return
-			}
-			credentials, _ := f.applyBody["credentials"].(map[string]any)
-			if finished.State != store.RecoveryCompleted || credentials["refresh_token"] != "relogin-rt" ||
-				f.schedule == manualPause || f.applyCalls != 1 || f.testCalls != 1 || f.loginCalls != 0 || !reconciled {
-				t.Fatalf("update failed: state=%s code=%s schedule=%v events=%v", finished.State, finished.ErrorCode, f.schedule, f.events)
-			}
-			if !manualPause && f.methods[len(f.methods)-1] != "GET /admin/accounts/901" {
-				t.Fatalf("missing scheduling readback: %v", f.methods)
-			}
-			if scenario == "recheck_parent" {
-				forceDueRecheck(t, f)
-				if _, err := f.store.ClaimAccountRecoveryRecheckForDestination(ctx, time.Now(), "fixture"); err != nil {
-					t.Fatal(err)
-				}
-				child, err := f.store.QueueAccountRecoveryFromRecheck(ctx, task.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				detail, err := f.service.sub2Account(ctx, task.Sub2AccountID)
-				if err != nil || !f.service.delayedRecheckRetryOwned(ctx, child, detail) {
-					t.Fatalf("parent receipt was not accepted: %v", err)
-				}
-				receipt.CredentialRevision++
-				if f.service.delayedRecheckRetryOwned(ctx, child, detail) {
-					t.Fatal("child accepted a changed parent credential revision")
-				}
-			}
-			if scenario == "auth_error" || scenario == "recheck_binding_changed" {
-				forceDueRecheck(t, f)
-				if !f.service.processNextRecheck() {
-					t.Fatal("first lifecycle recheck was not processed")
-				}
-				if check := currentRecheck(t, f); check.Round != 2 || check.State != "pending" {
-					t.Fatalf("first lifecycle recheck: %+v", check)
-				}
-				if scenario == "recheck_binding_changed" {
-					if _, err := f.db.Exec("UPDATE sub2_imports SET operation_id='replacement' WHERE account_id=?", f.account.ID); err != nil {
-						t.Fatal(err)
-					}
-					f.schedule = false
-				}
-				forceDueRecheck(t, f)
-				if !f.service.processNextRecheck() {
-					t.Fatal("second lifecycle recheck was not processed")
-				}
-				check := currentRecheck(t, f)
-				if scenario == "auth_error" {
-					if check.State != "passed" || f.testCalls != 3 || len(phases) != 4 || !f.schedule {
-						t.Fatalf("lifecycle rechecks failed: state=%s probes=%d phases=%v schedule=%v", check.State, f.testCalls, phases, f.schedule)
-					}
-				} else if check.State != "requires_action" || f.testCalls != 2 || len(phases) != 4 || f.schedule {
-					t.Fatalf("changed binding accepted: state=%s probes=%d phases=%v schedule=%v", check.State, f.testCalls, phases, f.schedule)
-				}
+			got, err := f.store.GetAccountRecoveryTaskByID(ctx, task.ID)
+			if err != nil || got.ErrorCode != want || len(f.events) != 0 {
+				t.Fatalf("code=%s events=%v err=%v", got.ErrorCode, f.events, err)
 			}
 		})
+	}
+}
+
+func TestAccountDeliveryFrozenBindingDoesNotReplayUnconfirmedApply(t *testing.T) {
+	f, service, delivery := newBoundDeliveryFixture(t)
+	ctx := context.Background()
+	f.detailStatus, f.detailError, f.applyFailsOnce = "active", "", true
+	service.runOnce()
+	delivery, err := f.store.GetAccountDelivery(ctx, delivery.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.task, err = f.store.ClaimAccountRecoveryTask(ctx, delivery.RecoveryTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.service.process(f.task)
+	recoveryRetryDue(t, f)
+	f.service.retryDueRecoveries()
+	task := f.state(t)
+	if task.ErrorCode != "checkpoint_unconfirmed" || !task.RequiresAction || task.NextRetryAt != nil ||
+		f.applyCalls != 1 || f.testCalls != 0 || f.schedule {
+		t.Fatalf("unconfirmed apply was not stopped: state=%s code=%s apply=%d probes=%d scheduled=%v", task.State, task.ErrorCode, f.applyCalls, f.testCalls, f.schedule)
 	}
 }
 

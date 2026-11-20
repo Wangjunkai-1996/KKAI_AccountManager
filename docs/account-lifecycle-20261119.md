@@ -2,9 +2,30 @@
 
 规格日期为 2026-11-19，实施记录更新于 2026-11-20（北京时间）。本地实现及验证结果见文末。适用范围：KKAI_AUTH 管理的 OpenAI OAuth 账号及其已配置的 Sub2 目的地，不涉及 Sub2 的其他账号或平台。
 
-**实施目标**：解决账号表重登后原 Sub2 仍用旧刷新令牌的问题；把新确认的 Plus／Team 降级账号留在 AUTH、退出 Sub2；官方停用、删除及明确拒绝账密或要求邮箱验证的账号从所有自动处理入口永久退出，由后台安全清理，不向用户派发确认任务。以本文规则取代旧版「团队切个人 Free 后写回并恢复调度」的行为；不改变非终态账号原有的 [显式重导协议](account-management-20261113/reimport-20261114.md)。独立 [命令行登录／导出](../cmd/main.go#L90) 不走 Web Store、队列或 Sub2 管理接口，不纳入本期；不继承旧发布记录中的任何生产操作授权。
+## 当前 AUTH 行为（2026-11-20，本地实现）
 
-**当前实现范围（2026-11-20）**　Sub2 沿用现有版本。AUTH 清理使用已有的停调和删除接口，回读确认目标已停调、归属仍一致且没有关联的 Spark 子账号，删除后再回读确认目标不存在。现有删除接口按 ID 执行，外部管理员在最后一次校验与删除之间的并发修改仍有时间窗口。下文的 Sub2 专用接口和回执表属于已收起的本地试作。AUTH 的重登写回分支仍引用试作接口，完整发布尚未就绪。
+- **普通历史重登**只保存本次 OAuth 结果。单次和批量重登均默认关闭交付。一次旧交付需要处理时，账号表另有“重新登录并交付”按钮。详情区显示 Sub2 状态读取时间，并按凭据版本区分上一次已完成的交付。
+- **旧交付协议**已从 AUTH 移除。打开旧库时，AUTH 在恢复队列启动前，通过事务停止使用该协议的待交付、恢复和延迟复检任务，包括复检已排出的后续任务。旧数据只记录了使用哪条协议，最初是否主动选择交付无法还原。已完成的记录保留，可能已派发的写入标记为结果未确认，供只读核对。
+- **显式交付**沿用 Sub2 现有管理接口。对登录开始时已有绑定的交付，AUTH 核对原绑定和凭据版本，记录写入已开始。回包丢失后缺少同任务、同版本的远端标记时，停止重复提交。管理员暂停的账号停止交付，避免调用会改变状态的探测接口。
+- **废弃号清理和已确认的 Free 退池**沿用现有停调、Spark 子账号检查、删除和缺失回读。有子账号或绑定变更时停止删除。现有删除接口按 ID 执行，最后一次核对与删除之间仍有外部管理员并发修改的窗口。
+
+普通重登后，新 RT 是否在 Sub2 正常续期属于后续自动同步方案的独立验收项。独立命令行登录和导出的行为见 [CLI 入口](../cmd/main.go)。
+
+### 本次定向回归
+
+使用临时 SQLite 库、模拟 Sub2 服务与页面测试数据。覆盖迁移中断回滚、跨重启停止旧任务、保留新交付、普通重登零交付、写入结果未知时停止重发，以及删除响应丢失和 Spark 子账号保护。清理 404 测试原先模拟的是已停调账号，无法走到待测的停调请求。修正该用例后，单项重跑和竞态检查通过。全仓套件、真实 OAuth 及生产验收均未运行。
+
+```sh
+GOPROXY=off go test ./internal/store -run '^Test(RetireLifecycleDeliveries|DestinationMigration|AccountDelivery|NewLoginDoesNotCancel|AccountRecoveryRecheck|Discarded|LifecycleTerminal|LinkSub2AccountIsTerminal|Sub2Missing)' -count=1 -timeout=90s
+# 此次服务端定向检查仅下方单独重跑的 404 用例失败
+GOPROXY=off go test ./cmd/server -run '^Test(AccountDelivery|HistoryRelogin|RunWithHistory|Sub2Recovery|Sub2Recheck|CredentialRepair|OfficialSub2CleanupFence|FreeCleanup|PendingCleanup|Sub2Missing|DeliveryProbe)' -count=1 -timeout=120s
+GOPROXY=off go test ./cmd/server -run '^TestSub2MissingUntrustedCleanup404KeepsBindingWithSecretsCleared$' -count=1 -timeout=45s
+GOPROXY=off go test -race ./cmd/server -run '^Test(HistoryReloginBoundSavesOnlyToAUTH|AccountDeliveryFrozenBinding.*|Sub2MissingUntrustedCleanup404KeepsBindingWithSecretsCleared)$' -count=1 -timeout=90s
+node --test cmd/server/client.test.cjs
+git diff --check
+```
+
+以下第 1–5 节和原试作记录保留设计背景。其中 R3 自动交付、Sub2 专用接口、回执表及对应发布门槛均已撤回。当前实现以本节为准。
 
 ## 1. 根因与边界
 
@@ -122,7 +143,7 @@ node cmd/server/account-checks.test.cjs
 
 **拒收线**：任何误删、错绑/建号、未批准启用、旧任务写回或重放、官方终态仍可人工复活/取密、丢失重试意图，以及仅凭 AT 探测冒充 RT 可用。生产健康、备份和实际刷新尚未验证；现场验收结果单独记录。
 
-## 2026-11-20 本地实施记录
+## 2026-11-20 原试作实施记录（历史）
 
 账号表的 `/api/history/login` 复用服务端交付队列。登录事务记录当前目的地、AUTH ID、绑定 ID、Sub2 ID、operation 和凭据版本。重登成功后，有原绑定且本次明确为付费的账号进入只更新任务。无绑定且关闭自动交付时只保存 AUTH。临时缺少套餐的 token refresh 可以沿用已有套餐，但完整重登未确认付费或套餐 claim 冲突时，本次凭据仅留在本地。相同 OAuth issuer 下，新旧 subject 冲突会终止更新。
 

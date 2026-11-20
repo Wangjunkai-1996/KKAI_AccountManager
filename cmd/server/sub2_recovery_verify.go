@@ -391,6 +391,16 @@ func verifySub2RecoveryIdentity(detail map[string]any, expectedSub2ID, accountID
 	return errors.New("Sub2 import marker or verified local association missing")
 }
 
+// A linked account may have no import marker. When present, the marker
+// must identify the exact import operation frozen for this delivery.
+func boundImportMarkerMatches(detail map[string]any, binding store.Sub2Import) bool {
+	extra, _ := detail["extra"].(map[string]any)
+	if _, exists := extra["kkai_auth_import"]; exists {
+		return matchesImportMarker(detail, binding)
+	}
+	return strings.HasPrefix(binding.OperationID, "linked-")
+}
+
 // Association and recovery both validate credential identity, never the
 // editable display name. A present foreign import marker remains a conflict.
 func verifySub2AccountIdentity(detail map[string]any, expectedSub2ID, accountID int64, account store.Account) error {

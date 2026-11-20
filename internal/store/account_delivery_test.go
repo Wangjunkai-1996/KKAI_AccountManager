@@ -24,6 +24,127 @@ func deliveryTestLogin(t *testing.T, s *Store, email string) AccountDelivery {
 	return delivery
 }
 
+func TestRetireLifecycleDeliveriesBeforeRestart(t *testing.T) {
+	s, dir := testStore(t)
+	ctx := context.Background()
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := s.db.Exec(query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	queued := deliveryTestLogin(t, s, "queued@example.test")
+	orphan := deliveryTestLogin(t, s, "orphan@example.test")
+	done := deliveryTestLogin(t, s, "done@example.test")
+	pending := deliveryTestLogin(t, s, "pending@example.test")
+	passed := deliveryTestLogin(t, s, "passed@example.test")
+	normal := deliveryTestLogin(t, s, "normal@example.test")
+	exec(`UPDATE account_deliveries SET original_binding_id=42,allow_create=0 WHERE id!=?`, normal.ID)
+	// Restore the old on-disk schema, including its lack of a protocol column.
+	exec("ALTER TABLE account_deliveries DROP COLUMN bound_handoff_state")
+	newTask := func(d AccountDelivery, purpose, state string, deliveryID int64) int64 {
+		t.Helper()
+		res, err := s.db.Exec(`INSERT INTO account_recovery_tasks(account_id,sub2_account_id,purpose,delivery_id,destination_key,state,result_credential_attempt_id,created_at,updated_at)
+ VALUES(?,42,?,?,?,?,?,100,101)`, d.AccountID, purpose, deliveryID, d.DestinationKey, state, d.CredentialVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	inFlight := newTask(orphan, "delivery", RecoveryApplyingCredentials, orphan.ID)
+	exec(`INSERT INTO account_credential_repairs(account_id,recovery_task_id,state,updated_at) VALUES(?,?,'recovery_queued',101)`, orphan.AccountID, inFlight)
+	parent := newTask(done, "delivery", RecoveryCompleted, done.ID)
+	child := newTask(done, "recovery", RecoveryCompleted, 0)
+	grandchild := newTask(done, "recovery", RecoveryQueued, 0)
+	standalone := newTask(done, "recovery", RecoveryFailed, 0)
+	completed := newTask(pending, "delivery", RecoveryCompleted, pending.ID)
+	verified := newTask(passed, "delivery", RecoveryCompleted, passed.ID)
+	exec(`UPDATE account_deliveries SET state='verifying',recovery_task_id=? WHERE id=?`, parent, done.ID)
+	exec(`INSERT INTO account_recovery_rechecks(task_id,state,recovery_task_id,next_check_at,completed_at,updated_at) VALUES
+ (?,'recovery_queued',?,NULL,101,101),(?,'recovery_queued',?,NULL,101,101),(?,'checking',0,101,101,101),(?,'passed',0,NULL,101,101)`,
+		parent, child, child, grandchild, completed, verified)
+
+	dbPath, keyPath := filepath.Join(dir, "accounts.db"), filepath.Join(dir, "secret.key")
+	exec(`CREATE TRIGGER fail_retirement BEFORE UPDATE OF state ON account_recovery_rechecks
+ WHEN NEW.state='canceled' BEGIN SELECT RAISE(ABORT,'retirement interrupted'); END`)
+	if unexpectedlyOpened, err := Open(dbPath, keyPath); err == nil {
+		unexpectedlyOpened.Close()
+		t.Fatal("opened database with partially retired queues")
+	}
+	if task, err := s.GetAccountRecoveryTaskByID(ctx, inFlight); err != nil || task.State != RecoveryApplyingCredentials {
+		t.Fatalf("retirement was not atomic: state=%s err=%v", task.State, err)
+	}
+	exec("DROP TRIGGER fail_retirement")
+	reopen := func() {
+		t.Helper()
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		s, err = Open(dbPath, keyPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	reopen()
+	defer func() {
+		if s != nil {
+			_ = s.Close()
+		}
+	}()
+	for _, want := range []struct {
+		id, taskID int64
+		state      string
+	}{
+		{queued.ID, 0, "canceled"}, {orphan.ID, inFlight, "canceled"}, {done.ID, parent, "completed"},
+		{pending.ID, completed, "completed"}, {passed.ID, verified, "completed"}, {normal.ID, 0, "queued"},
+	} {
+		d, err := s.GetAccountDelivery(ctx, want.id)
+		if err != nil || d.State != want.state || d.RecoveryTaskID != want.taskID || d.NextRetryAt != nil {
+			t.Fatalf("delivery %d state=%s task=%d err=%v", want.id, d.State, d.RecoveryTaskID, err)
+		}
+	}
+	for id, state := range map[int64]string{parent: "recovery_queued", child: "canceled", completed: "canceled", verified: "passed"} {
+		var got string
+		var noDeadline bool
+		if err := s.db.QueryRow(`SELECT state,next_check_at IS NULL FROM account_recovery_rechecks WHERE task_id=?`, id).Scan(&got, &noDeadline); err != nil || got != state || !noDeadline {
+			t.Fatalf("recheck %d state=%s noDeadline=%v err=%v", id, got, noDeadline, err)
+		}
+	}
+	for id, state := range map[int64]string{inFlight: RecoveryCanceled, parent: RecoveryCompleted, child: RecoveryCompleted, grandchild: RecoveryCanceled, standalone: RecoveryFailed} {
+		task, err := s.GetAccountRecoveryTaskByID(ctx, id)
+		if err != nil || task.State != state || task.NextRetryAt != nil || id == inFlight && !strings.Contains(task.LastError, "远端写入结果未确认") {
+			t.Fatalf("recovery %d state=%s err=%v", id, task.State, err)
+		}
+	}
+	if repair, err := s.GetCredentialRepair(ctx, orphan.AccountID); err != nil || repair.State != "canceled" {
+		t.Fatalf("repair state=%s err=%v", repair.State, err)
+	}
+	if _, err := s.QueueAccountDelivery(ctx, queued.AccountID, queued.DestinationKey, DefaultDeliveryOptions()); !errors.Is(err, ErrAccountDeliverySettled) {
+		t.Fatalf("retired update-only intent reopened without a binding: %v", err)
+	}
+	if _, err := s.RetryAccountRecoveryTask(ctx, inFlight, false); !errors.Is(err, ErrAccountRecoveryNotResumable) {
+		t.Fatalf("retired recovery retry: %v", err)
+	}
+	if resumed, err := s.RetryAccountRecoveryRecheck(ctx, completed, pending.DestinationKey); err != nil || resumed {
+		t.Fatalf("retired recheck resumed=%v err=%v", resumed, err)
+	}
+	// A new explicit delivery uses the same binding snapshot shape. Only the
+	// earlier protocol is retired, even after a second real database open.
+	if _, err := s.LinkSub2Account(ctx, queued.DestinationKey, queued.AccountID, 42, "linked-fixture"); err != nil {
+		t.Fatal(err)
+	}
+	fresh := deliveryTestLogin(t, s, "queued@example.test")
+	reopen()
+	if got, err := s.GetAccountDelivery(ctx, fresh.ID); err != nil || got.State != "queued" || got.OriginalBindingID == 0 {
+		t.Fatalf("new bound delivery lost after restart: id=%d state=%s err=%v", got.ID, got.State, err)
+	}
+}
+
 func TestAccountDeliveryRejectsUnknownAndDowngradedFree(t *testing.T) {
 	for _, test := range []struct {
 		name   string
