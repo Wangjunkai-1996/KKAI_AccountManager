@@ -280,11 +280,18 @@ func runAccountCheckSub2CleanupTest(t *testing.T, outcome, errorCode, requestKey
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method + " " + r.URL.Path {
+		case http.MethodGet + " /api/v1/admin/accounts":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"items":[{"id":101}],"total":1}}`))
 		case http.MethodGet + " /api/v1/admin/accounts/101":
+			if deleted.Load() != 0 {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"code":404,"message":"account not found"}`))
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
 				"id": 101, "platform": "openai", "type": "oauth",
 				"credentials": map[string]any{"email": "fixture-0@example.test", "chatgpt_account_id": "fixture-0"},
-				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": ids[0]}},
+				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": ids[0], "operation_id": "fixture-0"}},
 			}})
 		case http.MethodDelete + " /api/v1/admin/accounts/101":
 			deleted.Add(1)

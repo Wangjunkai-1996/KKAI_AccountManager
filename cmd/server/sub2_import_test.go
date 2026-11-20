@@ -261,11 +261,18 @@ func TestDeleteDeletedAccountVerifiesAndDeletesRemoteBinding(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method + " " + r.URL.Path {
+		case http.MethodGet + " /api/v1/admin/accounts":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"items":[{"id":42}],"total":1}}`))
 		case http.MethodGet + " /api/v1/admin/accounts/42":
+			if deleted.Load() != 0 {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"code":404,"message":"account not found"}`))
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
 				"id": 42, "platform": "openai", "type": "oauth",
 				"credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": "chatgpt-1"},
-				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID}},
+				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID, "operation_id": task.OperationID}},
 			}})
 		case http.MethodDelete + " /api/v1/admin/accounts/42":
 			deleted.Add(1)
@@ -284,6 +291,70 @@ func TestDeleteDeletedAccountVerifiesAndDeletesRemoteBinding(t *testing.T) {
 	}
 	if _, err := history.GetSub2Import(ctx, "test", accountID); !errors.Is(err, store.ErrSub2ImportNotFound) {
 		t.Fatalf("deleted remote binding retained: %v", err)
+	}
+}
+
+func TestDeleteDeletedAccountRetainsUnconfirmedBinding(t *testing.T) {
+	for _, scenario := range []string{"shadow", "foreign_operation", "gateway_404", "delete_not_applied"} {
+		t.Run(scenario, func(t *testing.T) {
+			history, id := testOAuthStore(t)
+			ctx := context.Background()
+			binding, _, err := history.CreateOrGetSub2Import(ctx, "test", id, "original", "fixture", []byte("{}"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := history.UpdateSub2Import(ctx, binding.ID, "imported", true, 42, ""); err != nil {
+				t.Fatal(err)
+			}
+			var deletes atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.Method + " " + r.URL.Path {
+				case "GET /admin/accounts":
+					items := []map[string]int{{"id": 42}}
+					if scenario == "shadow" {
+						items = append(items, map[string]int{"id": 43, "parent_account_id": 42})
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"items": items, "total": len(items)}})
+				case "GET /admin/accounts/42":
+					if scenario == "gateway_404" {
+						http.NotFound(w, r)
+						return
+					}
+					op := binding.OperationID
+					if scenario == "foreign_operation" {
+						op = "replacement"
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
+						"id": 42, "type": "oauth", "platform": "openai",
+						"credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": "chatgpt-1"},
+						"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": id, "operation_id": op}},
+					}})
+				case "DELETE /admin/accounts/42":
+					deletes.Add(1)
+					_, _ = w.Write([]byte(`{"code":0}`))
+				default:
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			service := &sub2ImportService{store: history, baseURL: server.URL, adminAPIKey: "fixture", destinationKey: "test", client: server.Client()}
+			if err := service.deleteDeletedAccount(ctx, id, binding.CredentialVersion); err == nil {
+				t.Fatal("unconfirmed retirement succeeded")
+			}
+			stored, err := history.GetSub2Import(ctx, "test", id)
+			if err != nil || stored.ID != binding.ID || stored.OperationID != binding.OperationID {
+				t.Fatalf("lost original binding: %v", err)
+			}
+			var wantDeletes int32
+			if scenario == "delete_not_applied" {
+				wantDeletes = 1
+			}
+			if deletes.Load() != wantDeletes {
+				t.Fatalf("deletes=%d, want %d", deletes.Load(), wantDeletes)
+			}
+		})
 	}
 }
 
@@ -314,7 +385,14 @@ func TestDeleteDeletedAccountRetriesTransientFailureAndFinalizesTombstone(t *tes
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method + " " + r.URL.Path {
+		case http.MethodGet + " /api/v1/admin/accounts":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"items":[{"id":42}],"total":1}}`))
 		case http.MethodGet + " /api/v1/admin/accounts/42":
+			if deletes.Load() != 0 {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"code":404,"message":"account not found"}`))
+				return
+			}
 			if gets.Add(1) == 1 {
 				http.Error(w, "temporary failure", http.StatusBadGateway)
 				return
@@ -322,7 +400,7 @@ func TestDeleteDeletedAccountRetriesTransientFailureAndFinalizesTombstone(t *tes
 			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
 				"id": 42, "platform": "openai", "type": "oauth",
 				"credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": "chatgpt-1"},
-				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID}},
+				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID, "operation_id": task.OperationID}},
 			}})
 		case http.MethodDelete + " /api/v1/admin/accounts/42":
 			deletes.Add(1)
@@ -417,7 +495,14 @@ func TestDeleteDeletedAccountSkipsChangedBinding(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method + " " + r.URL.Path {
+		case http.MethodGet + " /api/v1/admin/accounts":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"items":[{"id":42}],"total":1}}`))
 		case http.MethodGet + " /api/v1/admin/accounts/42":
+			if deleted.Load() != 0 {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"code":404,"message":"account not found"}`))
+				return
+			}
 			if err := history.UpdateSub2Import(ctx, task.ID, "unknown", true, 0, "changed during verification"); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -425,7 +510,7 @@ func TestDeleteDeletedAccountSkipsChangedBinding(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
 				"id": 42, "platform": "openai", "type": "oauth",
 				"credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": "chatgpt-1"},
-				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID}},
+				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID, "operation_id": task.OperationID}},
 			}})
 		case http.MethodDelete + " /api/v1/admin/accounts/42":
 			deleted.Add(1)
@@ -516,20 +601,29 @@ func TestDeleteDeletedAccountHoldsAccountLeaseAcrossRemoteDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var deleted atomic.Int32
 	getStarted := make(chan struct{})
 	allowGet := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method + " " + r.URL.Path {
+		case http.MethodGet + " /api/v1/admin/accounts":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"items":[{"id":42}],"total":1}}`))
 		case http.MethodGet + " /api/v1/admin/accounts/42":
+			if deleted.Load() != 0 {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"code":404,"message":"account not found"}`))
+				return
+			}
 			close(getStarted)
 			<-allowGet
 			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
 				"id": 42, "platform": "openai", "type": "oauth",
 				"credentials": map[string]any{"email": "sub2@example.com", "chatgpt_account_id": "chatgpt-1"},
-				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID}},
+				"extra":       map[string]any{"kkai_auth_import": map[string]any{"source_account_id": accountID, "operation_id": task.OperationID}},
 			}})
 		case http.MethodDelete + " /api/v1/admin/accounts/42":
+			deleted.Add(1)
 			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"message": "deleted"}})
 		default:
 			http.NotFound(w, r)

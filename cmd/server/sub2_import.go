@@ -878,6 +878,9 @@ func (s *sub2ImportService) apiJSONStatus(ctx context.Context, method, path stri
 	if err != nil {
 		return response.StatusCode, err
 	}
+	if method == http.MethodGet && response.StatusCode == http.StatusNotFound && trustedSub2NotFound(path, response.Header.Get("Content-Type"), body) {
+		return response.StatusCode, errConfirmedSub2Missing
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return response.StatusCode, recoveryHTTPError(response.StatusCode, recoveryRetryAfter(response.Header.Get("Retry-After")))
 	}
@@ -903,6 +906,40 @@ func (s *sub2ImportService) apiJSONStatus(ctx context.Context, method, path stri
 		return response.StatusCode, err
 	}
 	return response.StatusCode, nil
+}
+
+var errConfirmedSub2Missing = errors.New("Sub2 账号不存在")
+
+func isSub2AccountDetailPath(path string) bool {
+	if !strings.HasPrefix(path, "/admin/accounts/") {
+		return false
+	}
+	n, err := strconv.ParseInt(strings.TrimPrefix(path, "/admin/accounts/"), 10, 64)
+	return err == nil && n > 0
+}
+func trustedSub2NotFound(path, contentType string, body []byte) bool {
+	if !isSub2AccountDetailPath(path) || !strings.HasPrefix(strings.ToLower(contentType), "application/json") {
+		return false
+	}
+	var payload struct {
+		Code    json.RawMessage `json:"code"`
+		Message string          `json:"message"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return false
+	}
+	code := strings.TrimSpace(string(payload.Code))
+	message := strings.ToLower(strings.TrimSpace(payload.Message))
+	// Sub2's management error envelope uses a numeric code and a message.
+	// Empty values, arbitrary error objects and reverse-proxy JSON are not proof.
+	if code != "1" && code != "404" && code != `"ACCOUNT_NOT_FOUND"` {
+		return false
+	}
+	switch message {
+	case "not found", "account not found", "account does not exist", "账号不存在", "账户不存在":
+		return true
+	}
+	return false
 }
 
 // deleteDeletedAccount removes the verified Sub2 binding when AUTH has
@@ -999,20 +1036,42 @@ func (s *sub2ImportService) deleteDeletedAccountWithLease(ctx context.Context, l
 	if task.State != "cleanup_pending" && currentVersion != expectedCredentialAttemptID {
 		return errors.New("检测使用的凭据版本已变化，跳过删除")
 	}
+	path := "/admin/accounts/" + strconv.FormatInt(task.Sub2AccountID, 10)
 	var detail map[string]any
-	status, err := s.apiJSONStatus(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(task.Sub2AccountID, 10), nil, &detail)
-	if status == http.StatusNotFound {
+	status, err := s.apiJSONStatus(ctx, http.MethodGet, path, nil, &detail)
+	if errors.Is(err, errConfirmedSub2Missing) {
 		return s.finishDeletedSub2Binding(ctx, account, task)
 	}
 	if err != nil {
-		if status == 0 || status >= 500 {
+		if status == 0 || status >= 500 || status == http.StatusNotFound {
 			s.markSub2CleanupPending(ctx, task, err)
 		}
 		return err
 	}
-	if err := verifySub2RecoveryIdentity(detail, task.Sub2AccountID, accountID, account, task); err != nil {
+	extra, _ := detail["extra"].(map[string]any)
+	_, hasMarker := extra["kkai_auth_import"]
+	owned := matchesImportMarker(detail, task) || !hasMarker && strings.HasPrefix(task.OperationID, "linked-")
+	if detail["parent_account_id"] != nil || fmt.Sprint(extra["synthetic_ui_test"]) == "true" || account.ChatGPTAccountID == "" || verifySub2AccountIdentity(detail, task.Sub2AccountID, accountID, account) != nil || !owned {
 		_ = s.store.UpdateSub2Import(ctx, task.ID, "cleanup_manual", true, task.Sub2AccountID, "Sub2 账号身份核对失败，需要人工确认")
+		return errors.New("Sub2 退役目标与原绑定不一致")
+	}
+	// The standard DELETE also deletes Spark shadows. Verify that only the
+	// original account is affected before sending that request.
+	items, err := s.listOAuthAccounts(ctx)
+	if err != nil {
 		return err
+	}
+	found := false
+	for _, item := range items {
+		if int64(toFloat(item["parent_account_id"])) == task.Sub2AccountID {
+			return errors.New("Sub2 账号仍有关联子账号，已停止删除")
+		}
+		if int64(toFloat(item["id"])) == task.Sub2AccountID {
+			found = true
+		}
+	}
+	if !found {
+		return errors.New("Sub2 列表无法确认原绑定")
 	}
 	// The remote GET and DELETE are separate calls. Re-read the local
 	// association before the destructive call so a concurrent relink/requeue
@@ -1025,17 +1084,22 @@ func (s *sub2ImportService) deleteDeletedAccountWithLease(ctx context.Context, l
 		_ = s.store.UpdateSub2Import(ctx, task.ID, "cleanup_manual", true, task.Sub2AccountID, "Sub2 绑定在删除前发生变化，需要人工确认")
 		return errors.New("Sub2 绑定在删除前发生变化")
 	}
-	status, err = s.apiJSONStatus(ctx, http.MethodDelete, "/admin/accounts/"+strconv.FormatInt(task.Sub2AccountID, 10), nil, nil)
-	if status == http.StatusNotFound {
+	writeErr := s.apiJSON(ctx, http.MethodDelete, path, nil, nil)
+	// A lost reply can follow a successful delete. Only a trusted GET on the
+	// original account ID confirms removal.
+	_, readErr := s.apiJSONStatus(ctx, http.MethodGet, path, nil, &detail)
+	if errors.Is(readErr, errConfirmedSub2Missing) {
 		return s.finishDeletedSub2Binding(ctx, account, task)
 	}
-	if err != nil {
-		if status == 0 || status >= 500 {
-			s.markSub2CleanupPending(ctx, task, err)
-		}
-		return err
+	if writeErr != nil {
+		err = writeErr
+	} else if readErr != nil {
+		err = readErr
+	} else {
+		err = errors.New("Sub2 账号仍然存在，删除尚未确认")
 	}
-	return s.finishDeletedSub2Binding(ctx, account, task)
+	s.markSub2CleanupPending(ctx, task, err)
+	return err
 }
 
 func (s *sub2ImportService) markSub2CleanupPending(ctx context.Context, task store.Sub2Import, err error) {
