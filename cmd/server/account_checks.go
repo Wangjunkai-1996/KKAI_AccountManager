@@ -262,6 +262,33 @@ func (s *accountCheckService) finish(id, accountID int64, result store.AccountCh
 		}
 		cleanupCancel()
 	}
+	// Read the committed result: late canceled or superseded checks must not
+	// authorize a recovery, even if the probe originally returned a 401.
+	recovery := accountRecoveryService
+	if !result.Canceled && accountID > 0 && recovery != nil && recovery.configured() && !recovery.paused.Load() &&
+		(batch.DestinationKey == "" || batch.DestinationKey == recovery.sub2.destinationKey) {
+		if committedBatch, checks, readErr := s.store.GetAccountCheckBatch(ctx, batch.ID); readErr == nil && committedBatch.State != "stopping" && committedBatch.State != "stopped" {
+			for _, check := range checks {
+				if check.ID != id || !accountCheckRecoveryCandidate(&check) {
+					continue
+				}
+				explicit, err := s.store.ExplicitRecoveryCheck(ctx, batch.ID)
+				if err == nil && explicit {
+					manual, claimed, claimErr := s.store.ClaimExplicitRecoveryCheck(ctx, batch.ID)
+					if claimErr == nil && claimed {
+						recoveryCtx, recoveryCancel := context.WithTimeout(recovery.ctx, 10*time.Second)
+						if _, _, err := recovery.enqueueWithIntent(recoveryCtx, accountID, manual); err != nil {
+							recovery.recordRecoveryEnqueueFailure(accountID)
+						}
+						recoveryCancel()
+					}
+				} else if err == nil {
+					recovery.enqueueAutomatic(accountID)
+				}
+				break
+			}
+		}
+	}
 	s.notify()
 }
 

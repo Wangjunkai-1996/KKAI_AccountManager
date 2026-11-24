@@ -89,16 +89,26 @@ func TestManualRecoveryOneAttemptAfterLoginStop(t *testing.T) {
 	}
 }
 
-func TestManualRecoveryWithoutPriorTaskRequiresAuthorization(t *testing.T) {
+func TestManualRecoveryCreatesOnceWithoutPriorTask(t *testing.T) {
 	f := newMonitorFixture(t)
 	ctx := context.Background()
 	finishRecoveryCheck(t, f.store, f.db, f.account.ID, "manual-check", "unauthorized", "", "", nil)
 	request := manualRecoveryRequest(store.AccountRecoveryTask{AccountID: f.account.ID})
-	_, created, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, request)
-	if err == nil || created || classifyRecoveryError(err).Code != "reauthorize" {
-		t.Fatalf("manual endpoint accepted an AUTH-only result: created=%v err=%v", created, err)
+	task, created, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, request)
+	if err != nil || !created || task.RetryAction != "manual_start" {
+		t.Fatalf("new manual task missing: %+v %v", task, err)
 	}
-	assertCheckAction(t, f, "reauthorize")
+	f.service.process(task)
+	got, err := f.store.GetAccountRecoveryTaskByID(ctx, task.ID)
+	if err != nil || got.State != store.RecoveryCompleted || f.loginCalls != 1 || f.applyCalls != 1 {
+		t.Fatalf("new manual task did not recover: %+v %v", got, err)
+	}
+	if _, _, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, request); !errors.Is(err, store.ErrAccountRecoveryStale) {
+		t.Fatalf("initial HTTP snapshot replayed: %v", err)
+	}
+	if _, _, err := f.store.CreateOrGetManualAccountRecoveryTask(ctx, f.account.ID, task.CheckID, task.Sub2AccountID, true, "fixture", 0); !errors.Is(err, store.ErrAccountRecoveryStale) {
+		t.Fatalf("initial store snapshot replayed: %v", err)
+	}
 }
 
 func TestManualRecoveryRestartAndTransientFailureStop(t *testing.T) {
@@ -184,7 +194,7 @@ func TestManualRecoveryPreservesSafetyGatesAndCheckpoint(t *testing.T) {
 	}
 }
 
-func TestLegacyManualRecoveryCheckOnlyReportsAction(t *testing.T) {
+func TestManualRecoveryCheckHandoffConsumedOnce(t *testing.T) {
 	f := newMonitorFixture(t)
 	ctx := context.Background()
 	batch, _, err := f.store.CreateAccountCheckBatch(ctx, store.AccountCheckInput{
@@ -199,7 +209,19 @@ func TestLegacyManualRecoveryCheckOnlyReportsAction(t *testing.T) {
 		t.Fatalf("legacy work=%+v err=%v", work, err)
 	}
 	f.service.checker.process(work)
-	assertCheckAction(t, f, "reauthorize")
+	task, active, err := f.store.GetActiveAccountRecoveryTask(ctx, f.account.ID)
+	if err != nil || !active || !task.ManualAttempt() {
+		t.Fatalf("manual check did not hand off: task=%+v active=%v err=%v", task, active, err)
+	}
+	manual, claimed, err := f.store.ClaimExplicitRecoveryCheck(ctx, batch.ID)
+	if err != nil || manual || claimed {
+		t.Fatalf("consumed handoff replayed: manual=%v claimed=%v err=%v", manual, claimed, err)
+	}
+	f.service.process(task)
+	got, err := f.store.GetAccountRecoveryTaskByID(ctx, task.ID)
+	if err != nil || got.State != store.RecoveryCompleted || f.loginCalls != 1 || f.applyCalls != 1 {
+		t.Fatalf("manual check recovery=%+v err=%v", got, err)
+	}
 }
 
 func TestManualHistoryFailureStopsAutomaticRecovery(t *testing.T) {
@@ -258,13 +280,6 @@ func TestManualHistoryFailureStopsAutomaticRecovery(t *testing.T) {
 				snapshot = f.state(t)
 			}
 			task, _, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, manualRecoveryRequest(snapshot))
-			if !existingRetry {
-				if err == nil || classifyRecoveryError(err).Code != "reauthorize" {
-					t.Fatalf("local-only auth failure err=%v", err)
-				}
-				assertCheckAction(t, f, "reauthorize")
-				continue
-			}
 			if err != nil {
 				t.Fatalf("next explicit attempt remained blocked: %v", err)
 			}

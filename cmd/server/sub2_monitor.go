@@ -126,13 +126,20 @@ func sub2RecoveryPoolCandidate(status sub2AccountStatus) bool {
 	if strings.EqualFold(strings.TrimSpace(status.Status), "error") {
 		return true
 	}
-	// Explicit checks may inspect an active, scheduled account. Its local
-	// observations can require operator action even when Sub2 is healthy.
+	// An active, scheduled account also qualifies when a current AUTH check
+	// confirms invalid credentials. Remote active status alone is insufficient.
 	return strings.EqualFold(strings.TrimSpace(status.Status), "active") && *status.Schedulable
 }
 
+// Use the shared classification so explicit terminal codes take precedence
+// over a generic HTTP/SSE 401, and stale or canceled checks never qualify.
+func accountCheckRecoveryCandidate(check *store.AccountCheck) bool {
+	return check != nil && check.State == "finished" && check.Freshness == "current" &&
+		(check.RequiredAction == "reauthorize" || check.RequiredAction == "verify_remote_refresh")
+}
+
 func (s *sub2RecoveryService) scanSub2Accounts() {
-	if !s.configured() || !s.autoRecovery.Load() || s.ctx.Err() != nil {
+	if !s.configured() || !s.autoRecovery.Load() || s.paused.Load() || s.ctx.Err() != nil {
 		return
 	}
 	s.monitorMu.Lock()
@@ -165,6 +172,7 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 		return
 	}
 	ids := make([]int64, 0, len(statuses))
+	direct := make([]int64, 0)
 	unknown := 0
 	for id, status := range statuses {
 		if status.Unknown || status.Stale {
@@ -172,6 +180,8 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 		}
 		if sub2RecoverySuspect(status) {
 			ids = append(ids, id)
+		} else if sub2RecoveryPoolCandidate(status) && accountCheckRecoveryCandidate(checks[id].LastResult) {
+			direct = append(direct, id)
 		}
 	}
 	// Use the persisted latest check ID as the scan cursor. Accounts with no
@@ -190,7 +200,8 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 			return ids[i] < ids[j]
 		}
 	})
-	waiting, submitted, toCheck := 0, 0, make([]int64, 0)
+	sort.Slice(direct, func(i, j int) bool { return direct[i] < direct[j] })
+	queued, waiting, submitted, toCheck := 0, 0, 0, make([]int64, 0)
 	for _, id := range ids {
 		if !s.autoRecovery.Load() || ctx.Err() != nil {
 			return
@@ -205,9 +216,15 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 			continue
 		}
 		check := checks[id]
-		if check.RequiredAction != "" {
-			waiting++
-			continue
+		if check.LastResult != nil && check.LastResult.FinishedAt != nil && time.Since(time.UnixMilli(*check.LastResult.FinishedAt)) <= 5*time.Minute {
+			if _, err := s.validateCandidate(ctx, id); err == nil {
+				if _, _, err := s.enqueue(ctx, id); err == nil {
+					queued++
+				} else {
+					lastError = "部分账号恢复入队失败，请查看账号检测和恢复详情"
+				}
+				continue
+			}
 		}
 		if !check.Eligible || check.CooldownRemainingSeconds > 0 || (check.LatestTask != nil && (check.LatestTask.State == "queued" || check.LatestTask.State == "running")) {
 			waiting++
@@ -216,6 +233,26 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 		toCheck = append(toCheck, id)
 		if len(toCheck) == 100 {
 			break
+		}
+	}
+	for _, id := range direct {
+		if !s.autoRecovery.Load() || ctx.Err() != nil {
+			return
+		}
+		allowed, err := s.automaticRecoveryAllowed(ctx, id)
+		if err != nil {
+			lastError = "读取恢复记录失败"
+			return
+		}
+		if !allowed {
+			waiting++
+			continue
+		}
+		if _, _, err := s.enqueue(ctx, id); err == nil {
+			queued++
+		} else {
+			waiting++
+			lastError = "部分账号恢复入队失败，请查看账号检测和恢复详情"
 		}
 	}
 	if len(toCheck) > 0 && s.autoRecovery.Load() {
@@ -238,7 +275,7 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 			s.monitorMu.Unlock()
 		}
 	}
-	summary = fmt.Sprintf("Sub2 异常账号 %d 个，提交检测 %d 个，等待处理或冷却 %d 个", len(ids), submitted, waiting)
+	summary = fmt.Sprintf("待恢复账号 %d 个，提交检测 %d 个，直接提交恢复 %d 个，等待或冷却 %d 个", len(ids)+len(direct), submitted, queued, waiting)
 	if unknown > 0 {
 		summary += fmt.Sprintf("；%d 个状态暂时未知", unknown)
 	}
@@ -354,6 +391,26 @@ func (s *sub2RecoveryService) retryDueRecoveries() {
 	}
 }
 
+func (s *sub2RecoveryService) enqueueAutomatic(accountID int64) {
+	if !s.configured() || !s.autoRecovery.Load() || s.paused.Load() || s.ctx.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+	defer cancel()
+	allowed, err := s.automaticRecoveryAllowed(ctx, accountID)
+	if err != nil || !allowed {
+		return
+	}
+	if !s.remoteRecoverySuspect(ctx, accountID) {
+		return
+	}
+	if _, _, err := s.enqueue(ctx, accountID); err != nil {
+		s.monitorMu.Lock()
+		s.monitorState.LastError = "部分账号自动恢复入队失败，请查看检测与恢复详情"
+		s.monitorMu.Unlock()
+	}
+}
+
 func (s *sub2RecoveryService) remoteRecoverySuspect(ctx context.Context, accountID int64) bool {
 	binding, err := s.store.GetSub2Import(ctx, s.sub2.destinationKey, accountID)
 	if err != nil || binding.State != "imported" {
@@ -364,7 +421,13 @@ func (s *sub2RecoveryService) remoteRecoverySuspect(ctx context.Context, account
 	return sub2RecoveryPoolCandidate(status)
 }
 
-func (s *sub2RecoveryService) queueRecoveryChecks(ctx context.Context, ids []int64, manual bool) (store.AccountCheckBatch, error) {
+func (s *sub2RecoveryService) recordRecoveryEnqueueFailure(accountID int64) {
+	s.monitorMu.Lock()
+	defer s.monitorMu.Unlock()
+	s.monitorState.LastError = fmt.Sprintf("账号 %d 的认证失败已确认，但恢复未能入队；请刷新历史后查看账号绑定与恢复详情", accountID)
+}
+
+func (s *sub2RecoveryService) queueRecoveryChecks(ctx context.Context, ids []int64, manual bool, singleAttempt ...bool) (store.AccountCheckBatch, error) {
 	checker := s.checker
 	switch {
 	case checker == nil:
@@ -377,6 +440,9 @@ func (s *sub2RecoveryService) queueRecoveryChecks(ctx context.Context, ids []int
 	prefix := "recovery-auto-"
 	if manual {
 		prefix = "recovery-manual-"
+		if len(singleAttempt) > 0 && singleAttempt[0] {
+			prefix = "recovery-manual-once-"
+		}
 	}
 	var key [16]byte
 	if _, err := rand.Read(key[:]); err != nil {
@@ -438,7 +504,7 @@ func (s *sub2RecoveryService) handleRecoveryCheck(w http.ResponseWriter, r *http
 		recoveryAPIError(w, http.StatusConflict, code, safeRecoveryMessage(err))
 		return
 	}
-	batch, err := s.queueRecoveryChecks(r.Context(), []int64{req.AccountID}, true)
+	batch, err := s.queueRecoveryChecks(r.Context(), []int64{req.AccountID}, true, req.ManualAttempt)
 	if err != nil {
 		var safe *store.AccountCheckError
 		if errors.As(err, &safe) {

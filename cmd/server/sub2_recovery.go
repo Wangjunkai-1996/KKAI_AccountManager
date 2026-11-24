@@ -390,7 +390,7 @@ func (s *sub2RecoveryService) enqueueWithIntent(ctx context.Context, accountID i
 	if task, found, err := s.store.GetActiveAccountRecoveryTaskForDestination(ctx, accountID, s.sub2.destinationKey); err != nil {
 		return task, false, err
 	} else if found {
-		return task, false, s.checkLegacyRecovery(ctx, task)
+		return task, false, s.validateRecoveryCheck(ctx, task)
 	}
 	binding, err := s.sub2.store.GetSub2Import(ctx, s.sub2.destinationKey, accountID)
 	if err != nil || binding.State != "imported" || binding.Sub2AccountID <= 0 {
@@ -448,19 +448,50 @@ func (s *sub2RecoveryService) enqueueWithIntent(ctx context.Context, accountID i
 		}
 		return task, false, err
 	}
-	check, err := s.store.LatestFinishedAccountCheck(ctx, accountID, s.sub2.destinationKey)
+	if previousErr == nil && previous.RetryAction == "manual" && !superseded {
+		return previous, false, errRecoveryManualReview
+	}
+	original, ok := boolField(detail, "schedulable")
+	if !ok {
+		return store.AccountRecoveryTask{}, false, errors.New("Sub2 未返回账号调度状态")
+	}
+	if !original {
+		status, _ := detail["status"].(string)
+		if !strings.EqualFold(strings.TrimSpace(status), "error") {
+			return store.AccountRecoveryTask{}, false, &recoveryOperationError{Code: "manual_pause", RequiresAction: true}
+		}
+		// Sub2 pauses upstream authentication failures automatically.
+		original = true
+	}
+	checkID, err := s.validateCandidate(ctx, accountID)
 	if err != nil {
 		return store.AccountRecoveryTask{}, false, err
 	}
-	if previousErr == nil && previous.RetryAction == "manual" && !superseded {
-		if check == nil || check.RequiredAction == "" || previous.ErrorCode != check.RequiredAction {
-			return previous, false, errRecoveryManualReview
-		}
+	if previousErr == nil && previous.CheckID == checkID && previous.State == store.RecoveryCompleted {
+		return previous, false, nil
 	}
-	if check != nil && check.RequiredAction != "" {
-		return store.AccountRecoveryTask{}, false, &recoveryOperationError{Code: check.RequiredAction, RequiresAction: true}
+	var task store.AccountRecoveryTask
+	var created bool
+	if manual {
+		task, created, err = s.store.CreateOrGetManualAccountRecoveryTask(ctx, accountID, checkID, binding.Sub2AccountID, original, s.sub2.destinationKey, previous.ID)
+	} else {
+		task, created, err = s.store.CreateOrGetAccountRecoveryTask(ctx, accountID, checkID, binding.Sub2AccountID, original, s.sub2.destinationKey)
 	}
-	return store.AccountRecoveryTask{}, false, errRecoveryNotCandidate
+	if err == nil && created {
+		s.notify()
+	}
+	return task, created, err
+}
+
+func (s *sub2RecoveryService) validateCandidate(ctx context.Context, accountID int64) (int64, error) {
+	check, err := s.store.LatestFinishedAccountCheck(ctx, accountID, s.sub2.destinationKey)
+	if err != nil {
+		return 0, err
+	}
+	if !accountCheckRecoveryCandidate(check) {
+		return 0, errRecoveryNotCandidate
+	}
+	return check.ID, nil
 }
 
 func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
@@ -595,7 +626,7 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		return
 	}
 	if task.RetryAction == "" {
-		if err := s.checkLegacyRecovery(ctx, task); err != nil {
+		if err := s.validateRecoveryCheck(ctx, task); err != nil {
 			fail(store.RecoveryValidating, err)
 			return
 		}
@@ -959,10 +990,9 @@ func acquireRecoveryLoginSlot(ctx context.Context) (func(), error) {
 	}
 }
 
-// Older releases could queue a login on the strength of an AUTH-local check.
-// Only an independent remote recovery or an existing credential checkpoint
-// can carry an interrupted worker past this boundary.
-func (s *sub2RecoveryService) checkLegacyRecovery(ctx context.Context, task store.AccountRecoveryTask) error {
+// A queued local check must still describe the current credential version.
+// Remote recovery tasks and saved credential checkpoints have their own fences.
+func (s *sub2RecoveryService) validateRecoveryCheck(ctx context.Context, task store.AccountRecoveryTask) error {
 	if task.CheckID == 0 || task.Purpose == "delivery" || task.ResultCredentialAttemptID > 0 {
 		return nil
 	}
@@ -970,8 +1000,9 @@ func (s *sub2RecoveryService) checkLegacyRecovery(ctx context.Context, task stor
 	if err != nil {
 		return err
 	}
-	if check != nil && check.RequiredAction != "" {
-		return &recoveryOperationError{Code: check.RequiredAction, RequiresAction: true}
+	if accountCheckRecoveryCandidate(check) && check.ID == task.CheckID &&
+		check.CredentialAttemptID != nil && *check.CredentialAttemptID == task.SourceCredentialAttemptID {
+		return nil
 	}
 	// A new credential rejected by Sub2 after an earlier successful login has
 	// independent remote evidence. Its old AUTH observation is superseded.
@@ -1260,7 +1291,7 @@ func (s *sub2RecoveryService) verifyRecoveryRetry(ctx context.Context, task stor
 	if task.RetryAction != "resume" && task.RetryAction != "relogin" {
 		return &recoveryOperationError{Code: "checkpoint_unconfirmed", RequiresAction: true}
 	}
-	if err := s.checkLegacyRecovery(ctx, task); err != nil {
+	if err := s.validateRecoveryCheck(ctx, task); err != nil {
 		return err
 	}
 	if err := s.store.ValidateAccountRecoveryVersion(ctx, task.ID); err != nil {
