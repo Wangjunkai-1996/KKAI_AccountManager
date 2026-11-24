@@ -152,6 +152,9 @@ func TestRecoveryVerifyWrappedError(t *testing.T) {
 		{"revoked_embedded_prefix", "failure: Token revoked (401): at-secret", "probe_failed", 0, false, false},
 		{"revoked_malformed_status", "Token revoked (0401): at-secret", "probe_failed", 0, false, false},
 		{"empty_body", "API returned 401:", "credential_invalid", 401, true, false},
+		{"subscription without code", "API returned 402: Payment Required", "probe_failed", 402, false, false},
+		{"deactivated workspace", `API returned 402: {"error":{"code":"deactivated_workspace"}}`, "deactivated_workspace", 402, false, false},
+		{"other_billing_reason", `API returned 402: {"error":{"code":"insufficient_quota"}}`, "probe_failed", 402, false, false},
 		{"no_space_body", "API returned 401:unauthorized", "credential_invalid", 401, true, false},
 		{"disabled", `API returned 401: {"error":{"code":"account_disabled","status":503}}`, "account_disabled", 401, false, false},
 		{"body_status_ignored", `API returned 401: {"status":503,"status_code":502,"error":{"status":429,"status_code":403}}`, "credential_invalid", 401, true, false},
@@ -175,6 +178,22 @@ func TestRecoveryVerifyWrappedError(t *testing.T) {
 				t.Fatalf("wrong or unsafe classification: %+v", failure)
 			}
 		})
+	}
+}
+
+func TestRecoveryProbePaymentRequiredIsOfficialUnavailable(t *testing.T) {
+	failure := recoveryProbeEventError([]byte(`{"type":"error","error":{"code":"payment_required","status":402}}`))
+	if failure.Code != "payment_required" || failure.HTTPStatus != http.StatusPaymentRequired || !accountDeactivationConfirmed(failure.Code) {
+		t.Fatalf("payment-required probe = %+v", failure)
+	}
+	for _, payload := range []string{
+		`{"type":"error","status":402}`,
+		`{"type":"error","error":{"status":402}}`,
+	} {
+		failure := recoveryProbeEventError([]byte(payload))
+		if accountDeactivationConfirmed(failure.Code) {
+			t.Fatalf("unstructured 402 became official evidence: %+v", failure)
+		}
 	}
 }
 

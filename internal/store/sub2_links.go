@@ -16,8 +16,9 @@ func (s *Store) HasOfficialSub2CleanupEvidence(ctx context.Context, binding Sub2
 		WHERE i.id=? AND i.account_id=? AND i.destination_key=? AND i.sub2_account_id=? AND i.operation_id=?
 		AND i.credential_version=? AND i.state=? AND i.create_acknowledged=1
 		AND i.credential_version=(SELECT MAX(id) FROM login_attempts WHERE account_id=i.account_id AND status='success')
-		AND e.source IN ('official','cleanup_authorization') AND lower(trim(e.code)) IN
-		('account_deleted','user_deleted','account_deactivated','user_deactivated','account_disabled','user_disabled','deleted_or_deactivated')
+		AND e.source IN ('official','cleanup_authorization') AND (lower(trim(e.code)) IN
+		('deleted','account_deleted','user_deleted','deactivated','account_deactivated','user_deactivated','account_disabled','user_disabled','payment_required','subscription_expired','deactivated_workspace','deleted_or_deactivated')
+			OR (e.source='cleanup_authorization' AND e.status='deleted_or_deactivated'))
 		AND e.dedupe_key='sub2-official:' || i.id || ':' || i.sub2_account_id || ':' || i.credential_version || ':' || i.operation_id
 		AND e.observed_at >= (SELECT finished_at FROM login_attempts WHERE id=i.credential_version)
 	)`, binding.ID, binding.AccountID, binding.DestinationKey, binding.Sub2AccountID, binding.OperationID, binding.CredentialVersion, binding.State).Scan(&authorized)

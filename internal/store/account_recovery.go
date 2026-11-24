@@ -20,20 +20,22 @@ var (
 )
 
 const (
-	RecoveryQueued                = "queued"
-	RecoveryValidating            = "validating"
-	RecoveryDisablingSchedule     = "disabling_schedule"
-	RecoveryLoggingIn             = "logging_in"
-	RecoveryLoginSucceeded        = "login_succeeded"
-	RecoveryIdentityVerified      = "identity_verified"
-	RecoveryRefreshingCredentials = "refreshing_credentials"
-	RecoveryApplyingCredentials   = "applying_credentials"
-	RecoveryCredentialsApplied    = "credentials_applied"
-	RecoveryEnablingSchedule      = "enabling_schedule"
-	RecoveryCompleted             = "completed"
-	RecoveryFailed                = "failed"
-	RecoveryUnknown               = "unknown"
-	RecoveryCanceled              = "canceled"
+	RecoveryQueued                 = "queued"
+	RecoveryValidating             = "validating"
+	RecoveryDisablingSchedule      = "disabling_schedule"
+	RecoveryLoggingIn              = "logging_in"
+	RecoveryLoginSucceeded         = "login_succeeded"
+	RecoveryIdentityVerified       = "identity_verified"
+	RecoveryRefreshingCredentials  = "refreshing_credentials"
+	RecoveryApplyingCredentials    = "applying_credentials"
+	RecoveryCredentialsApplied     = "credentials_applied"
+	RecoveryEnablingSchedule       = "enabling_schedule"
+	RecoveryCompleted              = "completed"
+	RecoveryFailed                 = "failed"
+	RecoveryUnknown                = "unknown"
+	RecoveryCanceled               = "canceled"
+	RecoveryPlanUnconfirmed        = "plan_unconfirmed"
+	RecoveryPlanUnconfirmedMessage = "本次授权未确认付费套餐，请核实当前订阅"
 )
 
 // AccountRecoveryTask is the durable state for one AUTH account's Sub2
@@ -269,7 +271,7 @@ func scanAccountRecoveryTask(row scanner) (AccountRecoveryTask, error) {
 		return AccountRecoveryTask{}, err
 	}
 	task.OriginalSchedulable = original != 0
-	task.Resumable = task.ResultCredentialAttemptID > 0 && task.ResultCredentialAttemptID == currentVersion && task.RetryAction != "relogin" && (task.State == RecoveryFailed || task.State == RecoveryUnknown)
+	task.Resumable = task.ResultCredentialAttemptID > 0 && task.ResultCredentialAttemptID == currentVersion && task.RetryAction != "relogin" && task.ErrorCode != RecoveryPlanUnconfirmed && (task.State == RecoveryFailed || task.State == RecoveryUnknown)
 	task.RequiresAction = task.RetryAction == "manual" || task.ManualAction != ""
 	if strings.TrimSpace(diagnostic) != "" {
 		var parsed RecoveryDiagnostic
@@ -550,6 +552,9 @@ func (s *Store) UpdateAccountRecoveryTask(ctx context.Context, id int64, state, 
 	if err != nil {
 		return AccountRecoveryTask{}, err
 	}
+	if current.ErrorCode == RecoveryPlanUnconfirmed {
+		return current, ErrAccountRecoveryNotResumable
+	}
 	if current.State == RecoveryCanceled {
 		if state == RecoveryCanceled {
 			return current, nil
@@ -609,8 +614,8 @@ func (s *Store) RecordAccountRecoveryFailure(ctx context.Context, id int64, fail
 	}
 	diagnosticJSON := recoveryDiagnosticJSON(failure.Diagnostic)
 	now := time.Now().UnixMilli()
-	query := `UPDATE account_recovery_tasks SET state=?,last_error=?,failure_stage=?,error_code=?,probe_http_status=?,diagnostic_json=?,retry_action=?,next_retry_at=?,retry_count=retry_count+1,manual_action=?,updated_at=? WHERE id=? AND state NOT IN ('completed','canceled')`
-	args := []any{failure.State, strings.TrimSpace(failure.Message), strings.TrimSpace(failure.Stage), strings.TrimSpace(failure.Code), httpStatus, diagnosticJSON, failure.RetryAction, next, strings.TrimSpace(failure.ManualAction), now, id}
+	query := `UPDATE account_recovery_tasks SET state=?,last_error=?,failure_stage=?,error_code=?,probe_http_status=?,diagnostic_json=?,retry_action=?,next_retry_at=?,retry_count=retry_count+1,manual_action=?,updated_at=? WHERE id=? AND state NOT IN ('completed','canceled') AND error_code<>?`
+	args := []any{failure.State, strings.TrimSpace(failure.Message), strings.TrimSpace(failure.Stage), strings.TrimSpace(failure.Code), httpStatus, diagnosticJSON, failure.RetryAction, next, strings.TrimSpace(failure.ManualAction), now, id, RecoveryPlanUnconfirmed}
 	if strings.TrimSpace(failure.ExpectedState) != "" {
 		query += ` AND state=? AND retry_count=?`
 		args = append(args, strings.TrimSpace(failure.ExpectedState), failure.ExpectedRetryCount)
@@ -1005,7 +1010,7 @@ func (l *AccountRecoveryLease) FinishAttempt(ctx context.Context, taskID, attemp
 			return err
 		}
 		if policy != Sub2PolicyFreeLocal {
-			if err := checkpointRecoveryTx(ctx, tx, taskID, l.accountID, attemptID); err != nil {
+			if err := checkpointRecoveryTx(ctx, tx, taskID, l.accountID, attemptID, policy, RecoveryLoginSucceeded); err != nil {
 				return err
 			}
 		}
@@ -1051,7 +1056,12 @@ func (l *AccountRecoveryLease) UpdateOAuthResult(ctx context.Context, taskID int
 	nextPolicy := nextSub2Policy(result.PlanType, account.Sub2Policy)
 	if strings.TrimSpace(result.PlanType) == "" {
 		result.PlanType = ""
-		nextPolicy = normalizeSub2Policy(account.Sub2Policy)
+		// A standalone token refresh may preserve the existing policy. A
+		// recovery checkpoint needs a fresh plan observation before any remote
+		// write is allowed, so keep it unknown and stop for manual review.
+		if taskID == 0 {
+			nextPolicy = normalizeSub2Policy(account.Sub2Policy)
+		}
 	}
 	exec, err := tx.ExecContext(ctx, `UPDATE accounts SET access_token_cipher=?,refresh_token_cipher=?,chatgpt_account_id=CASE WHEN ?<>'' THEN ? ELSE chatgpt_account_id END,organization_id=CASE WHEN ?<>'' THEN ? ELSE organization_id END,plan_type=CASE WHEN ?<>'' THEN ? ELSE plan_type END,sub2_policy=?,expires_at=CASE WHEN ?>0 THEN ? ELSE expires_at END,status='active',attempt_count=attempt_count+1,last_error_code='',last_error='',last_http_status=0,last_success_at=?,updated_at=? WHERE id=?`, access, refresh, result.ChatGPTAccountID, result.ChatGPTAccountID, result.OrganizationID, result.OrganizationID, result.PlanType, result.PlanType, nextPolicy, result.ExpiresAt, result.ExpiresAt, now, now, l.accountID)
 	if err != nil {
@@ -1071,7 +1081,7 @@ func (l *AccountRecoveryLease) UpdateOAuthResult(ctx context.Context, taskID int
 			return 0, err
 		}
 	} else if taskID > 0 {
-		if err := checkpointRecoveryTx(ctx, tx, taskID, l.accountID, version); err != nil {
+		if err := checkpointRecoveryTx(ctx, tx, taskID, l.accountID, version, nextPolicy, RecoveryRefreshingCredentials); err != nil {
 			return 0, err
 		}
 	}
@@ -1081,8 +1091,17 @@ func (l *AccountRecoveryLease) UpdateOAuthResult(ctx context.Context, taskID int
 	return version, nil
 }
 
-func checkpointRecoveryTx(ctx context.Context, tx *sql.Tx, taskID, accountID, version int64) error {
-	result, err := tx.ExecContext(ctx, `UPDATE account_recovery_tasks SET result_credential_attempt_id=?,state='login_succeeded',last_error='',updated_at=? WHERE id=? AND account_id=? AND result_credential_attempt_id=0 AND state IN ('logging_in','refreshing_credentials')`, version, time.Now().UnixMilli(), taskID, accountID)
+func checkpointRecoveryTx(ctx context.Context, tx *sql.Tx, taskID, accountID, version int64, policy, stage string) error {
+	state, code, message := RecoveryLoginSucceeded, "", ""
+	if policy == Sub2PolicyUnknown {
+		state, code, message = RecoveryUnknown, RecoveryPlanUnconfirmed, RecoveryPlanUnconfirmedMessage
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE account_recovery_tasks SET result_credential_attempt_id=?,state=?,last_error=?,manual_action=?,
+		retry_action=CASE WHEN ?<>'' THEN 'manual' ELSE retry_action END,
+		failure_stage=CASE WHEN ?<>'' THEN ? ELSE failure_stage END,
+		error_code=CASE WHEN ?<>'' THEN ? ELSE error_code END,next_retry_at=NULL,updated_at=?
+		WHERE id=? AND account_id=? AND result_credential_attempt_id=0 AND state IN ('logging_in','refreshing_credentials')`,
+		version, state, message, message, code, code, stage, code, code, time.Now().UnixMilli(), taskID, accountID)
 	if err != nil {
 		return err
 	}
@@ -1090,6 +1109,9 @@ func checkpointRecoveryTx(ctx context.Context, tx *sql.Tx, taskID, accountID, ve
 		return err
 	} else if n != 1 {
 		return ErrAccountRecoveryNotResumable
+	}
+	if code != "" {
+		return finishCredentialRepairRecoveryTx(ctx, tx, taskID, "requires_action", message)
 	}
 	return nil
 }
@@ -1101,6 +1123,24 @@ func (s *Store) GetAccountCredentialVersion(ctx context.Context, accountID int64
 		err = ErrAccountNotFound
 	}
 	return version, err
+}
+
+// ObservedCredentialPlan returns the plan reported by this exact credential
+// version. Missing claims and inferred legacy metadata yield an empty plan.
+func (s *Store) ObservedCredentialPlan(ctx context.Context, accountID, version int64) (string, error) {
+	return observedCredentialPlan(ctx, s.db, accountID, version)
+}
+
+func observedCredentialPlan(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, accountID, version int64) (string, error) {
+	var plan string
+	err := q.QueryRowContext(ctx, `SELECT COALESCE(plan_type,'') FROM login_attempts
+		WHERE id=? AND account_id=? AND status='success' AND observation_source IN ('oauth_login','token_refresh')`, version, accountID).Scan(&plan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return plan, err
 }
 
 func validateRecoveryVersionTx(ctx context.Context, tx *sql.Tx, taskID, accountID int64) error {
@@ -1198,6 +1238,9 @@ func retryAccountRecoveryTaskTx(ctx context.Context, tx *sql.Tx, taskID int64, r
 		return task, err
 	}
 	if task.State != RecoveryFailed && task.State != RecoveryUnknown {
+		return task, ErrAccountRecoveryNotResumable
+	}
+	if task.ErrorCode == RecoveryPlanUnconfirmed {
 		return task, ErrAccountRecoveryNotResumable
 	}
 	if !relogin && task.ResultCredentialAttemptID == 0 {

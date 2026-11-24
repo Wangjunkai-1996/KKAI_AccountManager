@@ -88,6 +88,7 @@ func TestRecoveryHistoryFiltersDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	checkTestLogin(t, s, account.Email)
 	if _, err := s.LinkSub2Account(ctx, "alpha", account.ID, 101, "linked-alpha-history"); err != nil {
 		t.Fatal(err)
 	}

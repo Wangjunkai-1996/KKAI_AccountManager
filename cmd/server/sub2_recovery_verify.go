@@ -55,9 +55,14 @@ func (e *recoveryOperationError) Error() string {
 		"password_rejected": "密码错误，自动恢复已停止", "totp_rejected": "TOTP 验证码被拒绝，自动恢复已停止",
 		"verification_code_rejected": "验证码被拒绝，自动恢复已停止", "credentials_rejected": "登录凭据被拒绝，自动恢复已停止",
 		"auth_page_timeout": "认证页面暂未加载完成，稍后自动重试", "auth_page_timeout_exhausted": "本任务多次恢复失败且认证页面仍未完成，请人工核对",
-		"challenge":                  "认证站暂时要求浏览器验证，稍后自动重试",
-		"browser_runtime_permission": "浏览器运行环境权限不足，请联系管理员检查 Node 与驱动权限",
-		"manual_pause":               "账号已被人工暂停或禁用，保持原状态", "version_changed": "本地凭据版本已变化，请核对后继续",
+		"challenge":                   "认证站暂时要求浏览器验证，稍后自动重试",
+		"browser_runtime_permission":  "浏览器运行环境权限不足，请联系管理员检查 Node 与驱动权限",
+		"reauthorize":                 "需要重新授权，请仅重新登录 AUTH，核对后再显式交付",
+		store.RecoveryPlanUnconfirmed: store.RecoveryPlanUnconfirmedMessage,
+		"sub2_plan_ineligible":        "当前账号未获准进入 Sub2 付费池，请核实套餐及账号策略",
+		"free_local":                  "当前账号仅保留在 AUTH 本地",
+		"verify_remote_refresh":       "请先核对原 Sub2 账号的正常续期状态，必要时再重新授权",
+		"manual_pause":                "账号已被人工暂停或禁用，保持原状态", "version_changed": "本地凭据版本已变化，请核对后继续",
 		"checkpoint_unconfirmed": "无法确认恢复检查点归属，请人工核对", "account_busy": "账号正在处理其他任务，稍后自动重试",
 	}
 	if message := messages[e.Code]; message != "" {
@@ -76,6 +81,9 @@ func (e *recoveryOperationError) Error() string {
 }
 
 func classifyRecoveryError(err error) *recoveryOperationError {
+	if errors.Is(err, store.ErrSub2PlanIneligible) {
+		return &recoveryOperationError{Code: store.RecoveryPlanUnconfirmed, RequiresAction: true}
+	}
 	if errors.Is(err, store.ErrAccountDiscarded) {
 		return &recoveryOperationError{Code: "account_discarded"}
 	}
@@ -241,9 +249,12 @@ func recoveryProbeEventError(payload []byte) *recoveryOperationError {
 	if event.RetryAfter > 0 && event.RetryAfter <= 86400 {
 		failure.RetryAfterSeconds = event.RetryAfter
 	}
-	switch strings.ToLower(strings.TrimSpace(event.Code)) {
-	case "account_deactivated", "account_deleted", "user_deactivated", "user_deleted", "account_disabled", "user_disabled":
-		failure.Code = strings.ToLower(strings.TrimSpace(event.Code))
+	code := strings.ToLower(strings.TrimSpace(event.Code))
+	if accountDeactivationConfirmed(code) {
+		failure.Code = code
+		return failure
+	}
+	switch code {
 	case "token_revoked", "token_invalidated", "token_expired", "access_token_expired", "invalid_token", "unauthorized", "authentication_error":
 		failure.Code, failure.CredentialInvalid = "credential_invalid", true
 	case "rate_limit_exceeded", "rate_limited", "too_many_requests":

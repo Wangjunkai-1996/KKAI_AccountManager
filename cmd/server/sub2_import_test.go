@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,7 +60,7 @@ func finishFreeCleanupLogin(t *testing.T, history *store.Store) int64 {
 }
 
 func TestOfficialSub2CleanupFence(t *testing.T) {
-	for _, scenario := range []string{"confirmed", "discarded", "free", "has_shadow", "already_missing", "unsupported", "delete_404_target_present", "untrusted_target_404", "no_evidence", "unbound_evidence", "stale_version", "wrong_operation", "wrong_workspace", "pause_unconfirmed", "changed_revision", "lost_delete_response", "lost_pause_response"} {
+	for _, scenario := range []string{"confirmed", "payment_required", "subscription_expired", "deactivated_workspace", "official_page", "discarded", "free", "has_shadow", "already_missing", "unsupported", "delete_404_target_present", "untrusted_target_404", "no_evidence", "unbound_evidence", "stale_version", "wrong_operation", "wrong_workspace", "pause_unconfirmed", "changed_revision", "lost_delete_response", "lost_pause_response"} {
 		t.Run(scenario, func(t *testing.T) {
 			history, accountID := testOAuthStore(t)
 			ctx := context.Background()
@@ -73,6 +74,16 @@ func TestOfficialSub2CleanupFence(t *testing.T) {
 			version := binding.CredentialVersion
 			if scenario == "free" {
 				version = finishFreeCleanupLogin(t, history)
+			} else if scenario == "official_page" {
+				attempt, err := history.StartAttempt(ctx, "sub2@example.com")
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = history.FinishAttempt(ctx, attempt.ID, false, nil, &store.Failure{Code: "account_unavailable", AccountStatus: "deleted_or_deactivated"})
+				attempt.Release()
+				if err != nil {
+					t.Fatal(err)
+				}
 			} else if scenario == "discarded" {
 				attempt, err := history.StartAttempt(ctx, "sub2@example.com")
 				if err != nil {
@@ -98,9 +109,11 @@ func TestOfficialSub2CleanupFence(t *testing.T) {
 				if scenario == "unbound_evidence" {
 					key = "fixture"
 				}
-				if err := history.MarkOfficialUnavailable(ctx, accountID, version, binding, store.LifecycleEvent{
-					Source: "official", Status: "deleted", Code: "account_deleted", DedupeKey: key,
-				}); err != nil {
+				event := store.LifecycleEvent{Source: "official", Status: "deleted", Code: "account_deleted", DedupeKey: key}
+				if scenario == "payment_required" || scenario == "subscription_expired" || scenario == "deactivated_workspace" {
+					event.Status, event.Code, event.HTTPStatus = "deactivated", scenario, http.StatusPaymentRequired
+				}
+				if err := history.MarkOfficialUnavailable(ctx, accountID, version, binding, event); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -206,7 +219,7 @@ func TestOfficialSub2CleanupFence(t *testing.T) {
 					t.Fatalf("issued %d writes without ownership evidence", writes.Load())
 				}
 			}
-			wantDelete := scenario == "confirmed" || scenario == "discarded" || scenario == "free" || scenario == "already_missing" || scenario == "lost_delete_response" || scenario == "lost_pause_response"
+			wantDelete := scenario == "confirmed" || scenario == "official_page" || scenario == "payment_required" || scenario == "subscription_expired" || scenario == "deactivated_workspace" || scenario == "discarded" || scenario == "free" || scenario == "already_missing" || scenario == "lost_delete_response" || scenario == "lost_pause_response"
 			if deleted.Load() != (wantDelete || scenario == "untrusted_target_404") || (err == nil) != wantDelete {
 				t.Fatalf("deleted = %t, err = %v, want delete = %t", deleted.Load(), err, wantDelete)
 			}
@@ -290,7 +303,7 @@ func TestSub2ImportServiceStartStop(t *testing.T) {
 }
 
 func TestAccountDeactivationConfirmedRecognizesOfficialCodesOnly(t *testing.T) {
-	for _, code := range []string{"account_deleted", "user_deleted", "account_deactivated", "user_deactivated", "account_disabled", "user_disabled"} {
+	for _, code := range []string{"account_deleted", "user_deleted", "account_deactivated", "user_deactivated", "account_disabled", "user_disabled", "payment_required", "subscription_expired", "deactivated_workspace"} {
 		if !accountDeactivationConfirmed(code) || !accountDeactivationConfirmed(strings.ToUpper(code)) {
 			t.Fatalf("official code %q was not recognized", code)
 		}
@@ -299,6 +312,101 @@ func TestAccountDeactivationConfirmedRecognizesOfficialCodesOnly(t *testing.T) {
 		if accountDeactivationConfirmed(code) {
 			t.Fatalf("ambiguous/non-official code %q was recognized", code)
 		}
+	}
+}
+
+func TestSub2ImportMissingPlanReleasesQueueAndHoldsDelivery(t *testing.T) {
+	for _, tc := range []struct{ name, observed, cached, policy, reason string }{
+		{"missing_plan", "", "plus", "eligible", store.RecoveryPlanUnconfirmedMessage},
+		{"revoked_policy", "plus", "plus", "unknown", "当前账号未获准进入 Sub2 付费池，请核实套餐及账号策略"},
+		{"unconfirmed_account_plan", "plus", "", "eligible", "当前账号未获准进入 Sub2 付费池，请核实套餐及账号策略"},
+		{"free", "free", "free", "free_local", "当前账号仅保留在 AUTH 本地"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			path := filepath.Join(dir, "accounts.db")
+			history, err := store.Open(path, filepath.Join(dir, "accounts.key"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer history.Close()
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			firstAccount, firstAttempt, err := history.BeginAttempt(ctx, store.Credentials{Email: "first@example.test", Password: "fixture"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := history.FinishAttempt(ctx, firstAttempt.ID, true, &store.Result{PlanType: "plus"}, nil); err != nil {
+				t.Fatal(err)
+			}
+			firstAttempt.Release()
+			firstID := firstAccount.ID
+			delivery, err := history.QueueAccountDelivery(ctx, firstID, "fixture", store.DefaultDeliveryOptions())
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, _, err := history.CreateOrGetSub2Import(ctx, "fixture", firstID, "head", "head-key", []byte(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondAccount, attempt, err := history.BeginAttempt(ctx, store.Credentials{Email: "second@example.test", Password: "fixture"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := history.FinishAttempt(ctx, attempt.ID, true, &store.Result{PlanType: "plus"}, nil); err != nil {
+				t.Fatal(err)
+			}
+			attempt.Release()
+			second, _, err := history.CreateOrGetSub2Import(ctx, "fixture", secondAccount.ID, "next", "next-key", []byte(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`UPDATE accounts SET plan_type=?,sub2_policy=? WHERE id=?`, tc.cached, tc.policy, firstID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`UPDATE login_attempts SET plan_type=?, observation_source='token_refresh' WHERE id=?`, tc.observed, firstAttempt.ID); err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Errorf("unconfirmed import issued %s %s", r.Method, r.URL.Path)
+			}))
+			defer server.Close()
+			importer := &sub2ImportService{store: history, baseURL: server.URL, adminAPIKey: "fixture", destinationKey: "fixture", client: server.Client()}
+			importer.runOnce(ctx)
+			held, err := history.GetSub2ImportByID(ctx, first.ID)
+			if err != nil || held.State != "failed" || held.LastError != tc.reason {
+				t.Fatalf("first task=%+v err=%v", held, err)
+			}
+			queue, err := history.ListQueuedSub2ImportsForDestination(ctx, "fixture", 1)
+			if err != nil || len(queue) != 1 || queue[0].ID != second.ID {
+				t.Fatalf("next task=%+v err=%v", queue, err)
+			}
+			service := newAccountDeliveryService(history, importer, nil)
+			service.process(ctx, delivery)
+			heldDelivery, err := history.GetAccountDelivery(ctx, delivery.ID)
+			if err != nil || heldDelivery.State != "requires_action" || heldDelivery.ManualAction != tc.reason || heldDelivery.NextRetryAt != nil {
+				t.Fatalf("delivery=%+v err=%v", heldDelivery, err)
+			}
+			held, err = history.GetSub2ImportByID(ctx, first.ID)
+			if err != nil || held.State != "failed" {
+				t.Fatalf("delivery requeued import: %+v err=%v", held, err)
+			}
+			stale := second
+			stale.OperationID = "earlier-operation"
+			if err := history.FailQueuedSub2Import(ctx, stale, attempt.ID, tc.reason); !errors.Is(err, store.ErrAccountRecoveryStale) {
+				t.Fatalf("earlier operation changed task: %v", err)
+			}
+			if err := history.MarkSub2ImportSendingForOperation(ctx, second); err != nil {
+				t.Fatal(err)
+			}
+			if err := history.FailQueuedSub2Import(ctx, second, attempt.ID, tc.reason); !errors.Is(err, store.ErrAccountRecoveryStale) {
+				t.Fatalf("late worker changed in-flight task: %v", err)
+			}
+		})
 	}
 }
 
@@ -395,7 +503,7 @@ func TestSub2ImportRefreshesQueuedCredentialsBeforePost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := history.FinishAttempt(ctx, attempt.ID, true, &store.Result{AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "chatgpt-1"}, nil); err != nil {
+	if err := history.FinishAttempt(ctx, attempt.ID, true, &store.Result{AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "chatgpt-1", PlanType: "plus"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	attempt.Release()

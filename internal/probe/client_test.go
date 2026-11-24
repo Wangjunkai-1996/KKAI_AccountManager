@@ -134,6 +134,11 @@ func TestProbeClassification(t *testing.T) {
 		{"expired", 401, `{"error":{"code":"token_expired"}}`, "access_token_expired", "token_expired", nil},
 		{"revoked", 401, `{"error":{"code":"token_revoked"}}`, "credential_revoked", "token_revoked", nil},
 		{"disabled", 403, `{"error":{"code":"account_deactivated"}}`, "account_disabled", "account_deactivated", nil},
+		{"subscription expired without code", 402, "Payment Required", "request_rejected", "unknown_upstream_error", nil},
+		{"deactivated workspace", 402, `{"error":{"code":"deactivated_workspace"}}`, "account_disabled", "deactivated_workspace", nil},
+		{"402 with quota error", 402, `{"error":{"code":"insufficient_quota"}}`, "quota_exhausted", "insufficient_quota", nil},
+		{"402 with other code", 402, `{"error":{"code":"another_billing_error"}}`, "request_rejected", "unknown_upstream_error", nil},
+		{"subscription code", 403, `{"error":{"code":"payment_required"}}`, "account_disabled", "payment_required", nil},
 		{"mixed", 403, `{"error":{"message":"You do not have an account because it has been deleted or deactivated."}}`, "account_unavailable", "deleted_or_deactivated", nil},
 		{"cf header", 403, "<html>challenge</html>", "upstream_challenge", "", http.Header{"Cf-Mitigated": {"challenge"}}},
 		{"cf marker", 403, `<html><script src="/cdn-cgi/challenge-platform/a"></script></html>`, "upstream_challenge", "", nil},
@@ -183,6 +188,7 @@ func TestProbeSSE(t *testing.T) {
 		{"failed error", "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n", "upstream_error", "server_is_overloaded", 0},
 		{"completed error", "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"error\":{\"code\":\"invalid_token\"}}}\n\n", "unauthorized", "invalid_token", 0},
 		{"status 401", "data: {\"type\":\"error\",\"status_code\":401}\n\n", "unauthorized", "unknown_upstream_error", 401},
+		{"status 402 without code", "data: {\"type\":\"error\",\"status_code\":402}\n\n", "upstream_error", "unknown_upstream_error", 402},
 		{"string status", "data: {\"type\":\"error\",\"status_code\":\"401\",\"message\":\"401 secret\"}\n\n", "upstream_error", "unknown_upstream_error", 0},
 		{"incomplete error", "data: {\"type\":\"response.incomplete\",\"response\":{\"error\":{\"code\":\"model_not_found\"}}}\n\n", "model_unavailable", "model_not_found", 0},
 		{"bad json", "data: {broken}\n\n", "protocol_error", "", 0},
@@ -346,5 +352,12 @@ func TestProbeFragmentedStreamAndTruncatedHTTPError(t *testing.T) {
 	got := c.Check(context.Background(), "opaque", "account-1")
 	if got.Outcome != "unauthorized" || got.HTTPStatus != 401 || strings.Contains(got.Message, "sensitive") {
 		t.Fatalf("truncated 401: %+v", got)
+	}
+	c.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 402, Header: http.Header{}, Body: io.NopCloser(brokenReader{}), Request: req}, nil
+	})
+	got = c.Check(context.Background(), "opaque", "account-1")
+	if got.Outcome != "request_rejected" || got.ErrorCode != "unknown_upstream_error" || got.HTTPStatus != 402 {
+		t.Fatalf("truncated 402 was treated as subscription evidence: %+v", got)
 	}
 }

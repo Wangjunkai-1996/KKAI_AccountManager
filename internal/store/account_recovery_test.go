@@ -246,7 +246,7 @@ func TestRecoveryCheckpointResumeAndCredentialVersionGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lease.Release()
-	newVersion, err := lease.UpdateOAuthResult(ctx, task.ID, Result{AccessToken: "saved-at", RefreshToken: "saved-rt"})
+	newVersion, err := lease.UpdateOAuthResult(ctx, task.ID, Result{AccessToken: "saved-at", RefreshToken: "saved-rt", PlanType: "plus"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func TestRecoveryCheckpointResumeAndCredentialVersionGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	lease.Release()
-	if err := s.UpdateOAuthResultByID(ctx, id, Result{AccessToken: "newer-at", RefreshToken: "newer-rt"}); err != nil {
+	if err := s.UpdateOAuthResultByID(ctx, id, Result{AccessToken: "newer-at", RefreshToken: "newer-rt", PlanType: "plus"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.ValidateAccountRecoveryVersion(ctx, task.ID); !errors.Is(err, ErrAccountRecoveryVersionChanged) {
@@ -357,6 +357,9 @@ func TestRecoveryRejectsMissingVersionAndUncheckpointedResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.db.Exec(`UPDATE accounts SET sub2_policy='eligible',plan_type='plus' WHERE id=?`, account.ID); err != nil {
+		t.Fatal(err)
+	}
 	task, _, err := s.CreateOrGetAccountRecoveryTask(ctx, account.ID, 0, 42, true)
 	if err != nil {
 		t.Fatal(err)
@@ -374,6 +377,60 @@ func TestRecoveryRejectsMissingVersionAndUncheckpointedResume(t *testing.T) {
 	cancel()
 	if _, err := s.UpdateAccountRecoveryTask(canceled, task.ID, RecoveryCompleted, ""); err == nil {
 		t.Fatal("state persistence cancellation was ignored")
+	}
+}
+
+func TestRecoveryRefreshWaitsForPlanAfterRestart(t *testing.T) {
+	for _, plan := range []string{"", "unrecognized_tier"} {
+		t.Run("claim_"+plan, func(t *testing.T) {
+			ctx := context.Background()
+			s, dir := testStore(t)
+			id := checkTestAccount(t, s, "plan-review")
+			task, _, err := s.CreateOrGetAccountRecoveryTask(ctx, id, 0, 42, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.UpdateAccountRecoveryTask(ctx, task.ID, RecoveryRefreshingCredentials, ""); err != nil {
+				t.Fatal(err)
+			}
+			lease, err := s.AcquireAccountRecovery(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			version, err := lease.UpdateOAuthResult(ctx, task.ID, Result{AccessToken: "new-at", RefreshToken: "new-rt", PlanType: plan})
+			lease.Release()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := Open(filepath.Join(dir, "accounts.db"), filepath.Join(dir, "secret.key"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			held, err := reopened.GetAccountRecoveryTaskByID(ctx, task.ID)
+			if err != nil || held.State != RecoveryUnknown || held.ResultCredentialAttemptID != version || held.ErrorCode != RecoveryPlanUnconfirmed ||
+				held.FailureStage != RecoveryRefreshingCredentials || held.ManualAction == "" || held.RetryAction != "manual" || held.Resumable || held.NextRetryAt != nil {
+				t.Fatalf("reopened checkpoint=%+v err=%v", held, err)
+			}
+			for _, relogin := range []bool{false, true} {
+				if _, err := reopened.RetryAccountRecoveryTask(ctx, task.ID, relogin); !errors.Is(err, ErrAccountRecoveryNotResumable) {
+					t.Fatalf("retry=%t err=%v", relogin, err)
+				}
+			}
+			if _, err := reopened.UpdateAccountRecoveryTask(ctx, task.ID, RecoveryCompleted, "late callback"); !errors.Is(err, ErrAccountRecoveryNotResumable) {
+				t.Fatalf("late completion err=%v", err)
+			}
+			if _, err := reopened.RecordAccountRecoveryFailure(ctx, task.ID, RecoveryFailure{State: RecoveryFailed, Code: "late_failure", RetryAction: "resume"}); !errors.Is(err, ErrAccountRecoveryNotResumable) {
+				t.Fatalf("late failure err=%v", err)
+			}
+			after, err := reopened.GetAccountRecoveryTaskByID(ctx, task.ID)
+			if err != nil || after.ManualAction != held.ManualAction || after.ErrorCode != held.ErrorCode || !after.UpdatedAt.Equal(held.UpdatedAt) {
+				t.Fatalf("late callback changed hold: %+v err=%v", after, err)
+			}
+		})
 	}
 }
 
@@ -395,7 +452,7 @@ func TestRecoveryCheckpointSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	version, err := lease.UpdateOAuthResult(ctx, task.ID, Result{AccessToken: "durable-at", RefreshToken: "durable-rt"})
+	version, err := lease.UpdateOAuthResult(ctx, task.ID, Result{AccessToken: "durable-at", RefreshToken: "durable-rt", PlanType: "plus"})
 	lease.Release()
 	if err != nil {
 		t.Fatal(err)
@@ -437,6 +494,9 @@ func TestRecoveryMigrationAddsCheckpointColumns(t *testing.T) {
 	ctx := context.Background()
 	account, err := reopened.UpsertCredentials(ctx, Credentials{Email: "migration@example.test", Password: "pw"})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.db.Exec(`UPDATE accounts SET sub2_policy='eligible',plan_type='plus' WHERE id=?`, account.ID); err != nil {
 		t.Fatal(err)
 	}
 	task, _, err := reopened.CreateOrGetAccountRecoveryTask(ctx, account.ID, 0, 42, false)
@@ -527,6 +587,7 @@ func TestRecoveryQueriesStayWithinDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	checkTestLogin(t, s, account.Email)
 	if _, err := s.LinkSub2Account(ctx, "alpha", account.ID, 101, "linked-alpha"); err != nil {
 		t.Fatal(err)
 	}
@@ -588,6 +649,7 @@ func TestRecoveryQueriesStayWithinDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	checkTestLogin(t, s, other.Email)
 	if _, err := s.LinkSub2Account(ctx, "alpha", other.ID, 303, "linked-alpha-same"); err != nil {
 		t.Fatal(err)
 	}

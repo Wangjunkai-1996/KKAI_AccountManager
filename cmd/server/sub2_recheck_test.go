@@ -35,7 +35,11 @@ func TestSub2RecheckRetryAPI(t *testing.T) {
 			case "pause":
 				f.schedule = false
 			case "binding":
-				want = http.StatusNotFound // Legacy tasks lose destination proof with the binding.
+				// Pre-destination tasks lose their ownership proof when the binding changes.
+				if _, err := f.db.Exec(`UPDATE account_recovery_tasks SET destination_key='' WHERE id=?`, f.task.ID); err != nil {
+					t.Fatal(err)
+				}
+				want = http.StatusNotFound
 				binding, _ := f.store.GetSub2Import(context.Background(), "fixture", f.account.ID)
 				if err := f.store.UpdateSub2Import(context.Background(), binding.ID, "imported", true, 902, ""); err != nil {
 					t.Fatal(err)
@@ -143,6 +147,32 @@ func TestSub2RecheckInvalidActualCredentialQueuesOneRecovery(t *testing.T) {
 	child, _ = f.store.GetAccountRecoveryTaskByID(context.Background(), child.ID)
 	if child.State != store.RecoveryCompleted || f.loginCalls != 2 || f.applyCalls != 2 || !f.schedule {
 		t.Fatalf("delayed 401 failed to relogin active Sub2 account: %+v login=%d apply=%d schedule=%v", child, f.loginCalls, f.applyCalls, f.schedule)
+	}
+}
+
+func TestSub2RecheckOfficialFailureQueuesCleanup(t *testing.T) {
+	for _, code := range []string{"account_deleted", "payment_required", "deactivated_workspace"} {
+		t.Run(code, func(t *testing.T) {
+			ctx := context.Background()
+			f := newRecoveryFixture(t, true)
+			f.service.process(f.task)
+			version := f.state(t).ResultCredentialAttemptID
+			f.probeBody = fmt.Sprintf("data: {\"type\":\"error\",\"error\":{\"code\":%q}}\n\n", code)
+			forceDueRecheck(t, f)
+			if !f.service.processNextRecheck() {
+				t.Fatal("follow-up did not run")
+			}
+			// The fixture cannot acknowledge the cleanup pause, so the frozen
+			// binding must stay queued for the importer after the recheck stops.
+			binding, err := f.store.GetSub2Import(ctx, "fixture", f.account.ID)
+			if err != nil || binding.State != "cleanup_pending" || binding.CredentialVersion != version {
+				t.Fatalf("cleanup binding = %+v, err=%v", binding, err)
+			}
+			ok, err := f.store.HasOfficialSub2CleanupEvidence(ctx, binding)
+			if err != nil || !ok || currentRecheck(t, f).State != "canceled" {
+				t.Fatalf("follow-up retirement evidence = %t, err=%v", ok, err)
+			}
+		})
 	}
 }
 

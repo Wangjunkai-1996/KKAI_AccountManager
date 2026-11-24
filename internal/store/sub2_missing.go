@@ -161,6 +161,13 @@ func (s *Store) AuthorizeRemoteMissingReimport(ctx context.Context, binding Sub2
 	if err := ensureSub2EligibleTx(ctx, tx, binding.AccountID); err != nil {
 		return Sub2Import{}, err
 	}
+	plan, err := observedCredentialPlan(ctx, tx, binding.AccountID, version)
+	if err != nil {
+		return Sub2Import{}, err
+	}
+	if !IsSub2PaidPlan(plan) {
+		return Sub2Import{}, ErrSub2PlanIneligible
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE sub2_imports SET state='queued',credential_version=?,operation_id=?,idempotency_key=?,payload_cipher=?,sub2_account_id=NULL,create_acknowledged=0,last_error='',updated_at=?
  WHERE id=? AND destination_key=? AND account_id=? AND sub2_account_id=? AND operation_id=? AND state='remote_missing'
  AND EXISTS(SELECT 1 FROM accounts a WHERE a.id=? AND a.status='active')

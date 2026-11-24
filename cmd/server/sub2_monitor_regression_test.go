@@ -23,6 +23,18 @@ func TestSub2MonitorRotatesBeyondBatchLimit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		attempt, err := f.store.StartAttempt(ctx, account.Email)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.store.FinishAttempt(ctx, attempt.ID, true, &store.Result{AccessToken: "at", RefreshToken: "rt", ChatGPTAccountID: fmt.Sprintf("workspace-%d", i), PlanType: "plus"}, nil); err != nil {
+			t.Fatal(err)
+		}
+		attempt.Release()
+		account, err = f.store.GetAccountByID(ctx, account.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
 		binding, _, err := f.store.CreateOrGetSub2Import(ctx, "fixture", account.ID, fmt.Sprintf("rotate-%d", i), fmt.Sprintf("rotate-%d", i), []byte(`{}`))
 		if err != nil {
 			t.Fatal(err)

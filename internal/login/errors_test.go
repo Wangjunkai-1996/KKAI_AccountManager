@@ -182,6 +182,8 @@ func TestDescribeErrorAccountStatus(t *testing.T) {
 	}{
 		{"HTTP deleted", &authHTTPStatusError{Status: http.StatusServiceUnavailable, UpstreamCode: "account_deleted", Message: "Account unavailable"}, "account_deleted", "deleted"},
 		{"HTTP generic", &authHTTPStatusError{Status: http.StatusForbidden, UpstreamCode: "access_denied", Message: "Access denied"}, "access_denied", ""},
+		{"HTTP expired subscription", &authHTTPStatusError{Status: http.StatusPaymentRequired, UpstreamCode: "subscription_expired"}, "subscription_expired", "deactivated"},
+		{"HTTP billing reason unknown", &authHTTPStatusError{Status: http.StatusPaymentRequired, UpstreamCode: "unknown_billing_error", Message: "Payment Required"}, "unknown_billing_error", ""},
 		{"callback deactivated", &authRejectionError{Code: "user_deactivated", Message: "Account unavailable", Stage: LoginStageAuthorize}, "user_deactivated", "deactivated"},
 		{"wrapped callback deleted", fmt.Errorf("callback failed: %w", &authRejectionError{Code: "account_deleted", Message: "Account unavailable"}), "account_deleted", "deleted"},
 		{"callback exact sentence", &authRejectionError{Code: "account_unavailable", Message: "You do not have an account because it has been deleted or deactivated."}, "account_unavailable", "deleted_or_deactivated"},

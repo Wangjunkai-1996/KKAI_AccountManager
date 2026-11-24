@@ -6,6 +6,8 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/accountstate"
 )
 
 const (
@@ -79,16 +81,10 @@ func lifecycleStatusFromFailure(status, code string) string {
 	if isOfficialLifecycleStatus(status) {
 		return strings.ToLower(strings.TrimSpace(status))
 	}
-	switch strings.ToLower(strings.TrimSpace(code)) {
-	case "account_deleted", "user_deleted", "deleted":
-		return "deleted"
-	case "account_deactivated", "user_deactivated", "account_disabled", "user_disabled", "deactivated":
-		return "deactivated"
-	case "deleted_or_deactivated":
-		return "deleted_or_deactivated"
-	default:
-		return ""
+	if isOfficialLifecycleStatus(code) {
+		return strings.ToLower(strings.TrimSpace(code))
 	}
+	return accountstate.OfficialStatus(code)
 }
 
 func normalizePlanType(plan string) string {
@@ -239,9 +235,10 @@ func (s *Store) convergeTerminalCredentials(ctx context.Context) error {
 			SELECT 1 FROM account_lifecycle_events e
 			WHERE e.account_id=a.id AND e.email=a.email AND e.source='official'
 			AND e.status=CASE lower(trim(e.code))
-				WHEN 'account_deleted' THEN 'deleted' WHEN 'user_deleted' THEN 'deleted'
-				WHEN 'account_deactivated' THEN 'deactivated' WHEN 'user_deactivated' THEN 'deactivated'
+				WHEN 'deleted' THEN 'deleted' WHEN 'account_deleted' THEN 'deleted' WHEN 'user_deleted' THEN 'deleted'
+				WHEN 'deactivated' THEN 'deactivated' WHEN 'account_deactivated' THEN 'deactivated' WHEN 'user_deactivated' THEN 'deactivated'
 				WHEN 'account_disabled' THEN 'deactivated' WHEN 'user_disabled' THEN 'deactivated'
+				WHEN 'payment_required' THEN 'deactivated' WHEN 'subscription_expired' THEN 'deactivated' WHEN 'deactivated_workspace' THEN 'deactivated'
 				WHEN 'deleted_or_deactivated' THEN 'deleted_or_deactivated' END
 			AND (EXISTS (
 				SELECT 1 FROM login_attempts failed
@@ -416,7 +413,7 @@ func markOfficialUnavailableTx(ctx context.Context, tx *sql.Tx, accountID, crede
 			return ErrAccountRecoveryStale
 		}
 		var matches bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sub2_imports WHERE id=? AND account_id=? AND destination_key=? AND sub2_account_id=? AND operation_id=? AND state IN ('imported','cleanup_pending'))`, binding.ID, accountID, binding.DestinationKey, binding.Sub2AccountID, binding.OperationID).Scan(&matches); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sub2_imports WHERE id=? AND account_id=? AND destination_key=? AND sub2_account_id=? AND operation_id=? AND credential_version=? AND state IN ('imported','cleanup_pending'))`, binding.ID, accountID, binding.DestinationKey, binding.Sub2AccountID, binding.OperationID, binding.CredentialVersion).Scan(&matches); err != nil {
 			return err
 		}
 		if !matches {

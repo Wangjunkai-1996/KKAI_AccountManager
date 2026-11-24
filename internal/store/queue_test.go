@@ -90,7 +90,7 @@ func TestQueueClaimsRecoverAfterConnectionContention(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = lease.UpdateOAuthResult(ctx, task.ID, Result{AccessToken: "new-at", RefreshToken: "new-rt"})
+		_, err = lease.UpdateOAuthResult(ctx, task.ID, Result{AccessToken: "new-at", RefreshToken: "new-rt", PlanType: "plus"})
 		lease.Release()
 		if err != nil {
 			t.Fatal(err)

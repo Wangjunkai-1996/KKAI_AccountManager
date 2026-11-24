@@ -323,7 +323,7 @@ func TestRecoveryLoginUsesCurrentSub2EgressAndKeepsRemoteEgressUnchanged(t *test
 				if proxy != tc.wantProxy || upstream != "" {
 					t.Fatalf("recovery login did not receive the selected Sub2 proxy: proxy=%q upstream=%q", proxy, upstream)
 				}
-				return &login.LoginResult{Email: email, AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "workspace"}, nil
+				return &login.LoginResult{Email: email, AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "workspace", PlanType: "plus"}, nil
 			}
 			f.service.process(f.task)
 			state := f.state(t)

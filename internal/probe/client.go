@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/accountstate"
 )
 
 const (
@@ -307,10 +309,6 @@ func classifyError(item upstreamError) Result {
 			outcome = "credential_revoked"
 		case "invalid_token", "invalid_api_key", "authentication_error", "unauthorized":
 			outcome = "unauthorized"
-		case "account_deactivated", "user_deactivated", "account_disabled", "user_disabled":
-			outcome = "account_disabled"
-		case "account_deleted", "user_deleted":
-			outcome = "account_deleted"
 		case "deleted_or_deactivated":
 			outcome = "account_unavailable"
 		case "unsupported_country_region_territory":
@@ -323,6 +321,13 @@ func classifyError(item upstreamError) Result {
 			outcome = "model_unavailable"
 		case "server_error", "internal_server_error", "server_is_overloaded", "service_unavailable":
 			outcome = "upstream_error"
+		default:
+			switch accountstate.OfficialStatus(code) {
+			case "deleted":
+				outcome = "account_deleted"
+			case "deactivated":
+				outcome = "account_disabled"
+			}
 		}
 		if outcome != "" {
 			r := failure(outcome, "")

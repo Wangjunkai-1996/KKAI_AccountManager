@@ -527,3 +527,35 @@ func TestAccountCheckAttemptedFinalEvidence(t *testing.T) {
 		})
 	}
 }
+
+func TestRequiredActionPrefersExplicitCredentialCodeOverHTTPStatus(t *testing.T) {
+	status := 401
+	base := AccountCheck{State: "finished", Freshness: "current", HTTPStatus: &status}
+	for _, tc := range []struct {
+		name, outcome, errorCode, streamCode, want string
+	}{
+		{name: "access token expired", outcome: "access_token_expired", want: "verify_remote_refresh"},
+		{name: "token expired", errorCode: "token_expired", want: "verify_remote_refresh"},
+		{name: "specific expiry beats generic unauthorized", outcome: "unauthorized", streamCode: "access_token_expired", want: "verify_remote_refresh"},
+		{name: "specific revocation beats generic expiry", outcome: "access_token_expired", errorCode: "token_revoked", want: "reauthorize"},
+		{name: "terminal evidence beats unauthorized", outcome: "unauthorized", streamCode: "subscription_expired"},
+		{name: "token revoked", streamCode: "token_revoked", want: "reauthorize"},
+		{name: "bare unauthorized", outcome: "", want: "reauthorize"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			check := base
+			check.Outcome, check.ErrorCode, check.StreamErrorCode = tc.outcome, tc.errorCode, tc.streamCode
+			if got := requiredActionForCheck(&check); got != tc.want {
+				t.Fatalf("required action=%q want %q", got, tc.want)
+			}
+		})
+	}
+	stream := AccountCheck{State: "finished", Freshness: "current", StreamErrorStatus: &status}
+	if got := requiredActionForCheck(&stream); got != "reauthorize" {
+		t.Fatalf("stream 401 action=%q", got)
+	}
+	stream.Freshness = "stale"
+	if got := requiredActionForCheck(&stream); got != "" {
+		t.Fatalf("stale stream action=%q", got)
+	}
+}

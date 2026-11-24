@@ -22,6 +22,33 @@ func testStore(t *testing.T) (*Store, string) {
 	return s, dir
 }
 
+func TestMigrateDoesNotBackfillUnknownPaidPolicy(t *testing.T) {
+	s, dir := testStore(t)
+	if _, err := s.db.Exec(`INSERT INTO accounts(email,password_cipher,status,plan_type,sub2_policy,created_at,updated_at)
+		VALUES('legacy-paid@example.test',X'01','active','plus','unknown',1,1),
+		('legacy-free@example.test',X'01','active','free','unknown',1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(filepath.Join(dir, "accounts.db"), filepath.Join(dir, "secret.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	var paid, free string
+	if err := reopened.db.QueryRow(`SELECT sub2_policy FROM accounts WHERE email='legacy-paid@example.test'`).Scan(&paid); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.db.QueryRow(`SELECT sub2_policy FROM accounts WHERE email='legacy-free@example.test'`).Scan(&free); err != nil {
+		t.Fatal(err)
+	}
+	if paid != Sub2PolicyUnknown || free != Sub2PolicyUnknown {
+		t.Fatalf("migration policies paid=%q free=%q", paid, free)
+	}
+}
+
 func TestDeleteAccountByIDRejectsBusy(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()

@@ -74,6 +74,7 @@ type AccountCheck struct {
 	State               string `json:"state"`
 	CredentialAttemptID *int64 `json:"credential_attempt_id"`
 	Freshness           string `json:"freshness"`
+	RequiredAction      string `json:"required_action,omitempty"`
 	Outcome             string `json:"outcome,omitempty"`
 	SkipReason          string `json:"skip_reason,omitempty"`
 	RequestAttempted    *bool  `json:"request_attempted"`
@@ -119,9 +120,35 @@ type AccountCheckSummary struct {
 	AccountID                int64         `json:"account_id"`
 	Eligible                 bool          `json:"eligible"`
 	IneligibleReason         string        `json:"ineligible_reason,omitempty"`
+	RequiredAction           string        `json:"required_action,omitempty"`
 	CooldownRemainingSeconds int           `json:"cooldown_remaining_seconds"`
 	LatestTask               *AccountCheck `json:"latest_task"`
 	LastResult               *AccountCheck `json:"last_result"`
+}
+
+func requiredActionForCheck(check *AccountCheck) string {
+	if check == nil || check.State != "finished" || check.Freshness != "current" {
+		return ""
+	}
+	evidence := AccountCheckResult{ErrorCode: check.ErrorCode, StreamErrorCode: check.StreamErrorCode, Outcome: check.Outcome}
+	if status, _ := lifecycleStatusForAccountCheck(evidence); status != "" {
+		return ""
+	}
+	for _, value := range []string{check.ErrorCode, check.StreamErrorCode, check.Outcome} {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "token_revoked", "credential_revoked", "unauthorized", "auth_failed", "authentication_failed":
+			return "reauthorize"
+		case "credential_missing", "credential_incomplete", "access_token_expired", "token_expired":
+			return "verify_remote_refresh"
+		}
+	}
+	// A bare 401 has no machine-readable cause. Only then fall back to
+	// reauthorization. Explicit expiry codes above mean the remote refresh
+	// path should get the first chance, even when the transport used 401.
+	if (check.HTTPStatus != nil && *check.HTTPStatus == 401) || (check.StreamErrorStatus != nil && *check.StreamErrorStatus == 401) {
+		return "reauthorize"
+	}
+	return ""
 }
 
 func (s *Store) migrateAccountChecks() error {
@@ -248,6 +275,7 @@ func scanCheck(row scanner) (AccountCheck, error) {
 	} else if version.Valid && version.Int64 == current && (version.Int64 > 0 || c.Outcome == "credential_missing") {
 		c.Freshness = "current"
 	}
+	c.RequiredAction = requiredActionForCheck(&c)
 	return c, nil
 }
 func readChecks(ctx context.Context, tx *sql.Tx, where string, args ...any) ([]AccountCheck, error) {
@@ -499,17 +527,16 @@ func (s *Store) claimAccountCheck(ctx context.Context) (*AccountCheckWork, bool,
 		return nil, false, err
 	}
 	if access == "" || version == 0 || chatGPTID == "" {
-		result := AccountCheckResult{Outcome: "credential_incomplete", ErrorCode: "credential_incomplete", Message: "本地凭据信息不完整，请重新登录", FailureStage: "precheck"}
+		result := AccountCheckResult{Outcome: "credential_incomplete", ErrorCode: "credential_incomplete", Message: "本地凭据信息不完整", FailureStage: "precheck"}
 		if access == "" {
 			result.Outcome = "credential_missing"
 			result.ErrorCode = "credential_missing"
-			result.Message = "缺少访问令牌，请重新登录"
+			result.Message = "缺少本地访问令牌"
 		} else if version == 0 {
 			result.ErrorCode = "credential_version_missing"
-			result.Message = "缺少可靠凭据版本，请重新登录"
+			result.Message = "缺少本地凭据版本"
 		}
-		// The worker owns all terminal results, including local prechecks, so
-		// recovery hooks observe missing credentials just like an upstream 401.
+		// The worker persists local prechecks alongside upstream observations.
 		return &AccountCheckWork{Batch: batch, Check: item, PrecheckResult: &result}, false, nil
 	}
 	return &AccountCheckWork{Batch: batch, Check: item, AccessToken: access, ChatGPTAccountID: chatGPTID, Proxy: proxy}, false, nil
@@ -698,6 +725,9 @@ func (s *Store) ListAccountCheckBatches(ctx context.Context, activeOnly bool, li
 	}
 	return batches, rows.Err()
 }
+
+const accountCheckDestinationPredicate = `(?='' OR b.destination_key=? OR (b.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=c.account_id AND legacy_dest.state='imported' AND legacy_dest.sub2_account_id>0)=1 AND EXISTS(SELECT 1 FROM sub2_imports legacy_match WHERE legacy_match.account_id=c.account_id AND legacy_match.destination_key=? AND legacy_match.state='imported' AND legacy_match.sub2_account_id>0)))`
+
 func (s *Store) ListAccountChecks(ctx context.Context, accountID int64, limit int, destinations ...string) ([]AccountCheck, error) {
 	if limit < 1 || limit > 20 {
 		limit = 20
@@ -711,8 +741,22 @@ func (s *Store) ListAccountChecks(ctx context.Context, accountID int64, limit in
 	if len(destinations) > 0 {
 		destination = strings.TrimSpace(destinations[0])
 	}
-	return readChecks(ctx, tx, ` WHERE c.account_id=? AND (?='' OR b.destination_key=? OR (b.destination_key='' AND (SELECT COUNT(DISTINCT legacy_dest.destination_key) FROM sub2_imports legacy_dest WHERE legacy_dest.account_id=c.account_id AND legacy_dest.state='imported' AND legacy_dest.sub2_account_id>0)=1 AND EXISTS(SELECT 1 FROM sub2_imports legacy_match WHERE legacy_match.account_id=c.account_id AND legacy_match.destination_key=? AND legacy_match.state='imported' AND legacy_match.sub2_account_id>0))) ORDER BY c.id DESC LIMIT ?`, accountID, destination, destination, destination, limit)
+	return readChecks(ctx, tx, ` WHERE c.account_id=? AND `+accountCheckDestinationPredicate+` ORDER BY c.id DESC LIMIT ?`, accountID, destination, destination, destination, limit)
 }
+
+// LatestFinishedAccountCheck reads the current observation even when newer
+// attempts were skipped, canceled or are still running.
+func (s *Store) LatestFinishedAccountCheck(ctx context.Context, accountID int64, destination string) (*AccountCheck, error) {
+	check, err := scanCheck(s.db.QueryRowContext(ctx, checkSelect+` WHERE c.account_id=? AND c.state='finished' AND `+accountCheckDestinationPredicate+` ORDER BY c.id DESC LIMIT 1`, accountID, destination, destination, destination))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &check, nil
+}
+
 func (s *Store) ListAccountCheckSummaries(ctx context.Context, destinations ...string) (map[int64]AccountCheckSummary, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
@@ -767,6 +811,7 @@ func (s *Store) ListAccountCheckSummaries(ctx context.Context, destinations ...s
 		}
 		if item.State == "finished" && (summary.LastResult == nil || item.ID > summary.LastResult.ID) {
 			summary.LastResult = item
+			summary.RequiredAction = item.RequiredAction
 		}
 		summaries[id] = summary
 	}

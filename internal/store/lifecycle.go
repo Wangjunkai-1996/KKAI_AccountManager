@@ -35,13 +35,9 @@ func isOfficialLifecycleStatus(status string) bool {
 
 func lifecycleStatusForAccountCheck(result AccountCheckResult) (string, string) {
 	for _, candidate := range []string{result.ErrorCode, result.StreamErrorCode, result.Outcome} {
-		switch strings.ToLower(strings.TrimSpace(candidate)) {
-		case "account_deleted", "user_deleted", "deleted":
-			return "deleted", strings.ToLower(strings.TrimSpace(candidate))
-		case "account_deactivated", "user_deactivated", "account_disabled", "user_disabled", "deactivated":
-			return "deactivated", strings.ToLower(strings.TrimSpace(candidate))
-		case "deleted_or_deactivated":
-			return "deleted_or_deactivated", "deleted_or_deactivated"
+		code := strings.ToLower(strings.TrimSpace(candidate))
+		if status := lifecycleStatusFromFailure("", code); status != "" {
+			return status, code
 		}
 	}
 	return "", ""

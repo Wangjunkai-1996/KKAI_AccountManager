@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/accountstate"
 )
 
 // LoginErrorInfo is the safe, structured form of a login failure. Message is
@@ -375,13 +377,7 @@ func accountStatusForAuthError(code, message string) string {
 	if strings.Contains(strings.ToLower(strings.Join(strings.Fields(message), " ")), deletedOrDeactivated) {
 		return "deleted_or_deactivated"
 	}
-	switch normalizeAuthCode(code) {
-	case "account_deleted", "user_deleted":
-		return "deleted"
-	case "account_deactivated", "user_deactivated", "account_disabled", "user_disabled":
-		return "deactivated"
-	}
-	return ""
+	return accountstate.OfficialStatus(code)
 }
 
 func normalizeAuthCode(raw string) string {

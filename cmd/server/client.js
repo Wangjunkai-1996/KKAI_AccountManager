@@ -486,7 +486,9 @@ historyGrid.addEventListener('click', event => {
     if (button.dataset.historyAction === 'recovery-history') {
         toggleHistoryRecoveryPopover(id, button);
     } else if (button.dataset.historyAction === 'relogin' || button.dataset.historyAction === 'relogin-deliver') {
-        reloginHistory(id, button.dataset.historyAction === 'relogin-deliver');
+        const expected = button.dataset.bindingOperation !== undefined ? { operation_id: button.dataset.bindingOperation,
+            sub2_account_id: Number(button.dataset.remoteId), credential_version: Number(button.dataset.credentialVersion) } : undefined;
+        reloginHistory(id, button.dataset.historyAction === 'relogin-deliver', expected);
     } else if (button.dataset.historyAction === 'reimport') {
         reimportRemoteMissingHistory(id);
     } else if (button.dataset.historyAction === 'import') {
@@ -839,10 +841,10 @@ function renderRecoverySettings() {
         : !running ? '已开启 · 暂停运行' : recoverySettings.scanning ? '正在巡检…' : '已开启 · 后台运行';
     if (!autoRecoveryDetail) return;
     const parts = [running
-        ? `每 ${Number(recoverySettings.interval_seconds) || 60} 秒巡检 Sub2 异常账号，确认 401 或凭据失效后重新登录、写回凭据并恢复调度。关闭页面后仍继续，开关已保存。`
+        ? `每 ${Number(recoverySettings.interval_seconds) || 60} 秒巡检 Sub2 异常账号，检测结果会说明需要重新授权或核对续期。关闭页面后仍继续，开关已保存。`
         : enabled ? '自动恢复开关已保存，当前暂停运行。'
         : recoverySettings.blocked_reason ? '自动恢复已关闭，运行阻塞仍需处理。'
-        : '开启后立即巡检，此后每 60 秒检查 Sub2 异常账号；也可点击账号旁的“检测并恢复”。'];
+        : '开启后立即巡检，此后每 60 秒检查 Sub2 异常账号。也可点击账号旁的“检测当前凭据”。'];
     if (recoverySettings.blocked_reason) parts.push(`暂停原因：${recoverySettings.blocked_reason}`);
     if (recoverySettings.last_scan_at) parts.push(`上次巡检：${formatHistoryTime(recoverySettings.last_scan_at)}`);
     if (running && recoverySettings.next_scan_at) parts.push(`下次巡检：${formatHistoryTime(recoverySettings.next_scan_at)}`);
@@ -2092,6 +2094,8 @@ function historyRecoveryActive(task) {
 function historyRecoveryAction(account) {
     const blocked = sub2AutomationBlock(account);
     if (blocked || terminalHistoryAccount(account)) return { visible: false, disabled: true, label: '查看详情', reason: blocked?.label || '官方账号已删除或停用，自动处理已终止', resume: false };
+    const required = historyCheckAction(account);
+    if (required) return { visible: false, disabled: true, reason: required.label, resume: false };
     const state = account.sub2Status;
     const { recovery: task, delivery } = historyAccountTasks(account);
     const loginPaused = automationStopped(account)?.code === 'login';
@@ -2118,10 +2122,23 @@ function historyRecoveryAction(account) {
         visible: linked || Boolean(task),
         disabled: active || Boolean(reason),
         label: historyRecoveryRequests.has(account.id) ? '提交中…' : checking ? '检测中…'
-            : historyRecoveryActive(task) ? '恢复中…' : resumable ? '继续恢复' : '检测并恢复',
-        reason: reason || (resumable ? '继续已保存的恢复任务，完成凭据写回与调度恢复' : '先检测当前凭据，确认失效后重新登录并恢复 Sub2 调度'),
+            : historyRecoveryActive(task) ? '恢复中…' : resumable ? '继续恢复' : '检测当前凭据',
+        reason: reason || (resumable ? '继续已保存的恢复任务' : '检测当前凭据，查看是否需要核对续期或重新授权'),
         resume: Boolean(resumable)
     };
+}
+
+function historyCheckAction(account) {
+    const action = historyChecks.get(account.id)?.required_action;
+    if (action !== 'reauthorize' && action !== 'verify_remote_refresh') return null;
+    const state = account.sub2Status;
+    if (historyPoolState(account).kind !== 'present') return { label: '原 Sub2 绑定待核对', detail: '请刷新账号历史，核对对应的 Sub2 ID 和关联状态。' };
+    if (state?.schedulable === false && ['active', 'available', 'enabled'].includes(state.status)) {
+        return { label: '账号已人工暂停', detail: '保持原 Sub2 调度设置' };
+    }
+    return action === 'reauthorize'
+        ? { label: '需要重新授权', detail: '请账号持有人通过原 Sub2 账号的官方 OAuth 流程授权。完成后刷新账号历史，核对原绑定和调度状态。' }
+        : { label: '需要核对 Sub2 正常续期', detail: '请先查看原 Sub2 账号的正常续期结果。续期授权失效时，由账号持有人完成官方 OAuth 授权后刷新核对。' };
 }
 
 function renderHistoryRecovery(account) {
@@ -2133,6 +2150,8 @@ function renderHistoryRecovery(account) {
     const { recovery: latestRecovery, delivery } = historyAccountTasks(account);
     const recovery = latestRecovery?.purpose === 'delivery' ? null : latestRecovery;
     const lines = [];
+    const required = !terminalHistoryAccount(account) && historyCheckAction(account);
+    if (required) lines.push(`待处理：${required.label} · 检测于 ${formatHistoryTime(result?.finished_at || result?.checked_at)} · ${required.detail}`);
     if (['queued', 'running'].includes(latest?.state)) lines.push(latest.state === 'queued' ? '检测已排队，等待确认凭据状态' : '正在检测当前凭据');
     else if (latest && latest.state !== 'finished') {
         const names = { skipped: '检测已跳过', canceled: '检测已取消', interrupted: '检测中断' };
@@ -2149,7 +2168,7 @@ function renderHistoryRecovery(account) {
         const resultText = names[result.outcome] || result.message || '检测结束，详见检测详情';
         lines.push(`检测：${resultText}${result.http_status ? `（HTTP ${result.http_status}）` : ''}${result.freshness === 'stale' ? ' · 旧凭据结果' : ''}${result.finished_at ? ` · ${formatHistoryTime(result.finished_at)}` : ''}`);
     }
-    if (recovery) lines.push(`${historyRecoveryNames[recovery.state] || '恢复状态待确认'}${recovery.last_error ? `：${recovery.last_error}` : ''}${recovery.updated_at ? ` · ${formatHistoryTime(recovery.updated_at)}` : ''}${recovery.requires_action ? ` · ${recoveryDiagnosticParts(recovery).join(' · ')}` : ''}`);
+    if (recovery) lines.push(`${required && ['completed', 'success'].includes(recovery.state) ? '历史记录 · ' : ''}${historyRecoveryNames[recovery.state] || '恢复状态待确认'}${recovery.last_error ? `：${recovery.last_error}` : ''}${recovery.updated_at ? ` · ${formatHistoryTime(recovery.updated_at)}` : ''}${recovery.requires_action ? ` · ${recoveryDiagnosticParts(recovery).join(' · ')}` : ''}`);
     if (delivery?.last_error && delivery.state !== 'completed') lines.push(`交付：${delivery.last_error}`);
     if (historyRecoveryNotices.has(account.id)) lines.push(historyRecoveryNotices.get(account.id));
     return lines.map(line => `<div class="history-task-status">${escapeHTML(line)}</div>`).join('');
@@ -2334,7 +2353,20 @@ function canReimportRemoteMissing(account) {
 }
 
 function canReloginAndDeliver(account) {
-    return !['missing', 'free_local'].includes(sub2AutomationBlock(account)?.code) && !terminalHistoryAccount(account) && historyDeliveries.get(account.id)?.requires_action === true;
+    return !['missing', 'free_local'].includes(sub2AutomationBlock(account)?.code) && !terminalHistoryAccount(account) && !historyCheckAction(account) && historyDeliveries.get(account.id)?.requires_action === true &&
+        (historyImportState(account) !== 'imported' || Boolean(historyBindingForUpdate(account)));
+}
+
+function historyBindingForUpdate(account) {
+    if (!canReloginHistory(account) || automationStopped(account) || account.sub2Policy !== 'eligible' ||
+        !Number.isSafeInteger(account.credentialVersion) || account.credentialVersion <= 0 ||
+        !historySub2Configured || !historyImportsAvailable || historyPoolState(account).kind !== 'present') return null;
+    const binding = historyImports.get(account.id), state = account.sub2Status;
+    if (binding?.state !== 'imported' || binding.create_acknowledged !== true || !binding.operation_id ||
+        !Number.isSafeInteger(binding.sub2_account_id) || binding.sub2_account_id <= 0 || Number(state.sub2AccountID) !== binding.sub2_account_id ||
+        ['disabled', 'inactive', 'deleted'].includes(state.status) || (state.schedulable === false && ['active', 'available', 'enabled'].includes(state.status))) return null;
+    if (historyCheckAction(account) || historyRecoveryActive(historyAccountTasks(account).recovery)) return null;
+    return binding;
 }
 
 function canBatchRelogin(account) {
@@ -2483,7 +2515,10 @@ function renderHistory() {
         const expiry = historyExpiryState(account);
         const expiryBadge = ['soon', 'expired'].includes(expiry.kind) ? `<span class="history-expiry ${expiry.kind}" title="这里只表示 OAuth 访问令牌有效期，不代表账号或 Refresh Token 已失效">${escapeHTML(expiry.label)}</span>` : '';
         const recoveryAction = historyRecoveryAction(account);
+        const updateBinding = historyBindingForUpdate(account);
+        const bindingAttributes = updateBinding ? `data-binding-operation="${escapeHTML(updateBinding.operation_id)}" data-remote-id="${updateBinding.sub2_account_id}" data-credential-version="${account.credentialVersion}"` : '';
         const recoveryButton = recoveryAction.visible && !recoveryAction.disabled ? `<button class="btn-secondary history-primary-action" type="button" data-history-action="recover" data-history-id="${escapeHTML(account.id)}" title="${escapeHTML(recoveryAction.reason)}" ${historyActionsLocked() || busy ? 'disabled' : ''}>${recoveryAction.label}</button>` : '';
+        const requiredAction = historyCheckAction(account)?.label;
         const copyRefreshButton = account.refreshToken ? `
                     <button class="btn-secondary" type="button" data-history-action="copy-refresh-token" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy ? 'disabled' : ''}>
                         复制 Refresh Token
@@ -2502,7 +2537,7 @@ function renderHistory() {
         const primaryProblem = discarded ? `废弃原因：${errorSummary}` : official ? `官方账号${lifecycleStatusName(official)}，已停止登录` : stopped
             ? [stopped.label, recentLoginFailure].filter(Boolean).join('；') : errorSummary || importError || account.sub2Status.errorMessage;
         const checkState = historyChecks.get(account.id)?.latest_task?.state;
-        const workflow = official ? (importState === 'cleanup_pending' ? '后台清理 Sub2 中' : '已终止') : stopped?.code === 'free_local' ? 'Free · 仅本地' : stopped ? '自动处理已暂停' : [delivery, recovery, repair, recheck].some(task => task?.requires_action && !['completed', 'success', 'canceled'].includes(task.state)) ? '需处理'
+        const workflow = official ? (importState === 'cleanup_pending' ? '后台清理 Sub2 中' : '已终止') : stopped?.code === 'free_local' ? 'Free · 仅本地' : stopped ? '自动处理已暂停' : requiredAction ? requiredAction : [delivery, recovery, repair, recheck].some(task => task?.requires_action && !['completed', 'success', 'canceled'].includes(task.state)) ? '需处理'
             : ['queued', 'checking', 'recovery_queued', 'retry_wait'].includes(repair?.state) ? '资料更新处理中'
             : ['queued', 'running'].includes(checkState) ? (checkState === 'queued' ? '检测排队中' : '检测中')
             : ['running', 'pending'].includes(account.status) ? historyStatusName(account.status)
@@ -2544,7 +2579,7 @@ function renderHistory() {
                             ${stopped ? `<div class="history-more-status" role="status">${escapeHTML(stopped.label)}。${recentLoginFailure ? `${escapeHTML(recentLoginFailure)}${errorCode}${errorHTTPStatus}。` : ''}${official ? '官方终态账号不再提供登录或人工核对。' : stopped.code === 'free_local' ? '保留本地登录和凭据，不进入 Sub2。' : stopped.code === 'missing' ? '可仅重新登录 AUTH；也可明确选择“重新登录并导入 Sub2”重建。' : stopped.code === 'unmatched' ? '可更新资料、重新登录或手动首次导入。' : '可更新资料后手动重试；每次点击仅尝试一次，失败仍暂停。'}</div>` : ''}
                             ${stopped?.code === 'missing' ? '' : `<button class="btn-secondary" type="button" data-history-action="credentials" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy || account.status === 'running' ? 'disabled' : ''}>更新资料</button>`}
                             ${canReloginHistory(account) || busy ? `<button class="btn-secondary" type="button" data-history-action="relogin" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy || !canReloginHistory(account) ? 'disabled' : ''}>${busy ? '<span class="spinner"></span> 登录中' : '仅重新登录 AUTH'}</button>` : ''}
-                            ${canReloginHistory(account) && canReloginAndDeliver(account) ? `<button class="btn-secondary" type="button" data-history-action="relogin-deliver" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy ? 'disabled' : ''}>重新登录并交付</button>` : ''}
+                            ${canReloginHistory(account) && canReloginAndDeliver(account) ? `<button class="btn-secondary" type="button" data-history-action="relogin-deliver" data-history-id="${escapeHTML(account.id)}" ${bindingAttributes} ${historyActionsLocked() || busy ? 'disabled' : ''}>重新登录并交付</button>` : ''}
                             ${canReimportRemoteMissing(account) ? `<button class="btn-secondary" type="button" data-history-action="reimport" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy ? 'disabled' : ''}>重新登录并导入 Sub2</button>` : ''}
                             ${stopped && !canImportToSub2(account) ? '' : `<button class="btn-secondary" type="button" data-history-action="${importState === 'unknown' || importState === 'confirming' ? 'reconcile' : 'import'}" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy || !canImportToSub2(account) && !['unknown', 'confirming'].includes(importState) ? 'disabled' : ''}>${escapeHTML(importStateText)}</button>`}
                             <button class="btn-secondary" type="button" data-history-action="delete" data-history-id="${escapeHTML(account.id)}" ${historyActionsLocked() || busy ? 'disabled' : ''}>${deleted ? '清理记录' : '删除记录'}</button>
@@ -2873,10 +2908,17 @@ function renderHistoryDetail(account, attempts, recoveryFailures = [], recoveryF
         <div class="history-detail-attempts"><p class="hint">列表中的有效期来自 OAuth 访问令牌；访问令牌过期后，Refresh Token 是否可用不由此字段判断，通常仍可用于重新登录。最近 ${attempts.length} 次尝试</p>${attemptHTML}</div>${failureHTML}`;
 }
 
-async function performHistoryRelogin(id, { autoDeliver = false, deliveryOptions } = {}) {
+async function performHistoryRelogin(id, { autoDeliver = false, deliveryOptions, expectedBinding } = {}) {
     const account = historyAccounts.find(item => item.id === id);
     if (!account) return { success: false, error: '账号不存在' };
     if (!canReloginHistory(account)) return { success: false, error: '账号正在登录或官方已删除，请查看详情' };
+    if (autoDeliver && !canReloginAndDeliver(account)) return { success: false, error: '当前交付状态已变化，请刷新核对' };
+    if (autoDeliver && (expectedBinding || historyImportState(account) === 'imported')) {
+        const binding = historyBindingForUpdate(account);
+        if (!binding || binding.operation_id !== expectedBinding?.operation_id || binding.sub2_account_id !== expectedBinding?.sub2_account_id || account.credentialVersion !== expectedBinding?.credential_version) {
+            return { success: false, error: '原绑定或账号状态已变化，请刷新核对' };
+        }
+    }
     historyRefreshTokens.delete(String(id));
     account.refreshToken = '';
     historyBusyID = id;
@@ -2889,6 +2931,8 @@ async function performHistoryRelogin(id, { autoDeliver = false, deliveryOptions 
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
             body: JSON.stringify({ account_id: Number(id), auto_deliver: autoDeliver, manual_attempt: true,
+                ...(expectedBinding ? { expected_binding_operation_id: expectedBinding.operation_id, expected_remote_account_id: expectedBinding.sub2_account_id,
+                    expected_credential_version: expectedBinding.credential_version } : {}),
                 ...(deliveryOptions ? { delivery_options: deliveryOptions } : {}) }),
             signal: controller.signal
         });
@@ -2926,7 +2970,7 @@ async function performHistoryRelogin(id, { autoDeliver = false, deliveryOptions 
     }
 }
 
-async function reloginHistory(id, autoDeliver = false) {
+async function reloginHistory(id, autoDeliver = false, expectedBinding) {
     if (historyActionsLocked() || historyBusyID) return;
     processing = true;
     historyBatchSummary = '';
@@ -2937,7 +2981,7 @@ async function reloginHistory(id, autoDeliver = false) {
     historySearchInput.disabled = true;
     document.body.classList.add('processing');
     try {
-        const result = await performHistoryRelogin(id, { autoDeliver });
+        const result = await performHistoryRelogin(id, { autoDeliver, expectedBinding });
         historyBatchSummary = result.message || result.error;
         // Refresh once so the row reflects the persisted status and a deleted
         // account disappears immediately.

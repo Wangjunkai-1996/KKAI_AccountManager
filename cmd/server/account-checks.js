@@ -18,6 +18,10 @@
     const credentialOutcomes = ['credential_missing', 'credential_incomplete', 'access_token_expired', 'token_expired', 'token_revoked', 'credential_revoked', 'auth_failed', 'authentication_failed'];
     const networkOutcomes = ['network_error', 'proxy_error', 'timeout'];
     const permissionOutcomes = ['forbidden', 'region_restricted', 'model_unavailable'];
+    const requiredActions = {
+        reauthorize: '需要重新授权',
+        verify_remote_refresh: '需要核对 Sub2 正常续期'
+    };
     const selected = new Set(), rows = new Map(), summaries = new Map(), recoveryStates = new Map();
     let accounts = new Map(), filteredIDs = [], page = 1, pageSize = 20, available = false;
     let capabilities = {}, batch = null, batchItems = [], activeID = '', submitting = false, stopping = false, recovering = false;
@@ -46,6 +50,19 @@
         return '本次持有凭据的历史观察';
     }
     function remaining(summary) { return Math.max(0, Math.ceil(((summary?._cooldownUntil || 0) - Date.now()) / 1000)); }
+    function requiredAction(summary) {
+        const action = String(summary?.required_action || '').trim();
+        return Object.hasOwn(requiredActions, action) ? action : '';
+    }
+    function requiredActionText(summary, result) {
+        const action = requiredAction(summary);
+        if (!action) return '';
+        const detected = result?.finished_at || result?.checked_at;
+        const timeText = detected ? ` · 检测于 ${time(detected)}` : '';
+        return action === 'reauthorize'
+            ? `${requiredActions[action]}${timeText} · 请账号持有人通过原 Sub2 账号的官方 OAuth 流程授权，再刷新账号历史核对原绑定`
+            : `${requiredActions[action]}${timeText} · 请先核对原 Sub2 账号的正常续期结果，续期授权失效时由账号持有人重新授权`;
+    }
     function loginStopped(value, account) {
         if (typeof loginTaskSuperseded === 'function' && loginTaskSuperseded(account, value)) return false;
         return Boolean(value && (value.manual_reason ||
@@ -110,7 +127,7 @@
         return Number.isFinite(checkID) && checkID > 0 && checkID === Number(result.id);
     }
     function canStartRecovery(account, result, recovery) {
-        return available && canRecover(account, result, recovery) && !recoveryActiveStates.has(recovery?.state) &&
+        return available && !requiredAction(summaries.get(String(account?.id))) && canRecover(account, result, recovery) && !recoveryActiveStates.has(recovery?.state) &&
             !(['completed', 'success'].includes(recovery?.state) && recoveryMatchesResult(recovery, result));
     }
     function scheduleRecoveryPoll(id, delay = 1500) {
@@ -227,6 +244,7 @@
         const account = accounts.get(id), summary = summaries.get(id), result = summary?.last_result, task = summary?.latest_task;
         const storedRecovery = recoveryStates.get(id);
         const recovery = typeof loginTaskSuperseded === 'function' && loginTaskSuperseded(account, storedRecovery) ? null : storedRecovery;
+        const required = requiredAction(summary);
         const recoverable = canRecover(account, result, recovery);
         const blocked = automationBlocked(account);
         put(parts.email, account?.email || '账号已删除');
@@ -236,11 +254,11 @@
         put(parts.time, result ? `${time(result.finished_at || result.checked_at)} · ${(Number(result.duration_ms || 0) / 1000).toFixed(1)} 秒 · ${result.route_label || '出口未记录'} · ${result.model || capabilities.model || ''}` : 'AUTH 记录已导入');
         const cooldown = remaining(summary);
         put(parts.task, task && task.state !== 'finished' ? `${taskNames[task.state] || task.state}${task.skip_reason ? `：${skipNames[task.skip_reason] || '当前不可执行'}` : ''}${cooldown ? ` · ${cooldown} 秒后可重测` : ''}` : cooldown ? `${cooldown} 秒后可重新检测` : '');
-        put(parts.recoveryStatus, blocked ? '自动处理已暂停 · 关联或登录状态不允许检测恢复' : recovery ? recoveryLabel(recovery) : '');
-        parts.recoveryStatus.hidden = !blocked && !recovery;
+        put(parts.recoveryStatus, blocked ? '自动处理已暂停 · 关联或登录状态不允许检测恢复' : requiredActionText(summary, result) || (recovery ? recoveryLabel(recovery) : ''));
+        parts.recoveryStatus.hidden = !blocked && !required && !recovery;
         const recoveryState = String(recovery?.state || '').toLowerCase();
         const recoveryActive = recoveryActiveStates.has(recoveryState);
-        parts.recover.hidden = blocked || !recoverable && !recoveryActive;
+        parts.recover.hidden = blocked || Boolean(required) || !recoverable && !recoveryActive;
         const recoveryCurrent = ['completed', 'success'].includes(recoveryState) && recoveryMatchesResult(recovery, result);
         parts.recover.disabled = !canStartRecovery(account, result, recovery);
         put(parts.recover, recoveryActive ? '恢复中…' :
@@ -377,7 +395,10 @@
             const id = String(item.account_id), summary = summaries.get(id);
             if (!summary) continue;
             if (!summary.latest_task || Number(item.id) >= Number(summary.latest_task.id)) summary.latest_task = item;
-            if (item.state === 'finished' && (!summary.last_result || Number(item.id) >= Number(summary.last_result.id))) summary.last_result = item;
+            if (item.state === 'finished' && (!summary.last_result || Number(item.id) >= Number(summary.last_result.id))) {
+                summary.last_result = item;
+                summary.required_action = item.required_action;
+            }
         }
         updateBadge();
         if (detailID) {

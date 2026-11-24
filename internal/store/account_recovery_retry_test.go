@@ -144,7 +144,7 @@ func TestRecoveryRetryCheckpointNeverAdoptsNewerLogin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	version, err := lease.UpdateOAuthResult(ctx, task.ID, Result{AccessToken: "checkpoint-at", RefreshToken: "checkpoint-rt"})
+	version, err := lease.UpdateOAuthResult(ctx, task.ID, Result{AccessToken: "checkpoint-at", RefreshToken: "checkpoint-rt", PlanType: "plus"})
 	lease.Release()
 	if err != nil {
 		t.Fatal(err)
@@ -166,7 +166,7 @@ func TestRecoveryRetryCheckpointNeverAdoptsNewerLogin(t *testing.T) {
 	if _, err := s.RecordAccountRecoveryFailure(ctx, task.ID, RecoveryFailure{State: RecoveryFailed, RetryAction: "relogin"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateOAuthResultByID(ctx, id, Result{AccessToken: "newer-at", RefreshToken: "newer-rt"}); err != nil {
+	if err := s.UpdateOAuthResultByID(ctx, id, Result{AccessToken: "newer-at", RefreshToken: "newer-rt", PlanType: "plus"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.RetryAccountRecoveryTask(ctx, task.ID, true); !errors.Is(err, ErrAccountRecoveryVersionChanged) {

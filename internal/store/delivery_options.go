@@ -176,6 +176,13 @@ func (s *Store) QueueAccountDelivery(ctx context.Context, accountID int64, desti
 	if version <= 0 {
 		return AccountDelivery{}, errors.New("账号尚无成功登录凭据")
 	}
+	plan, err := s.ObservedCredentialPlan(ctx, accountID, version)
+	if err != nil {
+		return AccountDelivery{}, err
+	}
+	if !IsSub2PaidPlan(plan) {
+		return AccountDelivery{}, ErrSub2PlanIneligible
+	}
 	raw, err := json.Marshal(options)
 	if err != nil {
 		return AccountDelivery{}, err

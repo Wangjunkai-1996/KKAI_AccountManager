@@ -181,11 +181,11 @@ func (s *accountCheckService) process(work *store.AccountCheckWork) {
 		return
 	}
 	if probe.AccessTokenExpired(work.AccessToken, time.Now()) {
-		s.finish(work.Check.ID, accountID, store.AccountCheckResult{Outcome: "access_token_expired", ErrorCode: "access_token_expired", Message: "本地访问令牌已过期，请重新登录后检测", FailureStage: "precheck"})
+		s.finish(work.Check.ID, accountID, store.AccountCheckResult{Outcome: "access_token_expired", ErrorCode: "access_token_expired", Message: "本地访问令牌已过期，请核对原 Sub2 账号的正常续期状态", FailureStage: "precheck"})
 		return
 	}
 	if strings.ContainsAny(work.AccessToken+work.ChatGPTAccountID, "\r\n") {
-		s.finish(work.Check.ID, accountID, store.AccountCheckResult{Outcome: "credential_incomplete", ErrorCode: "credential_incomplete", Message: "本地凭据格式不完整，请重新登录", FailureStage: "precheck"})
+		s.finish(work.Check.ID, accountID, store.AccountCheckResult{Outcome: "credential_incomplete", ErrorCode: "credential_incomplete", Message: "本地凭据格式不完整，请核对原 Sub2 账号的正常续期状态", FailureStage: "precheck"})
 		return
 	}
 	markCtx, markCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -262,41 +262,6 @@ func (s *accountCheckService) finish(id, accountID int64, result store.AccountCh
 		}
 		cleanupCancel()
 	}
-	// Missing bindings can cancel an individual in-flight check while its
-	// batch completes normally. Never enqueue from that superseded result.
-	committed := false
-	if _, checks, readErr := s.store.GetAccountCheckBatch(ctx, batch.ID); readErr == nil {
-		for _, check := range checks {
-			if check.ID == id && check.State == "finished" && check.Freshness == "current" {
-				committed = true
-				break
-			}
-		}
-	}
-	if committed && !result.Canceled && batch.State != "stopping" && batch.State != "stopped" && accountID > 0 && accountRecoveryService != nil && recoveryCheckCandidate(result) {
-		explicit, err := s.store.ExplicitRecoveryCheck(ctx, batch.ID)
-		if err == nil && explicit {
-			manual, claimed, claimErr := s.store.ClaimExplicitRecoveryCheck(ctx, batch.ID)
-			if claimErr != nil || !claimed {
-				s.notify()
-				return
-			}
-			// This single-account intent survives a page close or an unrelated
-			// change to the automatic switch. The shared enqueue path revalidates
-			// identity, state and credentials before any recovery mutation.
-			recoveryCtx, recoveryCancel := context.WithTimeout(accountRecoveryService.ctx, 10*time.Second)
-			if accountRecoveryService.remoteRecoverySuspect(recoveryCtx, accountID) {
-				if _, _, err := accountRecoveryService.enqueueWithIntent(recoveryCtx, accountID, manual, false); err != nil {
-					accountRecoveryService.recordRecoveryEnqueueFailure(accountID)
-				}
-			} else {
-				accountRecoveryService.recordRecoveryEnqueueFailure(accountID)
-			}
-			recoveryCancel()
-		} else if err == nil {
-			accountRecoveryService.enqueueAutomatic(accountID)
-		}
-	}
 	s.notify()
 }
 
@@ -306,19 +271,6 @@ func sub2DeletionConfirmed(outcome string, errorCodes ...string) bool {
 	}
 	for _, code := range errorCodes {
 		if accountDeactivationConfirmed(code) {
-			return true
-		}
-	}
-	return false
-}
-
-func recoveryCheckCandidate(result store.AccountCheckResult) bool {
-	if result.HTTPStatus != nil && *result.HTTPStatus == http.StatusUnauthorized {
-		return true
-	}
-	for _, value := range []string{result.Outcome, result.ErrorCode, result.StreamErrorCode} {
-		switch strings.ToLower(strings.TrimSpace(value)) {
-		case "credential_missing", "credential_incomplete", "access_token_expired", "token_expired", "token_revoked", "credential_revoked", "unauthorized", "auth_failed", "authentication_failed":
 			return true
 		}
 	}

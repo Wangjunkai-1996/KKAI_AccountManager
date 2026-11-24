@@ -308,6 +308,15 @@ func TestHistoryReloginBoundSavesOnlyToAUTH(t *testing.T) {
 	}
 
 	req.AutoDeliver = true
+	binding, err := f.store.GetSub2Import(ctx, "fixture", f.account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := f.store.GetAccountCredentialVersion(ctx, f.account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.expectedBinding = &store.HistoryBindingExpectation{Destination: "fixture", OperationID: binding.OperationID, RemoteID: binding.Sub2AccountID, CredentialVersion: version}
 	result, err = runWithHistoryAccount(ctx, f.account.ID, req, loginOnce)
 	if err != nil {
 		t.Fatal(err)
@@ -315,6 +324,13 @@ func TestHistoryReloginBoundSavesOnlyToAUTH(t *testing.T) {
 	delivery, ok := result.Delivery.(store.AccountDelivery)
 	if !ok || delivery.State != "queued" || delivery.OriginalBindingID == 0 || delivery.AllowCreate {
 		t.Fatal("explicit delivery did not capture the original binding")
+	}
+	_, err = runWithHistoryAccount(ctx, f.account.ID, req, func(context.Context) (*login.LoginResult, error) {
+		t.Fatal("a duplicate request started OAuth")
+		return nil, nil
+	})
+	if !errors.Is(err, store.ErrHistoryBindingChanged) {
+		t.Fatalf("duplicate bound delivery returned %v", err)
 	}
 	service.runOnce()
 	delivery, err = f.store.GetAccountDelivery(ctx, delivery.ID)
@@ -329,6 +345,49 @@ func TestHistoryReloginBoundSavesOnlyToAUTH(t *testing.T) {
 	task, err = f.store.GetAccountRecoveryTaskByID(ctx, task.ID)
 	if err != nil || task.State != store.RecoveryCompleted || f.applyCalls != 1 || f.testCalls != 1 || !f.schedule {
 		t.Fatalf("explicit delivery state=%s apply=%d probes=%d scheduled=%v err=%v", task.State, f.applyCalls, f.testCalls, f.schedule, err)
+	}
+}
+
+func TestHistoryDeliveryRejectsStaleBindingBeforeLogin(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	ctx := context.Background()
+	oldHistory, oldImporter := loginHistory, sub2Importer
+	loginHistory, sub2Importer = f.store, f.service.sub2
+	t.Cleanup(func() { loginHistory, sub2Importer = oldHistory, oldImporter })
+	account, err := f.store.GetAccountByID(ctx, f.account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := f.store.GetSub2Import(ctx, "fixture", account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, changed := range []string{"operation", "remote_id", "destination", "removed"} {
+		expected := &store.HistoryBindingExpectation{Destination: "fixture", OperationID: binding.OperationID, RemoteID: binding.Sub2AccountID, CredentialVersion: account.CredentialVersion}
+		switch changed {
+		case "operation":
+			expected.OperationID += "-stale"
+		case "remote_id":
+			expected.RemoteID++
+		case "destination":
+			expected.Destination = "other"
+		case "removed":
+			if _, err := f.db.Exec(`DELETE FROM sub2_imports WHERE id=?`, binding.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		req := LoginRequest{Email: account.Email, Password: "fixture", AutoDeliver: true, expectedBinding: expected}
+		_, err := runWithHistoryAccount(ctx, account.ID, req, func(context.Context) (*login.LoginResult, error) {
+			t.Fatalf("%s started a login", changed)
+			return nil, nil
+		})
+		current, readErr := f.store.GetAccountByID(ctx, account.ID)
+		if !errors.Is(err, store.ErrHistoryBindingChanged) || readErr != nil || current.AttemptCount != account.AttemptCount {
+			t.Fatalf("%s: login err=%v, attempts=%d, read err=%v", changed, err, current.AttemptCount, readErr)
+		}
+	}
+	if len(f.methods) != 0 {
+		t.Fatalf("stale requests reached Sub2: %v", f.methods)
 	}
 }
 
@@ -515,6 +574,10 @@ func TestSub2RecoveryRechecksLegacyIdentityRules(t *testing.T) {
 	f := newRecoveryFixture(t, false)
 	f.service.autoRecovery.Store(true)
 	if _, err := f.db.Exec(`UPDATE accounts SET status='failed',last_error_code='identity_mismatch' WHERE id=?`, f.account.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Historical tasks predate structured retry actions and failure stages.
+	if _, err := f.db.Exec(`UPDATE account_recovery_tasks SET retry_action='',failure_stage='',error_code='' WHERE id=?`, f.task.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.store.UpdateAccountRecoveryTask(context.Background(), f.task.ID, store.RecoveryUnknown, "old workspace check"); err != nil {

@@ -48,6 +48,27 @@ func TestOfficialLifecycleEventAndAccountTombstoneAreRetained(t *testing.T) {
 	}
 }
 
+func TestPaymentRequiredIsOfficialDeactivation(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	account, err := s.UpsertCredentials(ctx, Credentials{Email: "payment-required@example.test", Password: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := s.StartAttempt(ctx, account.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishAttempt(ctx, attempt.ID, false, nil, &Failure{Code: "payment_required", HTTPStatus: 402}); err != nil {
+		t.Fatal(err)
+	}
+	attempt.Release()
+	got, err := s.GetAccountByID(ctx, account.ID)
+	if err != nil || got.Status != "deactivated" || got.Sub2Policy != Sub2PolicyOfficialUnavailable {
+		t.Fatalf("payment-required account = %+v, err=%v", got, err)
+	}
+}
+
 func TestRecordLifecycleEventIsIdempotent(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()

@@ -126,26 +126,9 @@ func sub2RecoveryPoolCandidate(status sub2AccountStatus) bool {
 	if strings.EqualFold(strings.TrimSpace(status.Status), "error") {
 		return true
 	}
-	// An active account may still have an expired AUTH-local credential. The
-	// check result must prove that failure before the account can be recovered;
-	// the raw Sub2 status alone never triggers this path.
+	// Explicit checks may inspect an active, scheduled account. Its local
+	// observations can require operator action even when Sub2 is healthy.
 	return strings.EqualFold(strings.TrimSpace(status.Status), "active") && *status.Schedulable
-}
-
-func accountCheckRecoveryCandidate(check *store.AccountCheck) bool {
-	if check == nil || check.State != "finished" || check.Freshness != "current" {
-		return false
-	}
-	if check.HTTPStatus != nil && *check.HTTPStatus == http.StatusUnauthorized {
-		return true
-	}
-	for _, value := range []string{check.Outcome, check.ErrorCode, check.StreamErrorCode} {
-		switch strings.ToLower(strings.TrimSpace(value)) {
-		case "credential_missing", "credential_incomplete", "access_token_expired", "token_expired", "token_revoked", "credential_revoked", "unauthorized", "auth_failed", "authentication_failed":
-			return true
-		}
-	}
-	return false
 }
 
 func (s *sub2RecoveryService) scanSub2Accounts() {
@@ -182,7 +165,6 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 		return
 	}
 	ids := make([]int64, 0, len(statuses))
-	direct := make([]int64, 0)
 	unknown := 0
 	for id, status := range statuses {
 		if status.Unknown || status.Stale {
@@ -190,8 +172,6 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 		}
 		if sub2RecoverySuspect(status) {
 			ids = append(ids, id)
-		} else if sub2RecoveryPoolCandidate(status) && accountCheckRecoveryCandidate(checks[id].LastResult) {
-			direct = append(direct, id)
 		}
 	}
 	// Use the persisted latest check ID as the scan cursor. Accounts with no
@@ -210,8 +190,7 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 			return ids[i] < ids[j]
 		}
 	})
-	sort.Slice(direct, func(i, j int) bool { return direct[i] < direct[j] })
-	queued, waiting, submitted, toCheck := 0, 0, 0, make([]int64, 0)
+	waiting, submitted, toCheck := 0, 0, make([]int64, 0)
 	for _, id := range ids {
 		if !s.autoRecovery.Load() || ctx.Err() != nil {
 			return
@@ -226,15 +205,9 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 			continue
 		}
 		check := checks[id]
-		if check.LastResult != nil && check.LastResult.FinishedAt != nil && time.Since(time.UnixMilli(*check.LastResult.FinishedAt)) <= 5*time.Minute {
-			if _, err := s.validateCandidate(ctx, id); err == nil {
-				if _, _, err := s.enqueue(ctx, id, true); err == nil {
-					queued++
-				} else {
-					lastError = "部分账号恢复入队失败，请查看账号检测和恢复详情"
-				}
-				continue
-			}
+		if check.RequiredAction != "" {
+			waiting++
+			continue
 		}
 		if !check.Eligible || check.CooldownRemainingSeconds > 0 || (check.LatestTask != nil && (check.LatestTask.State == "queued" || check.LatestTask.State == "running")) {
 			waiting++
@@ -243,26 +216,6 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 		toCheck = append(toCheck, id)
 		if len(toCheck) == 100 {
 			break
-		}
-	}
-	for _, id := range direct {
-		if !s.autoRecovery.Load() || ctx.Err() != nil {
-			return
-		}
-		allowed, err := s.automaticRecoveryAllowed(ctx, id)
-		if err != nil {
-			lastError = "读取恢复记录失败"
-			return
-		}
-		if !allowed {
-			waiting++
-			continue
-		}
-		if _, _, err := s.enqueue(ctx, id); err == nil {
-			queued++
-		} else {
-			waiting++
-			lastError = "部分账号恢复入队失败，请查看账号检测和恢复详情"
 		}
 	}
 	if len(toCheck) > 0 && s.autoRecovery.Load() {
@@ -285,7 +238,7 @@ func (s *sub2RecoveryService) scanSub2Accounts() {
 			s.monitorMu.Unlock()
 		}
 	}
-	summary = fmt.Sprintf("待恢复账号 %d 个，提交检测 %d 个，直接提交恢复 %d 个，等待或冷却 %d 个", len(ids)+len(direct), submitted, queued, waiting)
+	summary = fmt.Sprintf("Sub2 异常账号 %d 个，提交检测 %d 个，等待处理或冷却 %d 个", len(ids), submitted, waiting)
 	if unknown > 0 {
 		summary += fmt.Sprintf("；%d 个状态暂时未知", unknown)
 	}
@@ -310,8 +263,7 @@ func (s *sub2RecoveryService) automaticRecoveryAllowed(ctx context.Context, id i
 	if previous.RetryAction != "" {
 		return s.successfulLoginSupersedesFailure(ctx, previous)
 	}
-	// Success is not a failed attempt: a newly revoked credential must be
-	// checked and recovered without waiting for the second delayed recheck.
+	// A completed operation does not delay a new check of a remote error.
 	if previous.State != store.RecoveryCompleted && time.Since(previous.UpdatedAt) < 30*time.Minute {
 		return false, nil
 	}
@@ -402,29 +354,6 @@ func (s *sub2RecoveryService) retryDueRecoveries() {
 	}
 }
 
-// Ordinary checks still trigger recovery while the switch is on, but always
-// re-read Sub2 before enqueuing: a deleted, disabled, healthy or manually paused
-// account must not be reauthorized due to a stale local token.
-func (s *sub2RecoveryService) enqueueAutomatic(accountID int64) {
-	if !s.configured() || !s.autoRecovery.Load() || s.paused.Load() || s.ctx.Err() != nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
-	defer cancel()
-	allowed, err := s.automaticRecoveryAllowed(ctx, accountID)
-	if err != nil || !allowed {
-		return
-	}
-	if !s.remoteRecoverySuspect(ctx, accountID) {
-		return
-	}
-	if _, _, err := s.enqueue(ctx, accountID); err != nil {
-		s.monitorMu.Lock()
-		s.monitorState.LastError = "部分账号自动恢复入队失败，请查看检测与恢复详情"
-		s.monitorMu.Unlock()
-	}
-}
-
 func (s *sub2RecoveryService) remoteRecoverySuspect(ctx context.Context, accountID int64) bool {
 	binding, err := s.store.GetSub2Import(ctx, s.sub2.destinationKey, accountID)
 	if err != nil || binding.State != "imported" {
@@ -435,13 +364,7 @@ func (s *sub2RecoveryService) remoteRecoverySuspect(ctx context.Context, account
 	return sub2RecoveryPoolCandidate(status)
 }
 
-func (s *sub2RecoveryService) recordRecoveryEnqueueFailure(accountID int64) {
-	s.monitorMu.Lock()
-	defer s.monitorMu.Unlock()
-	s.monitorState.LastError = fmt.Sprintf("账号 %d 的认证失败已确认，但恢复未能入队；请刷新历史后查看账号绑定与恢复详情", accountID)
-}
-
-func (s *sub2RecoveryService) queueRecoveryChecks(ctx context.Context, ids []int64, manual bool, singleAttempt ...bool) (store.AccountCheckBatch, error) {
+func (s *sub2RecoveryService) queueRecoveryChecks(ctx context.Context, ids []int64, manual bool) (store.AccountCheckBatch, error) {
 	checker := s.checker
 	switch {
 	case checker == nil:
@@ -454,9 +377,6 @@ func (s *sub2RecoveryService) queueRecoveryChecks(ctx context.Context, ids []int
 	prefix := "recovery-auto-"
 	if manual {
 		prefix = "recovery-manual-"
-		if len(singleAttempt) > 0 && singleAttempt[0] {
-			prefix = "recovery-manual-once-"
-		}
 	}
 	var key [16]byte
 	if _, err := rand.Read(key[:]); err != nil {
@@ -506,14 +426,19 @@ func (s *sub2RecoveryService) handleRecoveryCheck(w http.ResponseWriter, r *http
 		recoveryAPIError(w, 422, "not_recoverable", "仅恢复仍在 Sub2 池中的异常账号；禁用、人工暂停或未知状态请先核对")
 		return
 	}
-	if task, _, err := s.enqueueWithIntent(r.Context(), req.AccountID, req.ManualAttempt, false, req); err == nil {
+	if task, _, err := s.enqueueWithIntent(r.Context(), req.AccountID, req.ManualAttempt, req); err == nil {
 		respondJSONStatus(w, 202, map[string]any{"success": true, "task": task})
 		return
 	} else if !errors.Is(err, errRecoveryNotCandidate) {
-		recoveryAPIError(w, 409, "recovery_unavailable", safeRecoveryMessage(err))
+		var failure *recoveryOperationError
+		code := "recovery_unavailable"
+		if errors.As(err, &failure) && failure.RequiresAction {
+			code = failure.Code
+		}
+		recoveryAPIError(w, http.StatusConflict, code, safeRecoveryMessage(err))
 		return
 	}
-	batch, err := s.queueRecoveryChecks(r.Context(), []int64{req.AccountID}, true, req.ManualAttempt)
+	batch, err := s.queueRecoveryChecks(r.Context(), []int64{req.AccountID}, true)
 	if err != nil {
 		var safe *store.AccountCheckError
 		if errors.As(err, &safe) {

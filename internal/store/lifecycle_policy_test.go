@@ -118,10 +118,14 @@ func TestLifecycleLegacyEvidenceAndTerminalCredentials(t *testing.T) {
 
 func TestLifecycleTerminalCredentialConvergence(t *testing.T) {
 	for _, scenario := range []struct {
-		name, code, source                            string
+		name, code, source, eventStatus               string
 		unlinked, newerSuccess, explicitPolicy, clear bool
 	}{
 		{name: "official attempt", code: "account_deactivated", source: "official", clear: true},
+		{name: "generic official deleted", code: "deleted", source: "official", eventStatus: "deleted", clear: true},
+		{name: "generic official deactivated", code: "deactivated", source: "official", eventStatus: "deactivated", clear: true},
+		{name: "payment required", code: "payment_required", source: "official", clear: true},
+		{name: "deactivated workspace", code: "deactivated_workspace", source: "official", clear: true},
 		{name: "explicit policy", explicitPolicy: true, clear: true},
 		{name: "generic classification", code: "account_unavailable", source: "official"},
 		{name: "unlinked event", code: "account_deactivated", source: "official", unlinked: true},
@@ -153,9 +157,13 @@ func TestLifecycleTerminalCredentialConvergence(t *testing.T) {
 				if scenario.unlinked {
 					eventAttempt = 0
 				}
+				eventStatus := scenario.eventStatus
+				if eventStatus == "" {
+					eventStatus = "deactivated"
+				}
 				if _, err := s.db.Exec(`INSERT INTO account_lifecycle_events(account_id,email,source,status,code,dedupe_key,observed_at)
-					SELECT account_id,? ,?,'deactivated',?,?,finished_at FROM login_attempts WHERE id=?`,
-					email, scenario.source, scenario.code, fmt.Sprintf("login_attempt:%d", eventAttempt), attempt.ID); err != nil {
+					SELECT account_id,?,?,?,?,?,finished_at FROM login_attempts WHERE id=?`,
+					email, scenario.source, eventStatus, scenario.code, fmt.Sprintf("login_attempt:%d", eventAttempt), attempt.ID); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -224,7 +232,7 @@ func TestLifecycleFreeRules(t *testing.T) {
 		}
 	})
 
-	t.Run("plus refresh keeps eligibility but empty login clears it", func(t *testing.T) {
+	t.Run("plus refresh keeps eligibility and empty login keeps only historical plan", func(t *testing.T) {
 		s, _ := testStore(t)
 		ctx := context.Background()
 		const email = "plus-empty-observation@example.test"
@@ -243,7 +251,7 @@ func TestLifecycleFreeRules(t *testing.T) {
 		}
 		finishLifecycleLogin(t, s, email, "")
 		account, err = s.GetAccount(ctx, email)
-		if err != nil || account.Sub2Policy != Sub2PolicyUnknown || account.PlanType != "" {
+		if err != nil || account.Sub2Policy != Sub2PolicyUnknown || account.PlanType != "plus" {
 			t.Fatalf("account=%+v err=%v", account, err)
 		}
 		var evidence int

@@ -28,7 +28,7 @@ func (s *sub2RecoveryService) handleRecheckRetry(w http.ResponseWriter, r *http.
 		recoveryAPIError(w, http.StatusInternalServerError, "recovery_read_failed", "读取恢复任务失败")
 		return
 	}
-	if err := s.validateRecheckOwnership(r.Context(), task); err != nil {
+	if _, err := s.validateRecheckOwnership(r.Context(), task); err != nil {
 		recoveryAPIError(w, http.StatusConflict, "recheck_not_resumable", safeRecoveryMessage(err))
 		return
 	}
@@ -101,14 +101,19 @@ func (s *sub2RecoveryService) processRecheck(check store.AccountRecoveryRecheck)
 		s.recheckFailure(check, err)
 		return
 	}
-	if err := s.validateRecheckOwnership(ctx, task); err != nil {
+	binding, err := s.validateRecheckOwnership(ctx, task)
+	if err != nil {
 		s.recheckFailure(check, err)
 		return
 	}
 	err = s.verifySub2AccountProbe(ctx, task.Sub2AccountID)
 	// The admin test uses Sub2's current token and egress. Re-read ownership and
 	// operator state after it, because its remote request can outlive a pause.
-	if ownershipErr := s.validateRecheckOwnership(ctx, task); ownershipErr != nil {
+	current, ownershipErr := s.validateRecheckOwnership(ctx, task)
+	if ownershipErr == nil && !sameCleanupBinding(current, binding) {
+		ownershipErr = &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
+	}
+	if ownershipErr != nil {
 		s.recheckFailure(check, ownershipErr)
 		return
 	}
@@ -117,6 +122,12 @@ func (s *sub2RecoveryService) processRecheck(check store.AccountRecoveryRecheck)
 		return
 	}
 	failure := classifyRecoveryError(err)
+	if accountDeactivationConfirmed(failure.Code) {
+		if err := s.handleOfficialSub2Probe(ctx, lease, binding, task.ResultCredentialAttemptID, failure); err != nil {
+			s.recheckFailure(check, err)
+		}
+		return
+	}
 	if !failure.CredentialInvalid {
 		s.recheckFailure(check, failure)
 		return
@@ -136,55 +147,55 @@ func (s *sub2RecoveryService) processRecheck(check store.AccountRecoveryRecheck)
 	s.notify()
 }
 
-func (s *sub2RecoveryService) validateRecheckOwnership(ctx context.Context, task store.AccountRecoveryTask) error {
+func (s *sub2RecoveryService) validateRecheckOwnership(ctx context.Context, task store.AccountRecoveryTask) (store.Sub2Import, error) {
 	if failure, err := s.automationFailure(ctx, task.AccountID); err != nil {
-		return err
+		return store.Sub2Import{}, err
 	} else if failure != nil {
-		return failure
+		return store.Sub2Import{}, failure
 	}
 	latest, err := s.store.GetLatestAccountRecoveryTaskForDestination(ctx, task.AccountID, s.sub2.destinationKey)
 	if err != nil {
-		return err
+		return store.Sub2Import{}, err
 	}
 	if latest.ID != task.ID || latest.State != store.RecoveryCompleted || !task.OriginalSchedulable {
-		return &recoveryOperationError{Code: "version_changed", RequiresAction: true}
+		return store.Sub2Import{}, &recoveryOperationError{Code: "version_changed", RequiresAction: true}
 	}
 	if err := s.store.ValidateAccountRecoveryVersion(ctx, task.ID); err != nil {
 		if errors.Is(err, store.ErrAccountRecoveryVersionChanged) {
-			return &recoveryOperationError{Code: "version_changed", RequiresAction: true}
+			return store.Sub2Import{}, &recoveryOperationError{Code: "version_changed", RequiresAction: true}
 		}
-		return err
+		return store.Sub2Import{}, err
 	}
 	account, err := s.store.GetAccountByID(ctx, task.AccountID)
 	if err != nil {
-		return err
+		return store.Sub2Import{}, err
 	}
 	binding, err := s.sub2.store.GetSub2Import(ctx, s.sub2.destinationKey, task.AccountID)
 	if err != nil && !errors.Is(err, store.ErrSub2ImportNotFound) {
-		return err
+		return store.Sub2Import{}, err
 	}
 	if err != nil || binding.State != "imported" || binding.Sub2AccountID != task.Sub2AccountID {
-		return &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
+		return store.Sub2Import{}, &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
 	}
 	detail, err := s.sub2Account(withSub2StatusFresh(ctx), task.Sub2AccountID)
 	if err != nil {
-		return err
+		return store.Sub2Import{}, err
 	}
 	if verifySub2RecoveryIdentity(detail, task.Sub2AccountID, task.AccountID, account, binding) != nil {
-		return &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
+		return store.Sub2Import{}, &recoveryOperationError{Code: "identity_changed", RequiresAction: true}
 	}
 	if err := s.verifyRecheckCheckpoint(ctx, task, detail, binding); err != nil {
-		return err
+		return store.Sub2Import{}, err
 	}
 	scheduled, ok := boolField(detail, "schedulable")
 	if !ok {
-		return &recoveryOperationError{Code: "checkpoint_unconfirmed", RequiresAction: true}
+		return store.Sub2Import{}, &recoveryOperationError{Code: "checkpoint_unconfirmed", RequiresAction: true}
 	}
 	status, _ := detail["status"].(string)
 	if recoveryAccountDisabled(detail) || strings.EqualFold(status, "active") && !scheduled {
-		return &recoveryOperationError{Code: "manual_pause", RequiresAction: true}
+		return store.Sub2Import{}, &recoveryOperationError{Code: "manual_pause", RequiresAction: true}
 	}
-	return nil
+	return binding, nil
 }
 
 func (s *sub2RecoveryService) verifyRecheckCheckpoint(ctx context.Context, task store.AccountRecoveryTask, detail map[string]any, binding store.Sub2Import) error {

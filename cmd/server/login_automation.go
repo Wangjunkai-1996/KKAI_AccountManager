@@ -96,13 +96,38 @@ func manualLoginRetryAllowed(code string) bool {
 	return false
 }
 
-// A strictly newer successful login supersedes only an old login-stage
-// rejection or exhausted page wait. Other checkpoints keep their own gates.
+// A strictly newer login supersedes credential-specific observations.
+// An unconfirmed plan also requires a paid observation for that new version.
 func (s *sub2RecoveryService) successfulLoginSupersedesFailure(ctx context.Context, task store.AccountRecoveryTask) (bool, error) {
-	loginStop := login.IsDeterministicFailure(login.LoginErrorInfo{Code: task.ErrorCode}) || task.ErrorCode == "auth_page_timeout_exhausted"
-	if task.FailureStage != store.RecoveryLoggingIn || task.RetryAction != "manual" || (task.State != store.RecoveryFailed && task.State != store.RecoveryUnknown) || !loginStop {
+	if task.RetryAction != "manual" || (task.State != store.RecoveryFailed && task.State != store.RecoveryUnknown) {
 		return false, nil
 	}
-	version, err := s.store.GetAccountCredentialVersion(ctx, task.AccountID)
-	return version > task.SourceCredentialAttemptID && version > task.ResultCredentialAttemptID, err
+	switch task.FailureStage {
+	case store.RecoveryValidating:
+		if task.ErrorCode != "reauthorize" && task.ErrorCode != "verify_remote_refresh" {
+			return false, nil
+		}
+	case store.RecoveryLoggingIn:
+		if !login.IsDeterministicFailure(login.LoginErrorInfo{Code: task.ErrorCode}) && task.ErrorCode != "auth_page_timeout_exhausted" {
+			return false, nil
+		}
+	case store.RecoveryLoginSucceeded, store.RecoveryRefreshingCredentials:
+		if task.ErrorCode != store.RecoveryPlanUnconfirmed {
+			return false, nil
+		}
+	default:
+		return false, nil
+	}
+	account, err := s.store.GetAccountByID(ctx, task.AccountID)
+	if err != nil || account.CredentialVersion <= task.SourceCredentialAttemptID || account.CredentialVersion <= task.ResultCredentialAttemptID {
+		return false, err
+	}
+	if task.FailureStage == store.RecoveryLoggingIn || task.FailureStage == store.RecoveryValidating {
+		return true, nil
+	}
+	if !account.AllowsSub2() {
+		return false, nil
+	}
+	plan, err := s.store.ObservedCredentialPlan(ctx, task.AccountID, account.CredentialVersion)
+	return store.IsSub2PaidPlan(plan), err
 }

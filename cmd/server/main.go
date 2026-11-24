@@ -109,6 +109,7 @@ var (
 )
 
 type LoginRequest struct {
+	expectedBinding *store.HistoryBindingExpectation
 	DeliveryOptions *store.DeliveryOptions `json:"delivery_options,omitempty"`
 	AutoDeliver     bool                   `json:"auto_deliver"`
 	Email           string                 `json:"email"`

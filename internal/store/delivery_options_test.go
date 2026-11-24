@@ -85,7 +85,7 @@ func TestQueueAccountDeliveryCorrectsUnsentRequiresAction(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer attempt.Release()
-	if err := s.FinishAttempt(ctx, attempt.ID, true, &Result{AccessToken: "fixture-at", RefreshToken: "fixture-rt"}, nil); err != nil {
+	if err := s.FinishAttempt(ctx, attempt.ID, true, &Result{AccessToken: "fixture-at", RefreshToken: "fixture-rt", PlanType: "plus"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	old, err := s.QueueAccountDelivery(ctx, account.ID, "fixture", DeliveryOptions{GroupIDs: []int64{7}, Priority: 1, Concurrency: 3})

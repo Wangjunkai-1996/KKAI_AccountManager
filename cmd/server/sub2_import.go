@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/accountstate"
 	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/store"
 )
 
@@ -357,27 +358,27 @@ func (s *sub2ImportService) processQueued(ctx context.Context, task store.Sub2Im
 	if current.State == store.Sub2RemoteMissing {
 		return store.ErrSub2AccountMissing
 	}
-	if current.OperationID != task.OperationID {
+	if current.OperationID != task.OperationID || current.State != "queued" || current.CredentialVersion != task.CredentialVersion {
 		return store.ErrAccountRecoveryStale
+	}
+	if task.DestinationKey != s.destinationKey {
+		return &recoveryOperationError{Code: "configuration", RequiresAction: true}
 	}
 	account, err := s.store.GetAccountByID(ctx, task.AccountID)
 	if err != nil {
 		return err
 	}
-	if err := account.Sub2EligibilityError(); err != nil {
-		return err
-	}
-	if !store.IsSub2PaidPlan(account.PlanType) {
-		return store.ErrSub2PlanIneligible
-	}
 	if err := s.importMissing(ctx, task.AccountID); err != nil {
 		return err
 	}
-	if task.DestinationKey != s.destinationKey {
-		return &recoveryOperationError{Code: "configuration", RequiresAction: true}
-	}
-	currentVersion, err := s.store.GetAccountCredentialVersion(ctx, task.AccountID)
-	if err != nil {
+	currentVersion := account.CredentialVersion
+	if err := s.checkImportPlan(ctx, account); err != nil {
+		var blocked *recoveryOperationError
+		if errors.As(err, &blocked) {
+			if saveErr := s.store.FailQueuedSub2Import(ctx, task, currentVersion, blocked.Error()); saveErr != nil {
+				return saveErr
+			}
+		}
 		return err
 	}
 	if currentVersion != task.CredentialVersion {
@@ -440,6 +441,27 @@ func (s *sub2ImportService) processQueued(ctx context.Context, task store.Sub2Im
 	return s.reconcile(ctx, task.ID)
 }
 
+func (s *sub2ImportService) checkImportPlan(ctx context.Context, account store.Account) error {
+	eligibilityErr := account.Sub2EligibilityError()
+	if eligibilityErr != nil && !errors.Is(eligibilityErr, store.ErrSub2PlanIneligible) {
+		return eligibilityErr
+	}
+	plan, err := s.store.ObservedCredentialPlan(ctx, account.ID, account.CredentialVersion)
+	if err != nil {
+		return err
+	}
+	switch {
+	case store.IsFreePlan(plan) || account.IsFreeLocal():
+		return &recoveryOperationError{Code: "free_local", RequiresAction: true}
+	case !store.IsSub2PaidPlan(plan):
+		return &recoveryOperationError{Code: store.RecoveryPlanUnconfirmed, RequiresAction: true}
+	case eligibilityErr != nil || !store.IsSub2PaidPlan(account.PlanType):
+		return &recoveryOperationError{Code: "sub2_plan_ineligible", RequiresAction: true}
+	default:
+		return nil
+	}
+}
+
 // refreshSub2ImportCredentials keeps the original operation marker and
 // display/options payload while replacing only the OAuth snapshot.
 func (s *sub2ImportService) refreshSub2ImportCredentials(ctx context.Context, task store.Sub2Import) error {
@@ -482,6 +504,13 @@ func (s *sub2ImportService) refreshSub2ImportCredentials(ctx context.Context, ta
 	version, err := s.store.GetAccountCredentialVersion(ctx, task.AccountID)
 	if err != nil {
 		return err
+	}
+	plan, err := s.store.ObservedCredentialPlan(ctx, task.AccountID, version)
+	if err != nil {
+		return err
+	}
+	if !store.IsSub2PaidPlan(plan) {
+		return store.ErrSub2PlanIneligible
 	}
 	return s.store.RefreshSub2ImportPayloadForVersion(ctx, task.ID, version, true, refreshed)
 }
@@ -1500,12 +1529,7 @@ func (s *sub2ImportService) deleteDeletedAccount(ctx context.Context, accountID,
 }
 
 func accountDeactivationConfirmed(code string) bool {
-	switch strings.ToLower(strings.TrimSpace(code)) {
-	case "account_deleted", "user_deleted", "account_deactivated", "user_deactivated", "account_disabled", "user_disabled":
-		return true
-	default:
-		return false
-	}
+	return accountstate.OfficialStatus(code) != ""
 }
 
 // deleteDeletedAccountWithLease is used by recovery flows that already hold

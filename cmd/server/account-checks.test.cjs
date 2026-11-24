@@ -244,6 +244,18 @@ const change = async (name, value) => { if (typeof value === 'boolean') el(name)
     await [...timers.values()].find(timer => timer.fn.name === 'poll').fn();
     assert.equal(requestCount('/api/history'), badgeHistoryReads, 'batch badge check must run before the periodic history refresh');
     assert.equal(elements.get('tabBadgeChecks').textContent, '1', 'a completed abnormal batch item must update the badge immediately');
+    const recoveryPostsBefore = requests.filter(r => r.url === '/api/account-recovery' && r.options.method === 'POST').length;
+    for (const [action, label] of [['reauthorize', '需要重新授权'], ['verify_remote_refresh', '需要核对 Sub2 正常续期']]) {
+        remote.items[0] = { ...remote.items[0], outcome: 'unauthorized', http_status: 401, required_action: action };
+        await [...timers.values()].find(timer => timer.fn.name === 'poll').fn();
+        assert.ok(part(4, 'recoveryStatus').textContent.includes(label), 'polling must update the pending action');
+        assert.equal(part(4, 'recover').hidden, true);
+        await window.AccountChecks.recoverAccount(4);
+    }
+    assert.equal(requests.filter(r => r.url === '/api/account-recovery' && r.options.method === 'POST').length, recoveryPostsBefore);
+    remote.items[0] = { ...remote.items[0], id: 502, required_action: undefined };
+    await [...timers.values()].find(timer => timer.fn.name === 'poll').fn();
+    assert.equal(part(4, 'recover').hidden, false, 'a newer completed check clears the previous action');
     assert.equal(tabPanel.scrollTop, 420, 'batch polling must preserve scroll');
     active = { state: 'active' };
     await click('Refresh');

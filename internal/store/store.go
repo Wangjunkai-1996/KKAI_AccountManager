@@ -25,6 +25,7 @@ var (
 	ErrAccountBusy             = errors.New("account login already in progress")
 	ErrAttemptNotFound         = errors.New("login attempt not found")
 	ErrSub2ImportNotFound      = errors.New("sub2 import not found")
+	ErrHistoryBindingChanged   = errors.New("原绑定或本地凭据已变化，请刷新历史列表")
 	ErrOAuthCredentialsMissing = errors.New("账号没有可导入的 OAuth token")
 )
 
@@ -38,8 +39,18 @@ type Credentials struct {
 	// ExistingAccountID makes BeginAttempt require this identity, preventing a
 	// stale history login from recreating a deleted account. Zero allows creation.
 	ExistingAccountID int64
+	ExpectedBinding   *HistoryBindingExpectation
 	// SingleAttempt records explicit one-shot intent before the browser starts.
 	SingleAttempt bool
+}
+
+// HistoryBindingExpectation is the target the operator saw before choosing
+// to reauthorize and update an existing Sub2 account.
+type HistoryBindingExpectation struct {
+	Destination       string `json:"-"`
+	OperationID       string `json:"expected_binding_operation_id"`
+	RemoteID          int64  `json:"expected_remote_account_id"`
+	CredentialVersion int64  `json:"expected_credential_version"`
 }
 
 // Result contains values returned by a successful OAuth login.
@@ -122,7 +133,7 @@ type Sub2Import struct {
 	DestinationKey     string    `json:"-"`
 	AccountID          int64     `json:"account_id"`
 	AccountEmail       string    `json:"email,omitempty"`
-	CredentialVersion  int64     `json:"-"`
+	CredentialVersion  int64     `json:"credential_version,omitempty"`
 	OperationID        string    `json:"operation_id"`
 	IdempotencyKey     string    `json:"-"`
 	State              string    `json:"state"`
@@ -676,6 +687,19 @@ func (s *Store) beginAttemptLocked(ctx context.Context, credentials Credentials,
 		release()
 		return Account{}, Attempt{}, err
 	}
+	if expected := credentials.ExpectedBinding; expected != nil {
+		var matches bool
+		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM lifecycle_request_bindings
+			WHERE request_key=? AND destination=? AND operation=? AND sub2_id=? AND source_version=?)`,
+			fmt.Sprintf("login_attempt:%d", attemptID), expected.Destination, expected.OperationID, expected.RemoteID, expected.CredentialVersion).Scan(&matches)
+		if err != nil || !matches {
+			release()
+			if err != nil {
+				return Account{}, Attempt{}, err
+			}
+			return Account{}, Attempt{}, ErrHistoryBindingChanged
+		}
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE accounts SET status='running',attempt_count=attempt_count+1,updated_at=? WHERE id=?`, now, accountID); err != nil {
 		release()
 		return Account{}, Attempt{}, err
@@ -783,6 +807,22 @@ func (s *Store) CreateOrGetSub2Import(ctx context.Context, destinationKey string
 		return Sub2Import{}, false, err
 	}
 	if !IsSub2PaidPlan(account.PlanType) {
+		return Sub2Import{}, false, ErrSub2PlanIneligible
+	}
+	if existing, existingErr := s.GetSub2Import(ctx, destinationKey, accountID); existingErr == nil {
+		return existing, false, nil
+	} else if !errors.Is(existingErr, ErrSub2ImportNotFound) {
+		return Sub2Import{}, false, existingErr
+	}
+	version, err := s.GetAccountCredentialVersion(ctx, accountID)
+	if err != nil {
+		return Sub2Import{}, false, err
+	}
+	plan, err := s.ObservedCredentialPlan(ctx, accountID, version)
+	if err != nil {
+		return Sub2Import{}, false, err
+	}
+	if !IsSub2PaidPlan(plan) {
 		return Sub2Import{}, false, ErrSub2PlanIneligible
 	}
 	missing, err := s.Sub2AccountMissing(ctx, destinationKey, accountID)
@@ -989,6 +1029,24 @@ func (s *Store) MarkSub2ImportSendingForOperation(ctx context.Context, binding S
 		return ErrAccountRecoveryStale
 	}
 	return nil
+}
+
+// FailQueuedSub2Import removes only the unsent operation inspected by
+// the worker. A replacement credential or an in-flight send wins the race.
+func (s *Store) FailQueuedSub2Import(ctx context.Context, task Sub2Import, observedVersion int64, message string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE sub2_imports SET state='failed',last_error=?,updated_at=?
+		WHERE id=? AND account_id=? AND operation_id=? AND credential_version=? AND state='queued'
+		AND COALESCE(create_acknowledged,0)=0 AND COALESCE(sub2_account_id,0)=0
+		AND ?=(SELECT COALESCE(MAX(id),0) FROM login_attempts WHERE account_id=sub2_imports.account_id AND status='success')`+sub2ImportNotDiscarded,
+		message, time.Now().Unix(), task.ID, task.AccountID, task.OperationID, task.CredentialVersion, observedVersion)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err == nil && n != 1 {
+		return ErrAccountRecoveryStale
+	}
+	return err
 }
 
 // MarkSub2ImportCleanupPending records the credential version that produced
@@ -1278,7 +1336,7 @@ func (s *Store) finishAttemptTx(ctx context.Context, tx *sql.Tx, id int64, succe
 			return e
 		}
 		nextPolicy := nextSub2Policy(result.PlanType, policy)
-		if _, err = tx.ExecContext(ctx, `UPDATE accounts SET status='active',sub2_policy=?,access_token_cipher=?,refresh_token_cipher=?,chatgpt_account_id=?,organization_id=?,plan_type=?,expires_at=?,last_error_code='',last_error='',last_http_status=0,last_success_at=?,updated_at=? WHERE id=?`, nextPolicy, access, refresh, result.ChatGPTAccountID, result.OrganizationID, result.PlanType, result.ExpiresAt, now, now, accountID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE accounts SET status='active',sub2_policy=?,access_token_cipher=?,refresh_token_cipher=?,chatgpt_account_id=?,organization_id=?,plan_type=COALESCE(NULLIF(trim(?),''),plan_type),expires_at=?,last_error_code='',last_error='',last_http_status=0,last_success_at=?,updated_at=? WHERE id=?`, nextPolicy, access, refresh, result.ChatGPTAccountID, result.OrganizationID, result.PlanType, result.ExpiresAt, now, now, accountID); err != nil {
 			return err
 		}
 		if nextPolicy == Sub2PolicyFreeLocal {

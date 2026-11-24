@@ -133,7 +133,7 @@ func (s *accountDeliveryService) process(ctx context.Context, task store.Account
 		s.failed(task, err)
 		return
 	}
-	if err := account.Sub2EligibilityError(); err != nil {
+	if err := account.Sub2EligibilityError(); err != nil && !errors.Is(err, store.ErrSub2PlanIneligible) {
 		s.failed(task, err)
 		return
 	}
@@ -152,13 +152,12 @@ func (s *accountDeliveryService) process(ctx context.Context, task store.Account
 		s.failed(task, priorErr)
 		return
 	}
-	version, err := s.store.GetAccountCredentialVersion(ctx, task.AccountID)
-	if err != nil {
-		s.failed(task, err)
+	if account.CredentialVersion != task.CredentialVersion {
+		s.update(task, "canceled", "已有更新的登录结果，旧交付已取消", "", nil, 0)
 		return
 	}
-	if version != task.CredentialVersion {
-		s.update(task, "canceled", "已有更新的登录结果，旧交付已取消", "", nil, 0)
+	if err := s.importer.checkImportPlan(ctx, account); err != nil {
+		s.failed(task, err)
 		return
 	}
 	if _, active, err := s.store.GetActiveAccountRecoveryTaskForDestination(ctx, task.AccountID, task.DestinationKey); err != nil {

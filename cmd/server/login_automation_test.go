@@ -186,15 +186,11 @@ func TestLoginAutomationNewSuccessAllowsNewUnauthorizedRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.service.autoRecovery.Store(true)
-	task, created, err := f.service.enqueue(ctx, f.account.ID, true)
-	if err != nil || !created || task.ID == f.task.ID || task.SourceCredentialAttemptID != attempt.ID {
-		t.Fatalf("new 401 did not create current recovery: %+v created=%v err=%v", task, created, err)
+	_, created, err := f.service.enqueue(ctx, f.account.ID)
+	if failure := classifyRecoveryError(err); err == nil || created || failure.Code != "reauthorize" {
+		t.Fatalf("fresh 401 should request reauthorization: created=%v err=%v", created, err)
 	}
-	f.service.process(task)
-	got, err := f.store.GetAccountRecoveryTaskByID(ctx, task.ID)
-	if err != nil || got.State != store.RecoveryCompleted || f.loginCalls != 1 {
-		t.Fatalf("new 401 did not recover: %+v calls=%d err=%v", got, f.loginCalls, err)
-	}
+	assertCheckAction(t, f, "reauthorize")
 }
 
 func TestLoginAutomationNewSuccessPreservesOtherManualStops(t *testing.T) {

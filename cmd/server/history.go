@@ -45,6 +45,7 @@ func initLoginHistory(dbPath, keyPath string) error {
 }
 
 type historyLoginRequest struct {
+	*store.HistoryBindingExpectation
 	ManualAttempt   bool                   `json:"manual_attempt"`
 	DeliveryOptions *store.DeliveryOptions `json:"delivery_options,omitempty"`
 	AutoDeliver     bool                   `json:"auto_deliver"`
@@ -274,6 +275,18 @@ func handleHistoryLogin(service *login.Service) http.HandlerFunc {
 				respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: "请求只能包含一个 JSON 对象"})
 				return
 			}
+			if expected := req.HistoryBindingExpectation; expected != nil {
+				if !req.AutoDeliver || expected.CredentialVersion <= 0 || expected.RemoteID <= 0 || strings.TrimSpace(expected.OperationID) == "" {
+					respondJSONStatus(w, http.StatusBadRequest, LoginResponse{Message: "更新原绑定需要完整的绑定信息及凭据版本", Code: "invalid_binding"})
+					return
+				}
+				if sub2Importer == nil || !sub2Importer.configured() {
+					respondJSONStatus(w, http.StatusServiceUnavailable, LoginResponse{Message: "Sub2 未配置", Code: "configuration"})
+					return
+				}
+				expected.Destination = sub2Importer.destinationKey
+				req.ManualAttempt = true
+			}
 			account, err := loginHistory.GetAccountByID(r.Context(), req.AccountID)
 			if err == nil && (account.Status == "discarded" || account.Sub2Policy == store.Sub2PolicyDiscarded) {
 				respondJSONStatus(w, http.StatusGone, LoginResponse{Message: "账号已在本地退役", Code: "account_discarded"})
@@ -286,6 +299,25 @@ func handleHistoryLogin(service *login.Service) http.HandlerFunc {
 			if err != nil {
 				respondJSONStatus(w, http.StatusInternalServerError, LoginResponse{Message: "读取账号失败", Code: "history_read_failed"})
 				return
+			}
+			if req.AutoDeliver && sub2Importer != nil && sub2Importer.configured() {
+				binding, bindingErr := sub2Importer.store.GetSub2Import(r.Context(), sub2Importer.destinationKey, account.ID)
+				if bindingErr == nil && binding.State == "imported" && binding.Sub2AccountID > 0 {
+					expected := req.HistoryBindingExpectation
+					check, checkErr := loginHistory.LatestFinishedAccountCheck(r.Context(), account.ID, sub2Importer.destinationKey)
+					if checkErr != nil {
+						respondJSONStatus(w, http.StatusInternalServerError, LoginResponse{Message: "读取账号检测结果失败", Code: "check_read_failed"})
+						return
+					}
+					if check != nil && check.RequiredAction != "" {
+						respondJSONStatus(w, http.StatusConflict, LoginResponse{Message: historyRequiredActionMessage(check.RequiredAction), Code: check.RequiredAction})
+						return
+					}
+					if expected == nil || expected.CredentialVersion <= 0 || expected.RemoteID <= 0 || strings.TrimSpace(expected.OperationID) == "" {
+						respondJSONStatus(w, http.StatusConflict, LoginResponse{Message: "原绑定需要完整的绑定信息及凭据版本，请刷新历史后重试", Code: "binding_confirmation_required"})
+						return
+					}
+				}
 			}
 			credentials, err := loginHistory.GetCredentialsByID(r.Context(), req.AccountID)
 			if errors.Is(err, store.ErrAccountNotFound) {
@@ -301,6 +333,7 @@ func handleHistoryLogin(service *login.Service) http.HandlerFunc {
 				proxy = credentials.Proxy
 			}
 			loginReq := LoginRequest{Email: credentials.Email, Password: credentials.Password, TotpSecret: credentials.TOTPSecret, Proxy: proxy, UpstreamProxy: strings.TrimSpace(req.UpstreamProxy), AutoDeliver: req.AutoDeliver, DeliveryOptions: req.DeliveryOptions}
+			loginReq.expectedBinding = req.HistoryBindingExpectation
 			if loginReq.DeliveryOptions == nil && sub2Importer != nil && sub2Importer.configured() {
 				options, err := sub2Importer.historyDeliveryOptions(r.Context(), req.AccountID)
 				if err != nil {
@@ -333,6 +366,17 @@ func handleHistoryLogin(service *login.Service) http.HandlerFunc {
 				return runWithHistoryAccount(ctx, req.AccountID, loginReq, logLogin)
 			})
 		})(w, r)
+	}
+}
+
+func historyRequiredActionMessage(action string) string {
+	switch strings.TrimSpace(action) {
+	case "reauthorize":
+		return "需要账号持有人通过官方 OAuth 重新授权 AUTH，核对成功后再显式交付"
+	case "verify_remote_refresh":
+		return "请先核对原 Sub2 账号的正常续期状态，必要时再由账号持有人通过官方 OAuth 重新授权"
+	default:
+		return "当前账号需要账号持有人完成官方授权后再继续交付"
 	}
 }
 
@@ -403,7 +447,7 @@ func runWithHistoryAccount(ctx context.Context, accountID int64, req LoginReques
 	}
 	persistCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, attempt, err := loginHistory.BeginAttempt(persistCtx, store.Credentials{Email: req.Email, Password: req.Password, TOTPSecret: req.TotpSecret, Proxy: req.Proxy, ExistingAccountID: accountID, SingleAttempt: login.IsSingleAttempt(ctx)})
+	_, attempt, err := loginHistory.BeginAttempt(persistCtx, store.Credentials{Email: req.Email, Password: req.Password, TOTPSecret: req.TotpSecret, Proxy: req.Proxy, ExistingAccountID: accountID, ExpectedBinding: req.expectedBinding, SingleAttempt: login.IsSingleAttempt(ctx)})
 	if err != nil {
 		return nil, err
 	}
@@ -473,6 +517,9 @@ func runWithHistoryAccount(ctx context.Context, accountID int64, req LoginReques
 }
 
 func describeLoginError(err error) login.LoginErrorInfo {
+	if errors.Is(err, store.ErrHistoryBindingChanged) {
+		return login.LoginErrorInfo{Stage: login.LoginStageConfiguration, Code: "binding_changed", Message: store.ErrHistoryBindingChanged.Error()}
+	}
 	if errors.Is(err, store.ErrAccountDiscarded) {
 		return login.LoginErrorInfo{Stage: login.LoginStageConfiguration, Code: "account_discarded", Message: "账号已在本地退役"}
 	}

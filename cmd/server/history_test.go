@@ -155,6 +155,9 @@ func TestHistoryRecoveryCountsAndSafeTimeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := history.UpdateOAuthResultByID(ctx, account.ID, store.Result{AccessToken: "at", RefreshToken: "rt", PlanType: "plus"}); err != nil {
+		t.Fatal(err)
+	}
 	for _, state := range []string{store.RecoveryCompleted, store.RecoveryUnknown} {
 		task, _, err := history.CreateOrGetAccountRecoveryTask(ctx, account.ID, 0, 42, true)
 		if err != nil {
@@ -189,6 +192,9 @@ func TestHistoryRecoveryFailureProjectionIsRedacted(t *testing.T) {
 	ctx := context.Background()
 	account, err := history.UpsertCredentials(ctx, store.Credentials{Email: "recovery-failure-history@example.test", Password: "secret-fixture-password"})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.UpdateOAuthResultByID(ctx, account.ID, store.Result{AccessToken: "at", RefreshToken: "rt", PlanType: "plus"}); err != nil {
 		t.Fatal(err)
 	}
 	task, _, err := history.CreateOrGetAccountRecoveryTask(ctx, account.ID, 0, 42, true)
@@ -278,6 +284,23 @@ func TestHistoryLoginRejectsRetainedDeletedAccount(t *testing.T) {
 	handleHistoryLogin(nil)(response, request)
 	if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), `"code":"account_not_found"`) {
 		t.Fatalf("deleted history login = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestHistoryLoginRejectsIncompleteBindingRequest(t *testing.T) {
+	newTestHistory(t)
+	for _, body := range []string{
+		`{"account_id":1,"auto_deliver":true,"expected_binding_operation_id":"old"}`,
+		`{"account_id":1,"auto_deliver":true,"expected_remote_account_id":42,"expected_credential_version":7}`,
+		`{"account_id":1,"expected_binding_operation_id":"old","expected_remote_account_id":42,"expected_credential_version":7}`,
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/api/history/login", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handleHistoryLogin(nil)(response, request)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"code":"invalid_binding"`) {
+			t.Fatalf("incomplete binding returned %d %s", response.Code, response.Body.String())
+		}
 	}
 }
 

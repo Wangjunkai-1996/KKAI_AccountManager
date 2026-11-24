@@ -47,6 +47,12 @@ func TestManualRecoveryOneAttemptAfterLoginStop(t *testing.T) {
 			request.Header.Set("Content-Type", "application/json")
 			response := httptest.NewRecorder()
 			f.service.handleCollection(response, request)
+			if code == login.LoginErrorPasswordRejected {
+				if response.Code != http.StatusGone || !strings.Contains(response.Body.String(), "account_discarded") || f.loginCalls != 0 {
+					t.Fatalf("discarded account response=%d %s", response.Code, response.Body.String())
+				}
+				return
+			}
 			if response.Code != http.StatusOK {
 				t.Fatalf("manual endpoint rejected stopped login: %d %s", response.Code, response.Body.String())
 			}
@@ -54,7 +60,7 @@ func TestManualRecoveryOneAttemptAfterLoginStop(t *testing.T) {
 			if task.ID != *req.ExpectedTaskID || !task.ManualAttempt() {
 				t.Fatalf("manual intent not persisted: %+v", task)
 			}
-			if duplicate, _, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, false, req); err != nil || duplicate.ID != task.ID {
+			if duplicate, _, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, req); err != nil || duplicate.ID != task.ID {
 				t.Fatalf("active duplicate not reused: %v", err)
 			}
 			f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
@@ -66,7 +72,7 @@ func TestManualRecoveryOneAttemptAfterLoginStop(t *testing.T) {
 			if f.loginCalls != 1 || f.applyCalls != 0 || got.RetryAction != "manual" || got.NextRetryAt != nil || got.ErrorCode != login.LoginErrorTOTPRejected {
 				t.Fatalf("manual rejection did not stop once: %+v calls=%d", got, f.loginCalls)
 			}
-			if _, _, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, false, req); err == nil {
+			if _, _, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, req); err == nil {
 				t.Fatalf("old HTTP snapshot reauthorized: %v", err)
 			}
 			if _, err := f.store.RetryManualAccountRecoveryTask(ctx, task, true); !errors.Is(err, store.ErrAccountRecoveryStale) {
@@ -83,29 +89,16 @@ func TestManualRecoveryOneAttemptAfterLoginStop(t *testing.T) {
 	}
 }
 
-func TestManualRecoveryCreatesOnceWithoutPriorTask(t *testing.T) {
-	f := newRecoveryFixture(t, true)
+func TestManualRecoveryWithoutPriorTaskRequiresAuthorization(t *testing.T) {
+	f := newMonitorFixture(t)
 	ctx := context.Background()
-	persistDeterministicLoginStop(t, f, login.LoginErrorPasswordRejected)
-	if _, err := f.db.Exec(`DELETE FROM account_recovery_tasks WHERE id=?`, f.task.ID); err != nil {
-		t.Fatal(err)
-	}
+	finishRecoveryCheck(t, f.store, f.db, f.account.ID, "manual-check", "unauthorized", "", "", nil)
 	request := manualRecoveryRequest(store.AccountRecoveryTask{AccountID: f.account.ID})
-	task, created, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, false, request)
-	if err != nil || !created || task.RetryAction != "manual_start" {
-		t.Fatalf("new manual task missing: %+v %v", task, err)
+	_, created, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, request)
+	if err == nil || created || classifyRecoveryError(err).Code != "reauthorize" {
+		t.Fatalf("manual endpoint accepted an AUTH-only result: created=%v err=%v", created, err)
 	}
-	f.service.process(task)
-	got, err := f.store.GetAccountRecoveryTaskByID(ctx, task.ID)
-	if err != nil || got.State != store.RecoveryCompleted || f.loginCalls != 1 || f.applyCalls != 1 {
-		t.Fatalf("new manual task did not recover: %+v %v", got, err)
-	}
-	if _, _, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, false, request); !errors.Is(err, store.ErrAccountRecoveryStale) {
-		t.Fatalf("initial HTTP snapshot replayed: %v", err)
-	}
-	if _, _, err := f.store.CreateOrGetManualAccountRecoveryTask(ctx, f.account.ID, task.CheckID, task.Sub2AccountID, true, "fixture", 0); !errors.Is(err, store.ErrAccountRecoveryStale) {
-		t.Fatalf("initial store snapshot replayed: %v", err)
-	}
+	assertCheckAction(t, f, "reauthorize")
 }
 
 func TestManualRecoveryRestartAndTransientFailureStop(t *testing.T) {
@@ -114,7 +107,7 @@ func TestManualRecoveryRestartAndTransientFailureStop(t *testing.T) {
 		ctx := context.Background()
 		persistManualLoginStop(t, f, "auth_page_timeout_exhausted")
 		request := manualRecoveryRequest(f.state(t))
-		task, _, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, false, request)
+		task, _, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, request)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -173,7 +166,7 @@ func TestManualRecoveryPreservesSafetyGatesAndCheckpoint(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			task, _, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, false, manualRecoveryRequest(f.state(t)))
+			task, _, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, manualRecoveryRequest(f.state(t)))
 			if gate != "checkpoint" {
 				if err == nil || f.loginCalls != 0 || f.applyCalls != 0 {
 					t.Fatalf("manual intent bypassed %s: %v", gate, err)
@@ -191,22 +184,22 @@ func TestManualRecoveryPreservesSafetyGatesAndCheckpoint(t *testing.T) {
 	}
 }
 
-func TestManualRecoveryCheckHandoffConsumedOnce(t *testing.T) {
-	f := newRecoveryFixture(t, true)
+func TestLegacyManualRecoveryCheckOnlyReportsAction(t *testing.T) {
+	f := newMonitorFixture(t)
 	ctx := context.Background()
-	if _, err := f.db.Exec(`UPDATE account_check_batches SET request_key='recovery-manual-once-fixture'`); err != nil {
+	batch, _, err := f.store.CreateAccountCheckBatch(ctx, store.AccountCheckInput{
+		RequestKey: "recovery-manual-once-fixture", AccountIDs: []int64{f.account.ID},
+		DestinationKey: "fixture", Concurrency: 1, ProxyMode: "direct",
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	var id string
-	if err := f.db.QueryRow(`SELECT id FROM account_check_batches LIMIT 1`).Scan(&id); err != nil {
-		t.Fatal(err)
+	work, err := f.store.ClaimAccountCheck(ctx)
+	if err != nil || work == nil || work.Batch.ID != batch.ID {
+		t.Fatalf("legacy work=%+v err=%v", work, err)
 	}
-	for i := 0; i < 2; i++ {
-		manual, claimed, err := f.store.ClaimExplicitRecoveryCheck(ctx, id)
-		if err != nil || claimed != (i == 0) || manual != (i == 0) {
-			t.Fatalf("handoff pass %d manual=%v claimed=%v err=%v", i, manual, claimed, err)
-		}
-	}
+	f.service.checker.process(work)
+	assertCheckAction(t, f, "reauthorize")
 }
 
 func TestManualHistoryFailureStopsAutomaticRecovery(t *testing.T) {
@@ -225,7 +218,7 @@ func TestManualHistoryFailureStopsAutomaticRecovery(t *testing.T) {
 				if _, err := f.store.RecordAccountRecoveryFailure(ctx, f.task.ID, store.RecoveryFailure{State: store.RecoveryUnknown, Stage: store.RecoveryLoggingIn, Code: "network_error", RetryAction: "relogin", NextRetryAt: timePointer(time.Now().Add(-time.Minute))}); err != nil {
 					t.Fatal(err)
 				}
-			} else if _, err := f.db.Exec(`DELETE FROM account_recovery_tasks WHERE id=?`, f.task.ID); err != nil {
+			} else if _, err := f.db.Exec(`DELETE FROM account_recovery_tasks`); err != nil {
 				t.Fatal(err)
 			}
 			_, err := runWithHistoryAccount(login.WithSingleAttempt(ctx), f.account.ID, LoginRequest{Email: f.account.Email, Password: "password"}, func(context.Context) (*login.LoginResult, error) {
@@ -264,7 +257,14 @@ func TestManualHistoryFailureStopsAutomaticRecovery(t *testing.T) {
 			if existingRetry {
 				snapshot = f.state(t)
 			}
-			task, _, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, false, manualRecoveryRequest(snapshot))
+			task, _, err := f.service.enqueueWithIntent(ctx, f.account.ID, true, manualRecoveryRequest(snapshot))
+			if !existingRetry {
+				if err == nil || classifyRecoveryError(err).Code != "reauthorize" {
+					t.Fatalf("local-only auth failure err=%v", err)
+				}
+				assertCheckAction(t, f, "reauthorize")
+				continue
+			}
 			if err != nil {
 				t.Fatalf("next explicit attempt remained blocked: %v", err)
 			}
@@ -315,6 +315,8 @@ func TestManualLoginSuccessSupersedesOnlyLoginStage(t *testing.T) {
 		{"auth_page_timeout_exhausted", store.RecoveryLoggingIn, true},
 		{login.LoginErrorPasswordRejected, store.RecoveryLoggingIn, true},
 		{"auth_page_timeout_exhausted", store.RecoveryValidating, false},
+		{"reauthorize", store.RecoveryValidating, true},
+		{"verify_remote_refresh", store.RecoveryValidating, true},
 		{"network_error", store.RecoveryApplyingCredentials, false},
 		{"identity_changed", store.RecoveryLoggingIn, false},
 	} {
@@ -343,5 +345,48 @@ func TestManualLoginSuccessSupersedesOnlyLoginStage(t *testing.T) {
 				t.Fatalf("wrong supersession allowed=%v want=%v err=%v", ok, tc.allowed, err)
 			}
 		})
+	}
+}
+
+func TestPaidManualLoginSupersedesUnconfirmedPlan(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	ctx := context.Background()
+	if _, err := f.db.Exec(`UPDATE account_recovery_tasks SET state='unknown',failure_stage=?,error_code=?,retry_action='manual',manual_action='需要核实套餐' WHERE id=?`, store.RecoveryLoginSucceeded, store.RecoveryPlanUnconfirmed, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := f.store.GetAccountRecoveryTaskByID(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if superseded, err := f.service.successfulLoginSupersedesFailure(ctx, stopped); err != nil || superseded {
+		t.Fatalf("same credential version superseded unconfirmed plan: %v, %v", superseded, err)
+	}
+	credentials, err := f.store.GetCredentialsByID(ctx, f.account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, attempt, err := f.store.BeginAttempt(ctx, credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = f.store.FinishAttempt(ctx, attempt.ID, true, &store.Result{AccessToken: "manual-paid-at", RefreshToken: "manual-paid-rt", ChatGPTAccountID: "workspace", PlanType: "plus"}, nil)
+	attempt.Release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if superseded, err := f.service.successfulLoginSupersedesFailure(ctx, stopped); err != nil || !superseded {
+		t.Fatalf("paid manual login did not supersede unconfirmed plan: %v, %v", superseded, err)
+	}
+	if err := f.store.UpdateOAuthResultByID(ctx, f.account.ID, store.Result{AccessToken: "refresh-at", RefreshToken: "refresh-rt"}); err != nil {
+		t.Fatal(err)
+	}
+	if superseded, err := f.service.successfulLoginSupersedesFailure(ctx, stopped); err != nil || superseded {
+		t.Fatalf("empty refresh inherited paid evidence: %v, %v", superseded, err)
+	}
+	if _, err := f.db.Exec(`UPDATE accounts SET sub2_policy='unknown',plan_type='' WHERE id=?`, f.account.ID); err != nil {
+		t.Fatal(err)
+	}
+	if superseded, err := f.service.successfulLoginSupersedesFailure(ctx, stopped); err != nil || superseded {
+		t.Fatalf("unknown plan superseded unconfirmed plan: %v, %v", superseded, err)
 	}
 }

@@ -135,14 +135,26 @@ func newRecoveryFixture(t *testing.T, schedulable bool, accessTokens ...string) 
 		return &login.LoginResult{Email: email, AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: "workspace", PlanType: "plus"}, nil
 	}
 	t.Cleanup(f.service.Stop)
-	// Sub2's error state represents an automatic pause after an auth failure;
-	// the successful recovery should reopen that schedule. An active account
-	// with schedulable=false below remains a manual pause case.
-	restoreSchedule := schedulable || f.detailStatus == "error"
-	f.task, _, err = history.CreateOrGetAccountRecoveryTask(ctx, account.ID, work.Check.ID, 901, restoreSchedule)
+	// Worker tests start with a persisted remote recheck that rejected the
+	// last delivered credential. A local AUTH 401 alone only creates a todo.
+	parent, _, err := history.CreateOrGetAccountRecoveryTask(ctx, account.ID, work.Check.ID, 901, true, "fixture")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.Exec(`UPDATE account_recovery_tasks SET result_credential_attempt_id=source_credential_attempt_id WHERE id=?`, parent.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := history.UpdateAccountRecoveryTask(ctx, parent.ID, store.RecoveryCompleted, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := history.ClaimAccountRecoveryRecheck(ctx, time.Now().Add(24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	f.task, err = history.QueueAccountRecoveryFromRecheck(ctx, parent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.recoveryMarker = map[string]any{"task_id": parent.ID, "credential_attempt_id": attempt.ID}
 	return f
 }
 
@@ -308,29 +320,6 @@ func finishRecoveryCheck(t *testing.T, s *store.Store, db *sql.DB, accountID int
 	return work.Check.ID
 }
 
-func TestSub2RecoveryValidateCandidateRecognizesAuthFailures(t *testing.T) {
-	for _, tc := range []struct {
-		name, outcome, errorCode, streamErrorCode string
-	}{
-		{name: "expired_outcome", outcome: "access_token_expired"},
-		{name: "missing_error_code", outcome: "error", errorCode: "credential_missing"},
-		{name: "stream_auth_error", outcome: "error", streamErrorCode: "authentication_failed"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newRecoveryFixture(t, false)
-			status := http.StatusBadGateway
-			if tc.outcome == "" {
-				tc.outcome = "authentication_error"
-			}
-			id := finishRecoveryCheck(t, f.store, f.db, f.account.ID, "candidate-"+tc.name, tc.outcome, tc.errorCode, tc.streamErrorCode, &status)
-			got, err := f.service.validateCandidate(context.Background(), f.account.ID)
-			if err != nil || got != id {
-				t.Fatalf("candidate id=%d err=%v want=%d", got, err, id)
-			}
-		})
-	}
-}
-
 func TestSub2RecoveryAutoSettings(t *testing.T) {
 	f := newRecoveryFixture(t, false)
 	f.service.autoRecovery.Store(false)
@@ -393,7 +382,7 @@ func TestSub2RecoveryPreservesManualPause(t *testing.T) {
 	}
 	f.task.OriginalSchedulable = false
 	f.service.process(f.task)
-	if got := f.state(t); got.State != store.RecoveryCompleted {
+	if got := f.state(t); got.State != store.RecoveryCanceled || got.ErrorCode != "manual_pause" || f.loginCalls != 0 || f.applyCalls != 0 {
 		t.Fatalf("state=%s error=%q", got.State, got.LastError)
 	}
 	f.mu.Lock()
@@ -561,6 +550,72 @@ func TestSub2RecoveryChangesWorkspaceAndPlan(t *testing.T) {
 				if !strings.HasPrefix(method, "GET ") {
 					t.Fatalf("free recovery made a remote write: %v", f.methods)
 				}
+			}
+		})
+	}
+}
+
+func TestSub2RecoveryKeepsUnconfirmedPlanForManualReview(t *testing.T) {
+	for _, plan := range []string{"", "unrecognized_tier"} {
+		t.Run("claim_"+plan, func(t *testing.T) {
+			f := newRecoveryFixture(t, false)
+			f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
+				f.loginCalls++
+				return &login.LoginResult{Email: f.account.Email, AccessToken: "unknown-at", RefreshToken: "unknown-rt", ChatGPTAccountID: "workspace", PlanType: plan}, nil
+			}
+			f.service.process(f.task)
+			held := f.state(t)
+			if held.State != store.RecoveryUnknown || held.ErrorCode != store.RecoveryPlanUnconfirmed || held.ManualAction == "" || held.RetryAction != "manual" || held.NextRetryAt != nil || held.Resumable || held.ResultCredentialAttemptID <= held.SourceCredentialAttemptID {
+				t.Fatalf("unconfirmed recovery=%+v", held)
+			}
+			// Replay both the old dispatch and the persisted task.
+			requests := len(f.methods)
+			f.service.process(f.task)
+			f.service.process(held)
+			current := f.state(t)
+			if f.loginCalls != 1 || f.applyCalls != 0 || f.schedule || len(f.methods) != requests ||
+				current.ErrorCode != held.ErrorCode || current.ManualAction != held.ManualAction || !current.UpdatedAt.Equal(held.UpdatedAt) {
+				t.Fatalf("hold changed on replay: task=%+v login=%d apply=%d", current, f.loginCalls, f.applyCalls)
+			}
+			account, err := f.store.GetAccountByID(context.Background(), f.account.ID)
+			if err != nil || account.Sub2Policy != store.Sub2PolicyUnknown {
+				t.Fatalf("account policy=%s err=%v", account.Sub2Policy, err)
+			}
+		})
+	}
+}
+
+func TestSub2RecoveryResumedCheckpointRequiresObservedPaidPlan(t *testing.T) {
+	for _, fixture := range []string{"empty_refresh", "inferred_legacy_plan"} {
+		t.Run(fixture, func(t *testing.T) {
+			f := newRecoveryFixture(t, true)
+			ctx := context.Background()
+			// Older recovery refreshes retained the account's paid plan and
+			// eligible policy when the refresh response had no plan claim.
+			if err := f.store.UpdateOAuthResultByID(ctx, f.account.ID, store.Result{AccessToken: "legacy-at", RefreshToken: "legacy-rt"}); err != nil {
+				t.Fatal(err)
+			}
+			account, err := f.store.GetAccountByID(ctx, f.account.ID)
+			if err != nil || !account.AllowsSub2() || !store.IsSub2PaidPlan(account.PlanType) {
+				t.Fatalf("legacy account fixture: policy=%s plan=%s err=%v", account.Sub2Policy, account.PlanType, err)
+			}
+			if fixture == "inferred_legacy_plan" {
+				if _, err := f.db.Exec(`UPDATE login_attempts SET plan_type='plus',observation_source='legacy_oauth_login' WHERE id=?`, account.CredentialVersion); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := f.db.Exec(`UPDATE account_recovery_tasks SET result_credential_attempt_id=? WHERE id=?`, account.CredentialVersion, f.task.ID); err != nil {
+				t.Fatal(err)
+			}
+			task, err := f.store.ClaimAccountRecoveryTask(ctx, f.task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.service.process(task)
+			held := f.state(t)
+			if held.ErrorCode != store.RecoveryPlanUnconfirmed || held.ManualAction != store.RecoveryPlanUnconfirmedMessage || held.Resumable ||
+				held.NextRetryAt != nil || len(f.methods) != 0 || f.loginCalls != 0 || !f.schedule {
+				t.Fatalf("legacy checkpoint escaped plan review: task=%+v calls=%v", held, f.methods)
 			}
 		})
 	}

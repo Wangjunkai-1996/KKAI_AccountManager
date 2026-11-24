@@ -3,13 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/login"
 	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/probe"
 	"github.com/Wei-Shaw/sub2api/tools/openai-login/internal/store"
 )
@@ -125,7 +125,18 @@ func TestSub2RecoverySetStateIgnoresDeletedTask(t *testing.T) {
 	}
 }
 
-func TestSub2MonitorEnableScansChecksAndRecovers(t *testing.T) {
+func assertCheckAction(t *testing.T, f *recoveryFixture, want string) {
+	t.Helper()
+	check, err := f.store.LatestFinishedAccountCheck(context.Background(), f.account.ID, "fixture")
+	if err != nil || check == nil || check.RequiredAction != want {
+		t.Fatalf("latest check=%+v err=%v want=%s", check, err, want)
+	}
+	if _, active, err := f.store.GetActiveAccountRecoveryTask(context.Background(), f.account.ID); err != nil || active {
+		t.Fatalf("local check started a recovery: active=%v err=%v", active, err)
+	}
+}
+
+func TestSub2MonitorEnableScansChecksAndReportsAction(t *testing.T) {
 	f := newMonitorFixture(t)
 	// Run only the independent monitor. Claiming checks/tasks below makes each
 	// transition deterministic without substituting the actual scan/probe paths.
@@ -155,17 +166,9 @@ func TestSub2MonitorEnableScansChecksAndRecovers(t *testing.T) {
 		t.Fatal("enabling did not immediately scan and queue AUTH check")
 	}
 	f.service.checker.process(work)
-	task, active, err := f.store.GetActiveAccountRecoveryTask(context.Background(), f.account.ID)
-	if err != nil || !active {
-		t.Fatalf("401 did not enqueue recovery: active=%v err=%v", active, err)
-	}
-	f.service.process(task)
-	recovered, err := f.store.GetAccountRecoveryTaskByID(context.Background(), task.ID)
-	if err != nil || recovered.State != store.RecoveryCompleted {
-		t.Fatalf("recovery=%+v err=%v", recovered, err)
-	}
-	if f.loginCalls != 1 || f.refreshCalls != 0 || !f.schedule {
-		t.Fatalf("login=%d refresh=%d schedule=%v", f.loginCalls, f.refreshCalls, f.schedule)
+	assertCheckAction(t, f, "reauthorize")
+	if f.loginCalls != 0 || f.applyCalls != 0 || f.refreshCalls != 0 || len(f.events) != 0 {
+		t.Fatalf("login=%d refresh=%d remote events=%v", f.loginCalls, f.refreshCalls, f.events)
 	}
 	get := httptest.NewRecorder()
 	f.service.handleAction(get, httptest.NewRequest(http.MethodGet, "/api/account-recovery/settings", nil))
@@ -213,67 +216,64 @@ func TestSub2MonitorSkipsDisabledHealthyAndPausedAccounts(t *testing.T) {
 	}
 }
 
-func TestSub2MonitorReusesFresh401AndHonorsFailureCooldown(t *testing.T) {
-	f := newRecoveryFixture(t, false)
-	if _, err := f.db.Exec(`DELETE FROM account_recovery_tasks`); err != nil {
-		t.Fatal(err)
-	}
-	f.service.autoRecovery.Store(true)
-	f.service.scanSub2Accounts()
-	task, active, err := f.store.GetActiveAccountRecoveryTask(context.Background(), f.account.ID)
-	if err != nil || !active {
-		t.Fatalf("fresh 401 not reused active=%v err=%v", active, err)
-	}
-	if _, err := f.store.UpdateAccountRecoveryTask(context.Background(), task.ID, store.RecoveryFailed, "login failed"); err != nil {
-		t.Fatal(err)
-	}
-	f.service.scanSub2Accounts()
-	if _, active, err := f.store.GetActiveAccountRecoveryTask(context.Background(), f.account.ID); err != nil || active {
-		t.Fatalf("immediate retry active=%v err=%v", active, err)
-	}
-	checks, err := f.store.ListAccountChecks(context.Background(), f.account.ID, 20)
-	if err != nil || len(checks) != 1 {
-		t.Fatalf("unnecessary repeated AUTH checks=%d err=%v", len(checks), err)
-	}
-}
-
-func TestSub2MonitorQueuesActiveAccountWithCurrent401(t *testing.T) {
-	f := newRecoveryFixture(t, true)
-	f.detailStatus = "active"
-	if _, err := f.db.Exec(`DELETE FROM account_recovery_tasks`); err != nil {
-		t.Fatal(err)
-	}
-	f.service.autoRecovery.Store(true)
-	f.service.scanSub2Accounts()
-	task, active, err := f.store.GetActiveAccountRecoveryTask(context.Background(), f.account.ID)
-	if err != nil || !active {
-		t.Fatalf("active 401 was not queued: active=%v err=%v", active, err)
-	}
-	f.service.process(task)
-	if got, err := f.store.GetAccountRecoveryTaskByID(context.Background(), task.ID); err != nil || got.State != store.RecoveryCompleted {
-		t.Fatalf("recovery=%+v err=%v", got, err)
-	}
-}
-
-func TestSub2AutomaticCheckEnqueuesActiveAccountWith401(t *testing.T) {
-	f := newMonitorFixture(t)
-	f.detailStatus, f.schedule = "active", true
-	f.service.autoRecovery.Store(true)
-	batch, err := f.service.queueRecoveryChecks(context.Background(), []int64{f.account.ID}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	work, err := f.store.ClaimAccountCheck(context.Background())
-	if err != nil || work == nil || work.Batch.ID != batch.ID {
-		t.Fatalf("check work=%+v err=%v", work, err)
-	}
-	f.service.checker.process(work)
-	if _, active, err := f.store.GetActiveAccountRecoveryTask(context.Background(), f.account.ID); err != nil || !active {
-		t.Fatalf("active 401 check did not enqueue recovery: active=%v err=%v", active, err)
+func TestSub2MonitorPreservesCurrentActionsAcrossScansAndAPI(t *testing.T) {
+	for _, tc := range []struct{ outcome, action string }{{"credential_revoked", "reauthorize"}, {"access_token_expired", "verify_remote_refresh"}} {
+		for _, remote := range []string{"active", "error"} {
+			t.Run(tc.outcome+"/"+remote, func(t *testing.T) {
+				f := newMonitorFixture(t)
+				f.service.autoRecovery.Store(true)
+				f.detailStatus, f.schedule = remote, remote == "active"
+				f.service.checker.runProbe = func(context.Context, string, string, string) probe.Result {
+					return probe.Result{Outcome: tc.outcome, HTTPStatus: http.StatusUnauthorized, RequestAttempted: true}
+				}
+				_, err := f.service.queueRecoveryChecks(context.Background(), []int64{f.account.ID}, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				work, err := f.store.ClaimAccountCheck(context.Background())
+				if err != nil || work == nil {
+					t.Fatalf("check=%+v err=%v", work, err)
+				}
+				f.service.checker.process(work)
+				f.service.scanSub2Accounts()
+				assertCheckAction(t, f, tc.action)
+				// More skipped attempts than fit on the history page must not
+				// hide the latest finished observation from either endpoint.
+				for i := 0; i < 21; i++ {
+					batch, _, err := f.store.CreateAccountCheckBatch(context.Background(), store.AccountCheckInput{RequestKey: fmt.Sprintf("cooldown-%d", i), AccountIDs: []int64{f.account.ID}, Concurrency: 1, ProxyMode: "direct", DestinationKey: "fixture"})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := f.store.ClaimAccountCheck(context.Background()); err != nil {
+						t.Fatal(err)
+					}
+					got, _, err := f.store.GetAccountCheckBatch(context.Background(), batch.ID)
+					if err != nil || got.Counts.Skipped != 1 {
+						t.Fatalf("cooldown batch=%+v err=%v", got, err)
+					}
+				}
+				for _, path := range []string{"/api/account-recovery", "/api/account-recovery/check"} {
+					request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"account_id":1}`))
+					request.Header.Set("Content-Type", "application/json")
+					response := httptest.NewRecorder()
+					if path == "/api/account-recovery" {
+						f.service.handleCollection(response, request)
+					} else {
+						f.service.handleAction(response, request)
+					}
+					if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), `"code":"`+tc.action+`"`) {
+						t.Fatalf("%s response=%d %s", path, response.Code, response.Body.String())
+					}
+				}
+				if len(f.events) != 0 || f.loginCalls != 0 || f.schedule != (remote == "active") {
+					t.Fatalf("local check changed remote events=%v logins=%d", f.events, f.loginCalls)
+				}
+			})
+		}
 	}
 }
 
-func TestSub2ManualCheckRecoversWithAutomaticSwitchOff(t *testing.T) {
+func TestSub2ExplicitCheckReportsActionWithAutomaticSwitchOff(t *testing.T) {
 	f := newMonitorFixture(t)
 	request := httptest.NewRequest(http.MethodPost, "/api/account-recovery/check", strings.NewReader(`{"account_id":1}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -287,9 +287,7 @@ func TestSub2ManualCheckRecoversWithAutomaticSwitchOff(t *testing.T) {
 		t.Fatalf("manual work=%v err=%v", work, err)
 	}
 	f.service.checker.process(work)
-	if _, active, err := f.store.GetActiveAccountRecoveryTask(context.Background(), f.account.ID); err != nil || !active {
-		t.Fatalf("manual recovery active=%v err=%v", active, err)
-	}
+	assertCheckAction(t, f, "reauthorize")
 }
 
 func TestSub2AutomaticCheckCanceledAfterSwitchOff(t *testing.T) {
@@ -336,7 +334,7 @@ func TestSub2MonitorSettingsRestoredOverEnvironment(t *testing.T) {
 	}
 }
 
-func TestSub2MonitorLinksExternalAccountAndRestoresSameAccount(t *testing.T) {
+func TestSub2MonitorLinksExternalAccountAndReportsAction(t *testing.T) {
 	f := newMonitorFixture(t)
 	if _, err := f.db.Exec(`DELETE FROM sub2_imports`); err != nil {
 		t.Fatal(err)
@@ -353,15 +351,7 @@ func TestSub2MonitorLinksExternalAccountAndRestoresSameAccount(t *testing.T) {
 		t.Fatalf("linked account not checked: work=%v err=%v", work, err)
 	}
 	f.service.checker.process(work)
-	task, active, err := f.store.GetActiveAccountRecoveryTask(context.Background(), f.account.ID)
-	if err != nil || !active {
-		t.Fatalf("linked recovery active=%v err=%v", active, err)
-	}
-	f.service.process(task)
-	got, err := f.store.GetAccountRecoveryTaskByID(context.Background(), task.ID)
-	if err != nil || got.State != store.RecoveryCompleted || got.Sub2AccountID != 901 || f.loginCalls != 1 || !f.schedule {
-		t.Fatalf("linked recovery=%+v login=%d schedule=%v err=%v", got, f.loginCalls, f.schedule, err)
-	}
+	assertCheckAction(t, f, "reauthorize")
 	for _, method := range f.methods {
 		if method == "POST /admin/accounts" {
 			t.Fatal("linked recovery created duplicate remote account")
@@ -369,30 +359,29 @@ func TestSub2MonitorLinksExternalAccountAndRestoresSameAccount(t *testing.T) {
 	}
 }
 
-func TestSub2RecoveryStopsIfAccountBecomesHealthyOrManuallyPaused(t *testing.T) {
-	for _, schedulable := range []bool{true, false} {
-		f := newRecoveryFixture(t, false)
-		f.detailStatus, f.schedule = "active", schedulable
-		if _, err := f.db.Exec(`UPDATE account_checks SET outcome='ok', error_code='', stream_error_code='', http_status=NULL WHERE account_id=?`, f.account.ID); err != nil {
-			t.Fatal(err)
-		}
-		f.service.process(f.task)
-		got := f.state(t)
-		if got.State != store.RecoveryFailed || f.loginCalls != 0 || f.applyCalls != 0 || f.schedule != schedulable {
-			t.Fatalf("changed account was recovered: task=%+v login=%d apply=%d schedule=%v", got, f.loginCalls, f.applyCalls, f.schedule)
-		}
-	}
-}
-
-func TestSub2RecoveryAllowsActiveAccountWithCurrent401(t *testing.T) {
-	f := newRecoveryFixture(t, true)
-	f.detailStatus = "active"
-	f.service.process(f.task)
-	if got := f.state(t); got.State != store.RecoveryCompleted {
-		t.Fatalf("state=%s error=%q", got.State, got.LastError)
-	}
-	if f.loginCalls != 1 || f.applyCalls != 1 || !f.schedule {
-		t.Fatalf("active 401 was not recovered: login=%d apply=%d schedule=%v", f.loginCalls, f.applyCalls, f.schedule)
+func TestSub2LegacyCheckOnlyRecoveryStopsBeforeRemoteMutation(t *testing.T) {
+	for _, retry := range []string{"", "relogin"} {
+		t.Run("queued_"+retry, func(t *testing.T) {
+			f := newMonitorFixture(t)
+			ctx := context.Background()
+			id := finishRecoveryCheck(t, f.store, f.db, f.account.ID, "legacy", "unauthorized", "", "", nil)
+			task, _, err := f.store.CreateOrGetAccountRecoveryTask(ctx, f.account.ID, id, 901, true, "fixture")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.db.Exec(`UPDATE account_recovery_tasks SET retry_action=? WHERE id=?`, retry, task.ID); err != nil {
+				t.Fatal(err)
+			}
+			task, err = f.store.ClaimAccountRecoveryTask(ctx, task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.service.process(task)
+			got, err := f.store.GetAccountRecoveryTaskByID(ctx, task.ID)
+			if err != nil || got.State != store.RecoveryFailed || got.ErrorCode != "reauthorize" || !got.RequiresAction || got.NextRetryAt != nil || f.loginCalls != 0 || len(f.events) != 0 {
+				t.Fatalf("legacy check-only task=%+v err=%v logins=%d events=%v", got, err, f.loginCalls, f.events)
+			}
+		})
 	}
 }
 
@@ -416,66 +405,29 @@ func TestSub2RecoveryIntentPrefixIsReservedCaseInsensitively(t *testing.T) {
 	}
 }
 
-func TestSub2MonitorRecoversMissingLocalCredentials(t *testing.T) {
-	for _, returnedWorkspace := range []string{"workspace", "another-workspace", "superseded"} {
-		t.Run(returnedWorkspace, func(t *testing.T) {
-			f := newMonitorFixture(t)
-			ctx := context.Background()
-			if _, err := f.db.Exec(`DELETE FROM login_attempts`); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := f.db.Exec(`UPDATE accounts SET access_token_cipher=NULL, refresh_token_cipher=NULL, chatgpt_account_id='', status='failed'`); err != nil {
-				t.Fatal(err)
-			}
-			f.service.autoRecovery.Store(true)
-			f.service.checker.runProbe = func(context.Context, string, string, string) probe.Result {
-				t.Error("missing token must not issue upstream request")
-				return probe.Result{}
-			}
-			f.service.loginWithProxies = func(context.Context, string, string, string, string, string) (*login.LoginResult, error) {
-				f.loginCalls++
-				return &login.LoginResult{Email: f.account.Email, AccessToken: "new-at", RefreshToken: "new-rt", ChatGPTAccountID: returnedWorkspace}, nil
-			}
-			f.service.scanSub2Accounts()
-			work, err := f.store.ClaimAccountCheck(ctx)
-			if err != nil || work == nil || work.PrecheckResult == nil || work.PrecheckResult.Outcome != "credential_missing" {
-				t.Fatalf("missing local credential work=%+v err=%v", work, err)
-			}
-			f.service.checker.process(work)
-			task, active, err := f.store.GetActiveAccountRecoveryTask(ctx, f.account.ID)
-			if err != nil || !active || task.SourceCredentialAttemptID != 0 {
-				t.Fatalf("missing-token recovery not enqueued: task=%+v active=%v err=%v", task, active, err)
-			}
-			if err := f.store.ValidateAccountRecoveryVersion(ctx, task.ID); err != nil {
-				t.Fatalf("valid zero-version observation rejected: %v", err)
-			}
-			if returnedWorkspace == "superseded" {
-				attempt, err := f.store.StartAttempt(ctx, f.account.Email)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := f.store.FinishAttempt(ctx, attempt.ID, true, &store.Result{AccessToken: "elsewhere-at", RefreshToken: "elsewhere-rt", ChatGPTAccountID: "workspace"}, nil); err != nil {
-					t.Fatal(err)
-				}
-				attempt.Release()
-				if err := f.store.ValidateAccountRecoveryVersion(ctx, task.ID); err != store.ErrAccountRecoveryVersionChanged {
-					t.Fatalf("intervening login did not invalidate zero-version task: %v", err)
-				}
-				f.service.process(task)
-				if f.loginCalls != 0 || f.applyCalls != 0 {
-					t.Fatal("superseded initial-login task mutated credentials")
-				}
-				return
-			}
-			f.service.process(task)
-			got, err := f.store.GetAccountRecoveryTaskByID(ctx, task.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got.State != store.RecoveryCompleted || got.ResultCredentialAttemptID <= 0 || f.loginCalls != 1 || f.applyCalls != 1 || !f.schedule || f.detailWorkspace != returnedWorkspace {
-				t.Fatalf("first-login recovery=%+v login=%d apply=%d schedule=%v workspace=%s", got, f.loginCalls, f.applyCalls, f.schedule, f.detailWorkspace)
-			}
-		})
+func TestSub2MonitorMissingLocalCredentialsRequiresRemoteRefreshCheck(t *testing.T) {
+	f := newMonitorFixture(t)
+	ctx := context.Background()
+	if _, err := f.db.Exec(`DELETE FROM login_attempts`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.Exec(`UPDATE accounts SET access_token_cipher=NULL, refresh_token_cipher=NULL, chatgpt_account_id='', status='failed'`); err != nil {
+		t.Fatal(err)
+	}
+	f.service.autoRecovery.Store(true)
+	f.service.checker.runProbe = func(context.Context, string, string, string) probe.Result {
+		t.Error("missing token issued an upstream request")
+		return probe.Result{}
+	}
+	f.service.scanSub2Accounts()
+	work, err := f.store.ClaimAccountCheck(ctx)
+	if err != nil || work == nil || work.PrecheckResult == nil || work.PrecheckResult.Outcome != "credential_missing" {
+		t.Fatalf("missing credential work=%+v err=%v", work, err)
+	}
+	f.service.checker.process(work)
+	assertCheckAction(t, f, "verify_remote_refresh")
+	if f.loginCalls != 0 || len(f.events) != 0 {
+		t.Fatalf("logins=%d remote events=%v", f.loginCalls, f.events)
 	}
 }
 
@@ -512,7 +464,6 @@ func TestSub2MonitorAfterCompletedTaskChecksNewFailure(t *testing.T) {
 				t.Fatalf("old 401 must be stale after login: checks=%+v err=%v", checks, err)
 			}
 			// A successful operation must not reuse the previous token's 401.
-			f.service.enqueueAutomatic(f.account.ID)
 			f.service.scanSub2Accounts()
 			if _, active, err := f.store.GetActiveAccountRecoveryTask(ctx, f.account.ID); err != nil || active {
 				t.Fatalf("stale 401 queued another recovery: active=%v err=%v", active, err)
@@ -532,8 +483,8 @@ func TestSub2MonitorAfterCompletedTaskChecksNewFailure(t *testing.T) {
 	}
 }
 
-func TestSub2MonitorAfterCompletedTaskRecoversCurrent401(t *testing.T) {
-	for _, path := range []string{"scan_error", "scan_active", "automatic_callback"} {
+func TestSub2MonitorAfterCompletedTaskReportsCurrent401(t *testing.T) {
+	for _, path := range []string{"scan_error", "scan_active"} {
 		t.Run(path, func(t *testing.T) {
 			ctx := context.Background()
 			f := newRecoveryFixture(t, true)
@@ -562,15 +513,8 @@ func TestSub2MonitorAfterCompletedTaskRecoversCurrent401(t *testing.T) {
 				f.detailStatus, f.detailError, f.schedule = "error", "Token revoked (401)", false
 				f.mu.Unlock()
 			}
-			if path == "automatic_callback" {
-				f.service.enqueueAutomatic(f.account.ID)
-			} else {
-				f.service.scanSub2Accounts()
-			}
-			task, active, err := f.store.GetActiveAccountRecoveryTask(ctx, f.account.ID)
-			if err != nil || !active || task.ID == completed.ID || task.CheckID != work.Check.ID || task.SourceCredentialAttemptID != completed.ResultCredentialAttemptID {
-				t.Fatalf("current 401 after success did not queue a new recovery: task=%+v active=%v err=%v", task, active, err)
-			}
+			f.service.scanSub2Accounts()
+			assertCheckAction(t, f, "reauthorize")
 		})
 	}
 }

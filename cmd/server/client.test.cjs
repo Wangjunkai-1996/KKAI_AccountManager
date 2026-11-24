@@ -479,7 +479,7 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     await click('refreshHistoryBtn');
     assert.match(el('historyGrid').innerHTML, /已关联 Sub2/);
     assert.match(el('historyGrid').innerHTML, /Sub2：401 credential expired/);
-    assert.match(el('historyGrid').innerHTML, /data-history-action="recover" data-history-id="2"[^>]*>检测并恢复/);
+    assert.match(el('historyGrid').innerHTML, /data-history-action="recover" data-history-id="2"[^>]*>检测当前凭据/);
     assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), false);
     await run("checkAndRecoverHistory('2')");
     assert.equal(requests.filter(item => item.url === '/api/account-recovery/check').length, 1);
@@ -501,6 +501,30 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.match(el('historyGrid').innerHTML, /Sub2 正常 · 本地凭据失效待处理/);
     assert.equal(run("historyRecoveryAction(historyAccounts.find(item => item.id === '2')).disabled"), false,
         'an AUTH 401 keeps recovery available when Sub2 is healthy');
+    checks[2].required_action = 'reauthorize';
+    checks[2].last_result.finished_at = Date.now();
+    recoveries[2] = { state: 'completed', check_id: 9 };
+    await click('refreshHistoryBtn');
+    assert.match(el('historyGrid').innerHTML, /history-workflow-state">需要重新授权</);
+    assert.match(el('historyGrid').innerHTML, /历史记录 · 恢复完成/);
+    assert.equal((el('historyGrid').innerHTML.match(/请账号持有人通过原 Sub2 账号的官方 OAuth 流程授权/g) || []).length, 1);
+    assert.match(el('historyGrid').innerHTML, /仅重新登录 AUTH/);
+    assert.match(el('historyGrid').innerHTML, /检测于/);
+    assert.doesNotMatch(el('historyGrid').innerHTML, /data-history-action="recover" data-history-id="2"/,
+        'reauthorize guidance must not offer automatic recovery');
+    checks[2].required_action = 'verify_remote_refresh';
+    await click('refreshHistoryBtn');
+    assert.match(el('historyGrid').innerHTML, /history-workflow-state">需要核对 Sub2 正常续期</);
+    assert.match(el('historyGrid').innerHTML, /请先查看原 Sub2 账号的正常续期结果/);
+    assert.doesNotMatch(el('historyGrid').innerHTML, /data-history-action="recover" data-history-id="2"/,
+        'remote refresh guidance must not offer automatic recovery');
+    sub2Statuses[2].schedulable = false;
+    await click('refreshHistoryBtn');
+    assert.match(el('historyGrid').innerHTML, /history-workflow-state">账号已人工暂停</);
+    assert.doesNotMatch(el('historyGrid').innerHTML, /请先查看原 Sub2 账号的正常续期结果/);
+    sub2Statuses[2].schedulable = true;
+    recoveries[2] = {};
+    delete checks[2].required_action;
     checks[2].last_result = { outcome: 'error', error_code: 'credential_missing', freshness: 'current' };
     await click('refreshHistoryBtn');
     assert.match(el('historyGrid').innerHTML, /本地凭据失效待处理/);
@@ -1193,9 +1217,8 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
         : normalFetchBeforeRelogin(url, options);
     context.performHistoryRelogin = originalHistoryRelogin;
     run("historyDeliveries.set('9001', {state:'requires_action', requires_action:true}); renderHistory()");
-    assert.match(el('historyGrid').innerHTML, /data-history-action="relogin-deliver" data-history-id="9001"/);
-    await run("performHistoryRelogin('9001', {autoDeliver:true})");
-    assert.equal(JSON.parse(requests.filter(item => item.url === '/api/history/login').at(-1).options.body).auto_deliver, true);
+    assert.doesNotMatch(el('historyGrid').innerHTML, /data-history-action="relogin-deliver" data-history-id="9001"/, 'incomplete binding cannot authorize an update');
+    assert.equal((await run("performHistoryRelogin('9001', {autoDeliver:true})")).success, false);
     context.fetch = (url, options) => {
         if (url !== '/api/history/login') return normalFetchBeforeRelogin(url, options);
         requests.push({ url, options });
@@ -1211,6 +1234,30 @@ const deletes = () => requests.filter(item => item.options.method === 'DELETE');
     assert.equal(historyLogin.delivery_options, undefined, 'history revival uses its current Sub2 account route, not the next batch selection');
     assert.equal(historyLogin.proxy, undefined, 'history relogin uses the saved route when no new selection is provided');
     assert.equal(historyLogin.manual_attempt, true, 'an explicit history login permits one attempt');
+    const originalBinding = { operation_id: 'original-op', sub2_account_id: 82, credential_version: 12 };
+    const localState = run(`(() => {
+        const a = historyAccounts.find(item => item.id === '9001');
+        const snapshot = { ...a };
+        Object.assign(a, { sub2Policy: 'eligible', credentialVersion: 12, status: 'active',
+            sub2Status: normalizeSub2Status({ configured:true, imported:true, exists:true, status:'active', schedulable:true, sub2_account_id:82 }) });
+        historyImports.set(a.id, { state:'imported', create_acknowledged:true, operation_id:'original-op', sub2_account_id:82 });
+        historyDeliveries.set(a.id, { state:'requires_action', requires_action:true });
+        renderHistory(); return snapshot;
+    })()`);
+    assert.match(costRow('9001'), /data-history-action="relogin-deliver"[^>]*data-binding-operation="original-op"[^>]*data-remote-id="82"[^>]*data-credential-version="12"/);
+    const beforeDrift = requests.filter(item => item.url === '/api/history/login').length;
+    for (const change of [{ operation_id: 'old-op' }, { sub2_account_id: 81 }, { credential_version: 11 }]) {
+        context.testBinding = { ...originalBinding, ...change };
+        const rejected = await run("performHistoryRelogin('9001', {autoDeliver:true, expectedBinding:testBinding})");
+        assert.equal(rejected.success, false);
+    }
+    for (const state of ['stale', 'remoteMissing', 'manualPause']) {
+        run(`(() => {const a=historyAccounts.find(x => x.id==='9001'); a.sub2Status.stale=${state === 'stale'}; a.sub2Status.remoteMissing=${state === 'remoteMissing'}; a.sub2Status.schedulable=${state !== 'manualPause'}; renderHistory()})()`);
+        assert.doesNotMatch(costRow('9001'), /data-history-action="relogin-deliver"/);
+    }
+    assert.equal(requests.filter(item => item.url === '/api/history/login').length, beforeDrift, 'stale submissions perform no login');
+    context.savedBindingAccount = localState;
+    run("Object.assign(historyAccounts.find(a=>a.id==='9001'),savedBindingAccount); historyImports.delete('9001'); historyDeliveries.delete('9001')");
     importSettings.egress_routes[1].eligible = false;
     const invalidRouteDialog = run('chooseDeliveryOptions()'); await flush();
     assert.equal(el('deliveryOptionsApply').disabled, true, 'a saved route that becomes unavailable blocks submission');

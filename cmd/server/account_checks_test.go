@@ -273,6 +273,57 @@ func TestAccountCheckWorkerFinalRequestEvidence(t *testing.T) {
 	}
 }
 
+func TestAccountCheckRequiredActionAPI(t *testing.T) {
+	ctx := context.Background()
+	history, ids := accountCheckFixture(t, 1)
+	old := loginHistory
+	loginHistory = history
+	t.Cleanup(func() { loginHistory = old })
+	batch, _, err := history.CreateAccountCheckBatch(ctx, store.AccountCheckInput{RequestKey: "action-api", AccountIDs: ids, Concurrency: 1, ProxyMode: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	work, err := history.ClaimAccountCheck(ctx)
+	if err != nil || work == nil {
+		t.Fatalf("claim: %v", err)
+	}
+	status := 401
+	if _, err = history.FinishAccountCheck(ctx, work.Check.ID, store.AccountCheckResult{Outcome: "unauthorized", ErrorCode: "token_expired", HTTPStatus: &status}); err != nil {
+		t.Fatal(err)
+	}
+	const want = "verify_remote_refresh"
+	s := newAccountCheckService(history, "", "")
+	defer s.Stop()
+	var batchDTO struct {
+		Items []store.AccountCheck `json:"items"`
+	}
+	var detailDTO struct {
+		Checks []store.AccountCheck `json:"checks"`
+	}
+	var listDTO struct {
+		Checks map[int64]store.AccountCheckSummary `json:"checks"`
+	}
+	for _, tc := range []struct {
+		path string
+		fn   http.HandlerFunc
+		dst  any
+	}{
+		{"/api/account-checks/" + batch.ID, s.handleAction, &batchDTO},
+		{fmt.Sprintf("/api/history/%d", ids[0]), handleHistoryDelete(), &detailDTO},
+		{"/api/history", handleHistory(), &listDTO},
+	} {
+		w := callCheckAPI(tc.fn, "GET", tc.path, "")
+		if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), tc.dst) != nil {
+			t.Fatalf("%s returned %d: %s", tc.path, w.Code, w.Body.String())
+		}
+	}
+	summary := listDTO.Checks[ids[0]]
+	if len(batchDTO.Items) != 1 || batchDTO.Items[0].RequiredAction != want || len(detailDTO.Checks) != 1 || detailDTO.Checks[0].RequiredAction != want ||
+		summary.RequiredAction != want || summary.LastResult == nil || summary.LastResult.RequiredAction != want {
+		t.Fatalf("action mismatch: batch=%+v detail=%+v summary=%+v", batchDTO, detailDTO, summary)
+	}
+}
+
 func runAccountCheckSub2CleanupTest(t *testing.T, outcome, errorCode, requestKey string) {
 	t.Helper()
 	history, ids := accountCheckFixture(t, 1)
