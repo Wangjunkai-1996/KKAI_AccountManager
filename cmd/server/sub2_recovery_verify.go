@@ -62,7 +62,8 @@ func (e *recoveryOperationError) Error() string {
 		"sub2_plan_ineligible":        "当前账号未获准进入 Sub2 付费池，请核实套餐及账号策略",
 		"free_local":                  "当前账号仅保留在 AUTH 本地",
 		"verify_remote_refresh":       "请先核对原 Sub2 账号的正常续期状态，必要时再重新授权",
-		"manual_pause":                "账号已被人工暂停或禁用，保持原状态", "version_changed": "本地凭据版本已变化，请核对后继续",
+		"manual_pause":                "Sub2 调度已关闭或账号已禁用，暂停来源未确认，保持原状态", "version_changed": "本地凭据版本已变化，请核对后继续",
+		"probe_unsupported":      "Sub2 尚不支持保留错误状态的探测，请先升级 Sub2 后重新复检",
 		"checkpoint_unconfirmed": "无法确认恢复检查点归属，请人工核对", "account_busy": "账号正在处理其他任务，稍后自动重试",
 	}
 	if message := messages[e.Code]; message != "" {
@@ -274,8 +275,9 @@ func recoveryProbeEventError(payload []byte) *recoveryOperationError {
 	return failure
 }
 
-// verifySub2AccountProbe uses the existing admin SSE test. Sub2 resolves the
-// account's own credentials and proxy/egress; AUTH never supplies an override.
+// verifySub2AccountProbe never uses the interactive /test endpoint: successful
+// tests clear runtime errors and can hide a concurrent automatic 401 pause.
+// Sub2 resolves the account's own credentials and egress for this probe.
 func (s *sub2RecoveryService) verifySub2AccountProbe(ctx context.Context, accountID int64) error {
 	if s == nil || s.sub2 == nil || s.sub2.client == nil || accountID <= 0 {
 		return &recoveryOperationError{Code: "configuration", RequiresAction: true}
@@ -284,7 +286,7 @@ func (s *sub2RecoveryService) verifySub2AccountProbe(ctx context.Context, accoun
 	defer cancel()
 	body := strings.NewReader(`{"model_id":"` + store.AccountCheckModel + `"}`)
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodPost,
-		s.sub2.baseURL+"/admin/accounts/"+strconv.FormatInt(accountID, 10)+"/test", body)
+		s.sub2.baseURL+"/admin/accounts/"+strconv.FormatInt(accountID, 10)+"/probe", body)
 	if err != nil {
 		return &recoveryOperationError{Code: "configuration", RequiresAction: true}
 	}
@@ -300,6 +302,9 @@ func (s *sub2RecoveryService) verifySub2AccountProbe(ctx context.Context, accoun
 		return classifyRecoveryError(err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		return &recoveryOperationError{Code: "probe_unsupported", HTTPStatus: resp.StatusCode, RetryAfterSeconds: recoveryRetryAfter(resp.Header.Get("Retry-After")), RequiresAction: true}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return recoveryHTTPError(resp.StatusCode, recoveryRetryAfter(resp.Header.Get("Retry-After")))
 	}
@@ -462,11 +467,19 @@ func verifySub2RecoveryDetail(detail map[string]any, expectedSub2ID, accountID i
 	if err := verifySub2RecoveryMetadata(detail, expectedSub2ID, accountID, account, bindings...); err != nil {
 		return err
 	}
-	if status, ok := detail["status"].(string); !ok || status != "active" {
-		return errors.New("Sub2 account is not active")
+	return verifySub2RecoveryRuntime(detail)
+}
+
+// An error raised during the probe is a runtime failure, not lost ownership
+// or proof of a manual pause. Keep it visible and retry without clearing it.
+func verifySub2RecoveryRuntime(detail map[string]any) error {
+	if recoveryAccountDisabled(detail) {
+		return &recoveryOperationError{Code: "account_unavailable", RequiresAction: true}
 	}
-	if message, ok := detail["error_message"].(string); !ok || strings.TrimSpace(message) != "" {
-		return errors.New("Sub2 account error is not cleared")
+	status, _ := detail["status"].(string)
+	message, known := detail["error_message"].(string)
+	if !strings.EqualFold(status, "active") || !known || strings.TrimSpace(message) != "" {
+		return &recoveryOperationError{Code: "probe_failed"}
 	}
 	return nil
 }

@@ -274,6 +274,58 @@ func TestSub2RecheckPreservesPauseDuringProbe(t *testing.T) {
 	}
 }
 
+func TestSub2RecheckConcurrent401IsNotManualPauseOrSuccess(t *testing.T) {
+	for _, probeFails := range []bool{false, true} {
+		t.Run(fmt.Sprintf("probe_fails=%t", probeFails), func(t *testing.T) {
+			f := newRecoveryFixture(t, true)
+			f.service.autoRecovery.Store(true)
+			f.service.process(f.task)
+			base := f.service.sub2.client.Transport
+			f.service.sub2.client.Transport = recoveryConcurrencyTransport(func(r *http.Request) (*http.Response, error) {
+				response, err := base.RoundTrip(r)
+				if r.URL.Path == "/admin/accounts/901/probe" {
+					f.mu.Lock()
+					f.schedule, f.detailStatus, f.detailError = false, "error", "Token revoked (401): invalidated oauth token"
+					f.mu.Unlock()
+				}
+				return response, err
+			})
+			if probeFails {
+				f.probeBody = "data: {\"type\":\"error\",\"status\":401,\"code\":\"token_revoked\"}\n\n"
+			}
+			forceDueRecheck(t, f)
+			f.service.processNextRecheck()
+			check := currentRecheck(t, f)
+			var state string
+			if err := f.db.QueryRow(`SELECT state FROM account_recovery_rechecks WHERE task_id=?`, f.task.ID).Scan(&state); err != nil {
+				t.Fatal(err)
+			}
+			want := "pending"
+			if probeFails {
+				want = "recovery_queued"
+			}
+			if state != want || check.RequiresAction || f.schedule || f.detailStatus != "error" {
+				t.Fatalf("automatic 401 was lost or misclassified: state=%s status=%s schedule=%v", state, f.detailStatus, f.schedule)
+			}
+			if f.loginCalls != 1 || f.applyCalls != 1 {
+				t.Fatal("recheck must not itself re-login or apply credentials")
+			}
+			if probeFails {
+				f.service.sub2.client.Transport, f.probeBody = base, ""
+				child, err := f.store.GetLatestAccountRecoveryTask(context.Background(), f.account.ID)
+				if err != nil || child.ID == f.task.ID {
+					t.Fatalf("missing recovery: %+v %v", child, err)
+				}
+				f.service.process(child)
+				child, _ = f.store.GetAccountRecoveryTaskByID(context.Background(), child.ID)
+				if child.State != store.RecoveryCompleted || !f.schedule || f.loginCalls != 2 {
+					t.Fatalf("automatic 401 did not recover: %+v schedule=%v", child, f.schedule)
+				}
+			}
+		})
+	}
+}
+
 func TestSub2RecheckRecoveryRetainsConfirmedPauseOnRetry(t *testing.T) {
 	f := newRecoveryFixture(t, true)
 	f.service.autoRecovery.Store(true)

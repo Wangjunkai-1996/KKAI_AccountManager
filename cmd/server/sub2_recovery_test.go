@@ -254,7 +254,7 @@ func (f *recoveryFixture) handle(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		writeRecoveryEnvelope(w, map[string]any{})
-	case "/admin/accounts/901/test":
+	case "/admin/accounts/901/probe":
 		f.testCalls++
 		f.events = append(f.events, "test")
 		if f.probePausesAccount {

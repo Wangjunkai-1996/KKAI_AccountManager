@@ -796,8 +796,12 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		fail(store.RecoveryEnablingSchedule, err)
 		return
 	}
-	if verifySub2RecoveryDetail(beforeEnable, task.Sub2AccountID, task.AccountID, account, binding) != nil || !recoveryMarkerMatches(beforeEnable, task) {
+	if verifySub2RecoveryMetadata(beforeEnable, task.Sub2AccountID, task.AccountID, account, binding) != nil || !recoveryMarkerMatches(beforeEnable, task) {
 		require(store.RecoveryEnablingSchedule, "identity_changed")
+		return
+	}
+	if err := verifySub2RecoveryRuntime(beforeEnable); err != nil {
+		fail(store.RecoveryEnablingSchedule, err)
 		return
 	}
 	if s.store.ValidateAccountRecoveryVersion(ctx, task.ID) != nil {
@@ -843,8 +847,18 @@ func (s *sub2RecoveryService) process(task store.AccountRecoveryTask) {
 		fail(store.RecoveryEnablingSchedule, err)
 		return
 	}
+	if verifySub2RecoveryMetadata(enabled, task.Sub2AccountID, task.AccountID, account, binding) != nil || !recoveryMarkerMatches(enabled, task) {
+		s.pauseSchedule(task.Sub2AccountID)
+		require(store.RecoveryEnablingSchedule, "checkpoint_unconfirmed")
+		return
+	}
+	if err := verifySub2RecoveryRuntime(enabled); err != nil {
+		s.pauseSchedule(task.Sub2AccountID)
+		fail(store.RecoveryEnablingSchedule, err)
+		return
+	}
 	value, ok := boolField(enabled, "schedulable")
-	if !ok || !value || verifySub2RecoveryDetail(enabled, task.Sub2AccountID, task.AccountID, account, binding) != nil || !recoveryMarkerMatches(enabled, task) {
+	if !ok || !value {
 		s.pauseSchedule(task.Sub2AccountID)
 		require(store.RecoveryEnablingSchedule, "checkpoint_unconfirmed")
 		return

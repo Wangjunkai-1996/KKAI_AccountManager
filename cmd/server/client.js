@@ -1808,8 +1808,8 @@ function renderSub2Status(account) {
     const effective = state.effectiveSchedulable ?? state.schedulable;
     const className = conflict || runtimePause || effective === false ? 'sub2-warning' : status === 'active' || status === 'available' || status === 'enabled' ? 'sub2-ok'
         : status === 'unknown' || status === 'stale' ? 'sub2-unknown' : 'sub2-error';
-    const manuallyPaused = ['active', 'available', 'enabled'].includes(status) && state.schedulable === false;
-    const schedule = manuallyPaused ? '人工暂停' : runtimePause ? '暂不可调度' : effective === true ? '可调度' : effective === false ? '暂不可调度' : '';
+    const scheduleClosed = ['active', 'available', 'enabled'].includes(status) && state.schedulable === false;
+    const schedule = scheduleClosed ? '调度已关闭' : runtimePause ? '暂不可调度' : effective === true ? '可调度' : effective === false ? '暂不可调度' : '';
     const checked = state.checkedAt ? `同步 ${formatHistoryTime(state.checkedAt)}` : '';
     const reason = [state.errorMessage, runtimePause?.reason, state.error, checked].filter(Boolean).join(' · ');
     const title = reason ? ` title="${escapeHTML(reason)}"` : '';
@@ -2112,7 +2112,7 @@ function historyRecoveryAction(account) {
     else if (!state.exists) reason = 'Sub2 状态待核对';
     else if (['inactive', 'disabled', 'deleted'].includes(state.status)) reason = 'Sub2 账号已禁用或删除，请先在 Sub2 中确认';
     else if (sub2RuntimePause(state) && !resumable && !localAuthFailure(account)) reason = sub2RuntimePause(state).label;
-    else if (!resumable && ['active', 'available', 'enabled'].includes(state.status) && state.schedulable === false) reason = '账号已人工暂停，保持暂停状态';
+    else if (!resumable && ['active', 'available', 'enabled'].includes(state.status) && state.schedulable === false) reason = 'Sub2 调度已关闭，暂停来源未确认，保持原状态';
     else if (account.status === 'deleted') reason = '该账号已删除';
     else if (account.status === 'running') reason = '账号正在登录';
     if (!reason && !resumable && !localAuthFailure(account) && state.status !== 'error') reason = ['active', 'available', 'enabled'].includes(state.status)
@@ -2134,7 +2134,7 @@ function historyCheckAction(account) {
     const state = account.sub2Status;
     if (historyPoolState(account).kind !== 'present') return { label: '原 Sub2 绑定待核对', detail: '请刷新账号历史，核对对应的 Sub2 ID 和关联状态。' };
     if (state?.schedulable === false && ['active', 'available', 'enabled'].includes(state.status)) {
-        return { label: '账号已人工暂停', detail: '保持原 Sub2 调度设置' };
+        return { label: 'Sub2 调度已关闭', detail: '保持原 Sub2 调度设置' };
     }
     return action === 'reauthorize'
         ? { label: '需要重新授权', detail: '请账号持有人通过原 Sub2 账号的官方 OAuth 流程授权。完成后刷新账号历史，核对原绑定和调度状态。' }

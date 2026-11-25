@@ -98,3 +98,22 @@ func TestSub2RecoveryFreshVersionReadStorageFailurePauses(t *testing.T) {
 		t.Fatalf("storage failure did not stop before write: paused=%v apply=%d scheduled=%v", f.service.paused.Load(), f.applyCalls, f.schedule)
 	}
 }
+
+func TestSub2RecoveryConcurrent401AfterProbeRemainsRetryable(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	base := f.service.sub2.client.Transport
+	f.service.sub2.client.Transport = recoveryConcurrencyTransport(func(r *http.Request) (*http.Response, error) {
+		response, err := base.RoundTrip(r)
+		if r.URL.Path == "/admin/accounts/901/probe" {
+			f.mu.Lock()
+			f.detailStatus, f.detailError = "error", "Token revoked (401): invalidated oauth token"
+			f.mu.Unlock()
+		}
+		return response, err
+	})
+	f.service.process(f.task)
+	got := f.state(t)
+	if got.State != store.RecoveryUnknown || got.ErrorCode != "probe_failed" || got.RequiresAction || got.NextRetryAt == nil || f.schedule {
+		t.Fatalf("runtime error became terminal or enabled scheduling: %+v schedule=%v", got, f.schedule)
+	}
+}

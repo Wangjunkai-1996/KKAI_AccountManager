@@ -114,8 +114,8 @@ func recoveryAccountDisabled(detail map[string]any) bool {
 }
 
 func sub2RecoverySuspect(status sub2AccountStatus) bool {
-	// Sub2 active + schedulable=false is an operator pause. Neither a local
-	// expired token nor that pause is a reason to turn scheduling back on.
+	// Active + schedulable=false has no reliable pause provenance. Do not infer
+	// operator intent or turn it back on from a local expired token alone.
 	return status.Imported && status.Exists && !status.Unknown && !status.Stale && strings.EqualFold(status.Status, "error") && status.Schedulable != nil
 }
 
@@ -489,7 +489,7 @@ func (s *sub2RecoveryService) handleRecoveryCheck(w http.ResponseWriter, r *http
 		return
 	}
 	if !s.remoteRecoverySuspect(r.Context(), req.AccountID) {
-		recoveryAPIError(w, 422, "not_recoverable", "仅恢复仍在 Sub2 池中的异常账号；禁用、人工暂停或未知状态请先核对")
+		recoveryAPIError(w, 422, "not_recoverable", "仅恢复仍在 Sub2 池中的异常账号；禁用、调度已关闭或未知状态请先核对")
 		return
 	}
 	if task, _, err := s.enqueueWithIntent(r.Context(), req.AccountID, req.ManualAttempt, req); err == nil {

@@ -63,7 +63,7 @@ func (recoveryVerifyReadFailure) Read([]byte) (int, error) {
 
 func TestRecoveryVerifyProbeHTTP(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/admin/accounts/42/test" || r.Header.Get("x-api-key") != "test-admin" {
+		if r.Method != http.MethodPost || r.URL.Path != "/admin/accounts/42/probe" || r.Header.Get("x-api-key") != "test-admin" {
 			t.Error("wrong probe target or authorization")
 			w.WriteHeader(http.StatusBadRequest)
 			return
@@ -97,6 +97,23 @@ func TestRecoveryVerifyProbeTimeout(t *testing.T) {
 	defer cancel()
 	if err := svc.verifySub2AccountProbe(ctx, 42); err == nil {
 		t.Fatal("timeout must fail closed")
+	}
+}
+
+func TestRecoveryVerifyProbeUnsupportedDoesNotFallBackToMutatingTest(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/admin/accounts/42/probe" {
+			t.Error("must not fall back to /test")
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	svc := &sub2RecoveryService{sub2: &sub2ImportService{baseURL: server.URL, client: server.Client()}}
+	failure := classifyRecoveryError(svc.verifySub2AccountProbe(context.Background(), 42))
+	if failure.Code != "probe_unsupported" || !failure.RequiresAction || calls != 1 {
+		t.Fatalf("unsupported probe was not stopped safely: %+v calls=%d", failure, calls)
 	}
 }
 
